@@ -35,3 +35,6 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # ambient EMPIRICAL_SKIP (напр. из ручного `EMPIRICAL_SKIP=1 make deploy`) не должен
     # контаминировать gate-тесты (как LADDER_SKIP/CODEX_REVIEW_SKIP).
     monkeypatch.delenv("EMPIRICAL_SKIP", raising=False)
+    # реальный CLAUDE_CODE_SESSION_ID не должен перебивать сессию, которую тест задаёт через
+    # CLAUDE_SESSION_ID (иначе _env_session вернёт реальный id и маркер-тесты сломаются).
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)

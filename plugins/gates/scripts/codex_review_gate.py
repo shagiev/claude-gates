@@ -525,11 +525,16 @@ def load_findings_ledger(baseline: "str | None") -> "dict | None":
     return led
 
 
+def _atomic_write_json(path: Path, obj: object, indent: "int | None" = None) -> None:
+    """Атомарная запись JSON (tmp + replace). Общая для findings-ledger и маркеров."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=indent))
+    tmp.replace(path)
+
+
 def save_findings_ledger(led: dict) -> None:
-    FINDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = FINDINGS_DIR / "current.json.tmp"
-    tmp.write_text(json.dumps(led, ensure_ascii=False, indent=2))
-    tmp.replace(FINDINGS_DIR / "current.json")
+    _atomic_write_json(FINDINGS_DIR / "current.json", led, indent=2)
 
 
 def merge_round(led: dict, blocking_findings: "list[tuple[str, str]]",
@@ -1001,36 +1006,99 @@ def _marker_path(session: str) -> Path:
     return DESIGN_MARKER.with_name(DESIGN_MARKER.name + "-" + safe)
 
 
-def write_marker(kind: str, detail: str, design_hash: str | None = None) -> None:
-    session = _env_session()
+def _write_marker_payload(session: str, payload: dict) -> None:
+    _atomic_write_json(_marker_path(session), payload)   # общий атомарный писатель
+
+
+def _load_marker(session: str) -> "dict | None":
     path = _marker_path(session)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _hash_file(path: Path) -> "str | None":
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()   # None → не прочитан (fail-closed)
+    except OSError:
+        return None
+
+
+def write_marker(kind: str, detail: str, design_hash: str | None = None) -> None:
+    """inline/trivial маркер (легаси-контракт). File-режим — add_design_file_binding (тикет #3)."""
+    session = _env_session()
+    _write_marker_payload(session, {
         "kind": kind, "detail": detail, "design_hash": design_hash,
         "session": session, "ts": datetime.now(timezone.utc).isoformat(),
-    }, ensure_ascii=False)
-    tmp = path.with_suffix(path.suffix + ".tmp")   # атомарная запись
-    tmp.write_text(payload)
-    tmp.replace(path)
+    })
     if kind == "trivial":                        # R1-6b: тривиальный маркер — осознанно, в аудит
         audit(f"trivial-marker session={session} reason={detail!r}")
 
 
-def has_marker(session: str) -> bool:
-    # R1-6b: валиден только при НЕпустой совпадающей сессии И (design→непустой hash | trivial).
+def add_design_file_binding(detail: str, design_file: str, reviewed_hash: str) -> int:
+    """File-режим design-маркера (тикет #3): мержит биндинг {file, hash: reviewed_hash} в набор
+    `designs` маркера сессии. reviewed_hash — из результата ревью (не «что сейчас в файле»).
+    Возвращает 0 при sha256(файл)==reviewed_hash, иначе 2 (записанный несовпадающий биндинг
+    делает has_marker drifted — маркер невалиден целиком, R2-F1)."""
+    session = _env_session()
+    rec = _load_marker(session)
+    designs = []
+    if rec and rec.get("session") == session and rec.get("kind") == "design" \
+            and isinstance(rec.get("designs"), list):
+        designs = [b for b in rec["designs"]              # прочие биндинги сохраняем
+                   if isinstance(b, dict) and b.get("file") != design_file]
+    designs.append({"file": design_file, "hash": reviewed_hash})
+    _write_marker_payload(session, {
+        "kind": "design", "detail": detail, "designs": designs,
+        "session": session, "ts": datetime.now(timezone.utc).isoformat(),
+    })
+    current = _hash_file(REPO_ROOT / design_file)
+    if current != reviewed_hash:
+        audit(f"design-file-binding MISMATCH session={session} file={design_file!r} "
+              f"reviewed={reviewed_hash[:12]} current={str(current)[:12]}")
+        print(f"[codex-gate] ⚠️ файл {design_file} НЕ совпал с reviewed_hash — записан как дрейф, "
+              "маркер невалиден до совпадения/ре-ревью. Codex ревьюил не этот текст?", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _marker_state(session: str) -> str:
+    """'valid'|'absent'|'foreign'|'drifted'|'invalid'. design file-режим (тикет #3): valid только
+    если ВСЕ биндинги набора совпали с текущими файлами; любой дрейф/непрочитан → 'drifted'."""
+    if not session:
+        return "invalid"
     path = _marker_path(session)
-    if not session or not path.exists():
-        return False
-    try:
-        rec = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False   # битый маркер не разблокирует
+    if not path.exists():
+        return "absent"
+    rec = _load_marker(session)
+    if rec is None:
+        return "invalid"                          # битый маркер не разблокирует
     if rec.get("session") != session:
-        return False   # протухший/чужой
+        return "foreign"                          # протухший/чужой
     kind = rec.get("kind")
-    if kind == "design":
-        return bool(rec.get("design_hash"))   # design без hash не разблокирует
-    return kind == "trivial"
+    if kind == "trivial":
+        return "valid"
+    if kind != "design":
+        return "invalid"
+    designs = rec.get("designs")
+    if isinstance(designs, list):                 # file-режим (тикет #3)
+        if not designs:
+            return "invalid"
+        for b in designs:
+            if not isinstance(b, dict) or not b.get("file") or not b.get("hash"):
+                return "invalid"
+            if _hash_file(REPO_ROOT / b["file"]) != b["hash"]:
+                return "drifted"                  # файл изменён/удалён/непрочитан (fail-closed)
+        return "valid"
+    return "valid" if rec.get("design_hash") else "invalid"   # легаси inline (без дрейф-проверки)
+
+
+def has_marker(session: str) -> bool:
+    # R1-6b + тикет #3: валиден только при непустой совпадающей сессии И (design без дрейфа | trivial).
+    return _marker_state(session) == "valid"
 
 
 def clear_marker() -> None:
@@ -1057,6 +1125,17 @@ def _hook_session(data: dict) -> str:
     return data.get("session_id") or _env_session()
 
 
+def _design_gate(session: str, drift_msg: str, unreviewed_msg: str) -> int:
+    """Общая ветка design-гейта по состоянию маркера (тикет #3): drifted → своё сообщение,
+    не-valid → generic, valid → 0."""
+    state = _marker_state(session)
+    if state == "drifted":
+        return _deny(drift_msg)
+    if state != "valid":
+        return _deny(unreviewed_msg)
+    return 0
+
+
 def gate_edit_cli(hook_json: str) -> int:
     if not _hooks_active():   # BS-P1: не-онбордженный проект / не git-репо → плагин молчит
         return 0
@@ -1072,10 +1151,12 @@ def gate_edit_cli(hook_json: str) -> int:
     if not session:   # сессию не определить → fail-open (design-гейт), не блокируем всю работу
         print("[codex-gate] сессия неизвестна — дизайн-гейт пропускает (fail-open)", file=sys.stderr)
         return 0
-    if not has_marker(session):
-        return _deny("Дизайн-ревью не пройдено. Запусти /design-review до правок кода "
-                     "(или /design-review --trivial \"причина\").")
-    return 0
+    return _design_gate(session,   # тикет #3: drifted → своё сообщение, иначе generic
+        "Дизайн изменился с момента ревью (дрейф дизайн-файла) — перепрогони /design-review "
+        "и перепомечай `write-marker design <detail> <hash> --file <path>`. Правки кода "
+        "заблокированы до совпадения с отревьюенным.",
+        "Дизайн-ревью не пройдено. Запусти /design-review до правок кода "
+        "(или /design-review --trivial \"причина\").")
 
 
 def gate_bash_cli(hook_json: str) -> int:
@@ -1092,11 +1173,12 @@ def gate_bash_cli(hook_json: str) -> int:
     if not session:
         print("[codex-gate] сессия неизвестна — bash-гейт пропускает (fail-open)", file=sys.stderr)
         return 0   # fail-open
-    if not has_marker(session):
-        return _deny("Дизайн-ревью не пройдено, а Bash-команда похоже правит кодовый путь "
-                     "(sed -i/git apply/patch/redirect). Запусти /design-review сначала. "
-                     "NB: эвристика частичная (см. остаток R1-5).")
-    return 0
+    return _design_gate(session,   # тикет #3
+        "Дизайн изменился с момента ревью (дрейф) — а Bash-команда похоже правит код. "
+        "Перепрогони /design-review и перепомечай (--file). Заблокировано.",
+        "Дизайн-ревью не пройдено, а Bash-команда похоже правит кодовый путь "
+        "(sed -i/git apply/patch/redirect). Запусти /design-review сначала. "
+        "NB: эвристика частичная (см. остаток R1-5).")
 
 
 def main(argv: list[str]) -> int:
@@ -1164,9 +1246,27 @@ def main(argv: list[str]) -> int:
         if DESIGN_MARKER is None:
             print("[codex-gate] ✗ не git-репозиторий — маркер писать некуда", file=sys.stderr)
             return 2
-        write_marker(argv[1] if len(argv) > 1 else "design",
-                     argv[2] if len(argv) > 2 else "",
-                     argv[3] if len(argv) > 3 else None)
+        args = argv[1:]
+        kind = args[0] if args else "design"
+        detail = args[1] if len(args) > 1 else ""
+        rest = args[2:]
+        design_file = None
+        if "--file" in rest:                       # тикет #3: file-режим design-маркера
+            i = rest.index("--file")
+            design_file = rest[i + 1] if i + 1 < len(rest) else None
+            rest = rest[:i] + rest[i + 2:]
+        reviewed_hash = rest[0] if rest else None
+        if kind == "design" and design_file:
+            if not reviewed_hash:
+                print("usage: write-marker design <detail> <reviewed_hash> --file <path>",
+                      file=sys.stderr)
+                return 1
+            return add_design_file_binding(detail, design_file, reviewed_hash)
+        if kind == "design":       # F2 (altitude): inline design без --file = БЕЗ дрейф-защиты —
+            print("[codex-gate] ⚠️ inline design-маркер (без --file) НЕ защищён от дрейфа: "  # громко, не молча
+                  "пост-ревью правка дизайна не будет поймана. Для нетривиального/actuator/"
+                  "data-loss дизайна используй `--file <path>` (см. /design-review).", file=sys.stderr)
+        write_marker(kind, detail, reviewed_hash)
         return 0
     if cmd == "clear-marker":
         if not _hooks_active():   # SessionStart в любом проекте: молча no-op вне онбординга
