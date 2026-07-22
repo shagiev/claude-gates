@@ -28,18 +28,19 @@ empirical:
 
 **Трёхстатусная модель конфига (R2-F1/R3-F1)** `_empirical_state(ref)` различает ТРИ
 состояния; `absent` — только при ДОКАЗАННОМ отсутствии, git-сбой ≠ absent:
-- Сначала валидировать ref (`git rev-parse --verify <ref>^{commit}`) — не валиден → **`unreadable`**.
-- `git cat-file -e <ref>:.codex-gate.yaml`: non-zero при валидном ref = путь не в дереве →
-  кандидат в `absent`; но ЛЮБАЯ git/object/OS-ошибка (не «нет пути») → **`unreadable`**
-  (R3-F1: non-zero от `git show` также даёт битый blob/сбой Git — degraded dependency НЕ
-  трактуем как «чисто»). Доказательство отсутствия — отдельным `cat-file -e` при валидном ref.
-- **`absent`**: ДОКАЗАНО нет файла на ref (валидный ref + `cat-file -e` = «нет пути») ЛИБО файл
-  прочитан и распарсен, но валидной `empirical.test_command` в нём нет. (PyYAML не нужен, если
-  файла нет — доказывается по git, не парсером.)
-- **`enabled(cmd)`**: файл прочитан и распарсен И `test_command` — непустая строка.
-- **`unreadable`**: невалидный ref; ошибка чтения существующего пути (битый blob, OSError);
-  файл есть, но не парсится (нет PyYAML, YAML-ошибка, decode). «Нет доказательства opt-in» ≠
-  «доказано, что opt-in нет».
+Доказательство отсутствия — через УСПЕШНОЕ чтение дерева (R4-F1: `cat-file -e` non-zero не
+отличает «пути нет» от «дерево/blob не читается» при partial-clone/повреждении):
+- `git ls-tree <ref> -- .codex-gate.yaml`:
+  - **non-zero** (дерево/ref не прочитано) → **`unreadable`** (нет доказательства — не absent).
+  - **exit 0 + ПУСТОЙ вывод** (дерево прочитано, пути в нём нет) → кандидат в `absent` — ДОКАЗАНО.
+  - **exit 0 + непустой** (путь есть) → читаем blob:
+    - `git cat-file blob <ref>:.codex-gate.yaml` non-zero (объект не читается) → **`unreadable`**.
+    - прочитан → парсим содержимое.
+- **`absent`**: ls-tree exit 0 + пусто (доказано нет файла; PyYAML не нужен) ЛИБО blob прочитан
+  и распарсен, но валидной `empirical.test_command` в нём нет.
+- **`enabled(cmd)`**: blob прочитан и распарсен И `test_command` — непустая строка.
+- **`unreadable`**: ls-tree fail; blob не читается (битый объект, OSError); файл есть, но не
+  парсится (нет PyYAML, YAML-ошибка, decode). «Нет доказательства opt-in» ≠ «доказано, что нет».
 
 Измерения:
 - **D1 состояние HEAD**: {absent, enabled(cmd), unreadable}
@@ -89,7 +90,7 @@ empirical_skip`). Эмпирика читает `base_state` от валидир
 | S11 | `CODEX_REVIEW_SKIP=1` + HEAD=enabled, D3=exit≠0 | **БЛОК** — эмпирика независима от Codex-скипа |
 | S12 | HEAD=enabled, D3=exit0, D6=HEAD сменился | **БЛОК (2)** — тест не для задеплоенного SHA (R2-F2) |
 | S13 | HEAD=enabled, D3=exit0, D6=дерево загрязнилось | **БЛОК (2)** — дерево ≠ проверенному (R2-F2) |
-| S14 | HEAD: невалидный ref / git-сбой чтения существующего пути | **БЛОК (2)** — `unreadable`, не absent (R3-F1) |
+| S14 | HEAD: `ls-tree` fail (невалидный ref / нечитаемое дерево) / нечитаемый blob | **БЛОК (2)** — `unreadable`, не absent (R3-F1/R4-F1) |
 | S15 | LADDER_SKIP+CODEX_REVIEW_SKIP заданы, EMPIRICAL_SKIP нет, D7=baseline неизвестен | **БЛОК (2)** — baseline обязателен эмпирике (R3-F2) |
 
 Проверка полноты: каждое значение D1–D7 встречается ≥1 раз; ключевые комбинации —
@@ -184,8 +185,19 @@ escape (S6).
 
 ## Тестирование
 
-Юнит (изоляция как в conftest; тест-команда — стаб-скрипты `bash -c 'exit N'` / `sleep`):
-S1–S10 из матрицы. Отдельно: ordering (S9) — Codex-стаб, падающий при вызове, не должен быть
-тронут при провале эмпирики; независимость от `CODEX_REVIEW_SKIP` (S10). Валидация `timeout_s`
-(S8). Битый `empirical` (S7). Все — через `check_reviewed_cli` (реальный маршрут), не только
-хелпер.
+Юнит (изоляция как в conftest; тест-команда — стаб-скрипты `bash -c 'exit N'` / `sleep`;
+git-состояния — tmp-репо, как в test_ladder_gate). **ОБЯЗАТЕЛЬНЫ ВСЕ S1–S15** — каждый новый
+code path (особенно fail-closed ветки) должен иметь тест, реально в него входящий (инвариант
+проекта; R4-F2). Явно, помимо очевидных:
+- **S7** (HEAD=absent, base=enabled → блок), **S7b** (HEAD=unreadable: битый YAML / нет PyYAML
+  при наличии файла → блок), **S8** (absent/absent → скип), **S8b** (base=unreadable → блок).
+- **S10** ordering — Codex-стаб, падающий ПРИ ВЫЗОВЕ, НЕ должен быть тронут при провале эмпирики.
+- **S11** независимость от `CODEX_REVIEW_SKIP` (эмпирика блокирует).
+- **S12/S13** race — монипатч/стаб команды, который во время прогона двигает HEAD / грязнит дерево → блок.
+- **S14** git-сбой: `ls-tree` fail (невалидный ref) / нечитаемый blob → `unreadable` → блок.
+- **S15** baseline обязателен: `LADDER_SKIP=1 CODEX_REVIEW_SKIP=1` заданы, `EMPIRICAL_SKIP` нет,
+  HEAD=absent, baseline неизвестен → блок.
+- Юнит `_empirical_state` отдельно: absent (нет файла) / enabled / unreadable (git-fail, no-yaml,
+  битый YAML) — три состояния на tmp-репо.
+Все интеграционные — через `check_reviewed_cli` (реальный маршрут), не только хелпер; `head_before`-
+биндинг проверяется тем, что записанный `.last-reviewed-sha` == проверенному эмпирикой SHA.
