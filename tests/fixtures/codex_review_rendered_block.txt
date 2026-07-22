@@ -1,0 +1,7 @@
+Verdict: needs-attention
+
+Summary: issues found
+
+Findings:
+- [critical] Unbounded await blows the cycle (app/x.py:10)
+- [medium] Naming nit (app/y.py:3)

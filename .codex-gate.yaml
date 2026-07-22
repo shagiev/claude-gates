@@ -1,0 +1,17 @@
+# Дог-фуд: репо плагина gates онбордится в собственные гейты (спека, раздел «Тесты»).
+code_paths:
+  prefixes:
+    - "plugins/gates/scripts/"
+    - "plugins/gates/hooks/"
+    - "plugins/gates/templates/"
+    - "tests/"
+  exact:
+    - "plugins/gates/.claude-plugin/plugin.json"
+    - ".claude-plugin/marketplace.json"
+
+ladder:
+  enabled: true
+  epoch_sha: "4041016436539ee24a4bdeca44f3ded66ecfbdbb"
+
+convergence:
+  hard_cap: 8

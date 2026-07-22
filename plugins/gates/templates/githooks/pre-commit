@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# gates ladder pre-commit (шим; спека Фазы 1.5 §2). Fail-closed: нет плагина/резолва → abort.
+# Обход осознанно: LADDER_SKIP=1 [LADDER_SKIP_REASON="..."] git commit ...
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -f "$HERE/gates-run" ]; then
+  echo "[gates] .githooks/gates-run отсутствует — коммит ПРЕРВАН (fail-closed). Перезапусти /gates-init." >&2
+  exit 1
+fi
+exec bash "$HERE/gates-run" ladder_gate.py check-precommit

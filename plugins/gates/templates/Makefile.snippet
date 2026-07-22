@@ -1,0 +1,46 @@
+# ═══ gates: ревью-гейты (плагин gates@lenar-gates) — вставь в свой Makefile ═══
+# Деплой у каждого проекта свой: этот snippet — каркас. Обязательные элементы:
+#   deploy: ... check-reviewed ...   (гейт — prerequisite деплоя)
+#   deploy-lock (atomic mkdir + trap; на macOS НЕТ flock CLI — только mkdir)
+#   check-decision ПРЯМО перед выкаткой (rsync/push)
+#   запись .claude/.last-deployed-sha ТОЛЬКО после успешной пост-деплой верификации
+# NB: в Makefile каждый '$' шелла пишется как '$$'.
+
+setup-hooks:
+	@git config core.hooksPath .githooks
+	@echo "✅ core.hooksPath=.githooks — ladder pre-commit/post-commit активны"
+
+# ladder-range + Codex-ревью диффа baseline..HEAD (fail-closed; чистое дерево обязательно)
+check-reviewed:
+	@bash .githooks/gates-run codex_review_gate.py check-reviewed
+
+deploy: check-reviewed   # + твои проверки: check-committed test mypy coverage
+	@mkdir -p logs; \
+	if ! mkdir logs/.deploy.lock.d 2>/dev/null; then \
+		echo "❌ другой make deploy уже идёт (deploy-lock). Если он завис/убит -9: rmdir logs/.deploy.lock.d"; \
+		exit 1; \
+	fi; \
+	trap 'rmdir logs/.deploy.lock.d 2>/dev/null' EXIT; \
+	trap 'exit 130' INT TERM; \
+	REVIEWED_SHA=$$(git rev-parse HEAD); \
+	if [ ! -f .claude/.last-reviewed-sha ] || [ "$$REVIEWED_SHA" != "$$(cat .claude/.last-reviewed-sha)" ]; then \
+		echo "❌ HEAD ($$REVIEWED_SHA) != одобренного check-reviewed SHA — HEAD сдвинулся; прерываю"; \
+		exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ] || [ "$$(git rev-parse HEAD)" != "$$REVIEWED_SHA" ]; then \
+		echo "❌ дерево изменилось после ревью (правка во время review) — прерываю до выкатки"; \
+		exit 1; \
+	fi; \
+	if ! bash .githooks/gates-run codex_review_gate.py check-decision; then \
+		echo "❌ решение ревью устарело (конкурентная находка/адъюдикация после allow) — прерываю"; \
+		exit 1; \
+	fi; \
+	echo "==> ЗДЕСЬ твоя выкатка (rsync/docker compose/ssh) и пост-деплой верификация"; \
+	echo "==> при УСПЕХЕ верификации зафиксируй baseline:"; \
+	printf '%s\n' "$$REVIEWED_SHA" > .claude/.last-deployed-sha; \
+	echo "==> baseline ревью обновлён: $$(cat .claude/.last-deployed-sha)"
+
+# Протокол сходимости (Фаза 1.6) — адъюдикация находок между раундами:
+#   bash .githooks/gates-run codex_review_gate.py findings
+#   bash .githooks/gates-run codex_review_gate.py adjudicate F1 fixed|residual-failsafe|refuted "причина"
+# Аварийные обходы (аудируются): LADDER_SKIP=1 (лесенка), CODEX_REVIEW_SKIP=1 (Codex-часть).

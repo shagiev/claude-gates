@@ -1,0 +1,8 @@
+{
+  "name": "gates",
+  "version": "0.1.0",
+  "description": "Ревью-гейты Claude↔Codex: дизайн-ревью до кода (G1), enforced-лесенка /simplify→/code-review, commit-bound деплой-гейт с протоколом сходимости.",
+  "author": {
+    "name": "Ленар"
+  }
+}

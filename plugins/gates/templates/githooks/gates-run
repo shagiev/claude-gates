@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# gates-run: запускает скрипт плагина gates@lenar-gates актуальной установленной версии.
+# Использование: gates-run <script.py> [args...]
+# Резолв версии (спека, решение 3): installed_plugins.json — авторитетно (то, что реально
+# активно у Claude Code); глоб кэша — ТОЛЬКО фолбэк при нечитаемых метаданных. Читаемые
+# метаданные БЕЗ записи плагина = «удалён» → fail-closed (протухший кэш не подхватывается).
+set -u
+SCRIPT="${1:?usage: gates-run <script.py> [args...]}"
+shift
+P=$(python3 - <<'EOF'
+import json, os, sys
+meta = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+try:
+    d = json.load(open(meta))
+except Exception:
+    print("FALLBACK"); sys.exit(0)   # метаданные нечитаемы -> глоб-фолбэк
+entries = (d.get("plugins") or {}).get("gates@lenar-gates") or []
+for e in entries:                     # несколько scope'ов -> первый с реально существующим путём
+    ip = e.get("installPath") or ""
+    if not os.path.isabs(ip):         # пустой/относительный путь (дрейф схемы) НЕ должен
+        continue                      # резолвиться в repo-local scripts/ от cwd хука
+    p = os.path.join(ip, "scripts")
+    if os.path.isfile(os.path.join(p, "ladder_gate.py")):
+        print(p); sys.exit(0)
+print("")                             # метаданные читаемы, записи/пути нет -> НЕ установлен
+EOF
+)
+if [ "$P" = "FALLBACK" ]; then
+  P=$(ls -d "$HOME"/.claude/plugins/cache/lenar-gates/gates/*/scripts 2>/dev/null | sort -V | tail -1)
+fi
+if [ -z "$P" ] || [ ! -f "$P/$SCRIPT" ]; then
+  echo "[gates] плагин gates@lenar-gates не установлен (или скрипт $SCRIPT не найден) — операция ПРЕРВАНА (fail-closed)." >&2
+  echo "[gates] Установи: /plugin marketplace add <путь-или-repo lenar-gates> ; /plugin install gates@lenar-gates" >&2
+  echo "[gates] Осознанный обход коммита: LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ... (аудит на деплой-гейте)" >&2
+  exit 1
+fi
+exec python3 "$P/$SCRIPT" "$@"

@@ -1,0 +1,1 @@
+{"review":"Adversarial Review","target":{"mode":"branch","baseRef":"HEAD~1"},"codex":{"status":0,"stderr":"","stdout":"{\"verdict\":\"approve\",\"summary\":\"No material issues.\",\"findings\":[],\"next_steps\":[]}","reasoning":[]},"result":{"verdict":"approve","summary":"No material issues.","findings":[],"next_steps":[]},"parseError":null,"rawOutput":"{}","reasoningSummary":[]}

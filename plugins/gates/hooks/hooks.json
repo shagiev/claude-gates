@@ -1,0 +1,38 @@
+{
+  "description": "G1 дизайн-гейт (PreToolUse) + сброс пер-сессионного маркера (SessionStart). No-op в проектах без .codex-gate.yaml.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" gate-edit",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" gate-bash",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" clear-marker",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

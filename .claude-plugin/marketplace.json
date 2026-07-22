@@ -1,0 +1,21 @@
+{
+  "name": "lenar-gates",
+  "owner": {
+    "name": "Ленар"
+  },
+  "metadata": {
+    "description": "Личный маркетплейс: переносимые ревью-гейты Claude↔Codex",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "gates",
+      "description": "Ревью-гейты Claude↔Codex: дизайн-ревью до кода (G1), enforced-лесенка /simplify→/code-review, commit-bound деплой-гейт с протоколом сходимости.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Ленар"
+      },
+      "source": "./plugins/gates"
+    }
+  ]
+}
