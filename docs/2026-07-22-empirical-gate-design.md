@@ -82,6 +82,7 @@ empirical_skip`). Эмпирика читает `base_state` от валидир
 | S5 | HEAD=enabled, D3=таймаут | **БЛОК (2)** после `timeout_s` |
 | S6 | D4="1" | скип + аудит-строка (перекрывает любой блок ниже) |
 | S7 | HEAD=absent, base=enabled | **БЛОК (2)** — гейт был включён, теперь снят (R2-F1) |
+| S16 | HEAD=enabled(cmd_h), base=enabled(cmd_b), cmd_h≠cmd_b | **БЛОК (2)** — смена команды = потенц. ослабление (code-R1); base=absent/unreadable → это включение, команда бежит |
 | S7b | HEAD=unreadable (битый YAML / нет PyYAML при наличии файла) | **БЛОК (2)** — состояние не подтвердить |
 | S8 | HEAD=absent (файл есть, секции нет), base=absent | скип — доказанно не opt-in |
 | S8b | HEAD=absent, base=unreadable | **БЛОК (2)** — base мог быть enabled, не доказать |
@@ -117,6 +118,10 @@ escape (S6).
 - **EARS-8:** IF HEAD=unreadable (файл есть, парс невозможен) ИЛИ (HEAD=absent И baseline∈
   {enabled, unreadable}) — THEN гейт SHALL заблокировать деплой (fail-closed), кроме
   `EMPIRICAL_SKIP`. (S7, S7b, S8b) — снятие/поломка гейта требует того же аудируемого действия, что и скип.
+- **EARS-12:** IF HEAD=enabled(cmd_h) И baseline=enabled(cmd_b) И cmd_h≠cmd_b — THEN гейт SHALL
+  заблокировать деплой (fail-closed), кроме `EMPIRICAL_SKIP` (code-R1/ML-E2: силу двух команд не
+  сравнить, `pytest`→`true` эффективно снимает гейт; смена = аудируемое действие). base=
+  absent/unreadable + HEAD=enabled — это ВКЛючение/подтверждение (не ослабление), команда бежит. (S16)
 - **EARS-9:** Конфиг (HEAD и baseline) SHALL читаться привязанно к SHA, не из worktree.
   `absent` SHALL доказываться ТОЛЬКО успешным чтением дерева (`git ls-tree <ref> -- path` →
   exit 0 + пустой вывод), либо успешно прочитанным-и-распарсенным blob без секции; ЛЮБАЯ
@@ -143,11 +148,13 @@ escape (S6).
 - **ML-E1** команда не запустилась → трактуется как «прошло» → непроверенный деплой. →
   S4/S5 fail-closed (актуатор-урок: «verify it LANDS» — подтвердить, что команда реально
   отработала, а не молча ничего).
-- **ML-E2 [R2-F1]** удаление секции / подмена `test_command` на `true` / порча YAML / нет
-  PyYAML при наличии конфига, чтобы снять гейт. → **трёхстатусное правило (EARS-8)**: HEAD=
-  unreadable → блок; HEAD=absent при base∈{enabled,unreadable} → блок; скип только при
-  доказанном absent на обоих SHA. Отключение = скип, оба через `EMPIRICAL_SKIP`. Не полагается
-  на «увидит Codex». «Нет доказательства opt-in» ≠ «доказано отсутствие opt-in».
+- **ML-E2 [R2-F1 + code-R1]** снять гейт тремя путями: (а) удаление секции → HEAD=absent при
+  base=enabled → блок; (б) порча YAML / нет PyYAML → HEAD=unreadable → блок; (в) **подмена
+  `test_command` на no-op (`true`)** → HEAD=enabled, но cmd≠base_cmd → блок (EARS-12). Все три —
+  fail-closed, кроме аудируемого `EMPIRICAL_SKIP`. Скип только при доказанном absent на обоих SHA.
+  Самодостаточно, не полагается на «увидит Codex» (связка `CODEX_REVIEW_SKIP`+ослабление). Ценность
+  — АУДИТ: тот, кто ставит `CODEX_REVIEW_SKIP`, и так может `EMPIRICAL_SKIP`, но правило
+  превращает молчаливый эффективный обход в записанный.
 - **ML-E3 [R2-F2]** смена HEAD за время прогона (тест ≤600с): чистый A → тест зелёный →
   параллельный commit/checkout ставит чистый B → задеплоится B, эмпирику не проходивший. →
   `head_before` захватывается один раз после clean-tree и используется ВЕЗДЕ (эмпирика,

@@ -173,6 +173,27 @@ def test_gate_s7_removed_after_enabled_blocks(repo, monkeypatch):
     assert g._empirical_gate(base, head) == 2            # снятие гейта без EMPIRICAL_SKIP → блок
 
 
+def test_gate_s16_command_change_blocks(repo, monkeypatch):   # Codex code-R1 (ML-E2 замена)
+    base = _commit_config(repo, _ENABLED.format(cmd="false"), "emp-pytest")   # base: строгая
+    head = _commit_config(repo, _ENABLED.format(cmd="true"), "emp-weakened")  # head: no-op
+    _gate_env(monkeypatch, repo, head)
+    assert g._empirical_gate(base, head) == 2   # смена команды без EMPIRICAL_SKIP → блок
+
+
+def test_gate_same_command_runs(repo, monkeypatch):   # смена нет → команда бежит (регресс)
+    base = _commit_config(repo, _ENABLED.format(cmd="true"), "emp-on")
+    head = _commit_config(repo, _ENABLED_TO.format(cmd="true", to=30), "emp-on-touch")  # cmd тот же
+    _gate_env(monkeypatch, repo, head)
+    assert g._empirical_gate(base, head) == 0   # команда та же (изменился лишь timeout) → бежит, pass
+
+
+def test_gate_enable_from_absent_runs(repo, monkeypatch):   # base=absent → включение, не смена
+    base = _sha(repo)                                        # файла нет
+    head = _commit_config(repo, _ENABLED.format(cmd="true"), "emp-enable")
+    _gate_env(monkeypatch, repo, head)
+    assert g._empirical_gate(base, head) == 0   # ВКЛючение гейта (не ослабление) → бежит
+
+
 def test_gate_s7b_head_unreadable_blocks(repo, monkeypatch):
     base = _sha(repo)
     head = _commit_config(repo, "empirical:\n  test_command: [unclosed\n", "emp-broken")

@@ -781,6 +781,17 @@ def _empirical_gate(baseline: str, head: str) -> int:
               "отсутствует/сломан — снятие гейта требует EMPIRICAL_SKIP=1 (аудит, как и скип). "
               "Деплой остановлен.", file=sys.stderr)
         return 2
+    # state == enabled: смена test_command с baseline = потенциальное ослабление (Codex code-R1,
+    # ML-E2). Силу двух произвольных команд не сравнить (pytest → true эффективно снимает гейт),
+    # потому блокируем ЛЮБУЮ смену без аудируемого EMPIRICAL_SKIP — самодостаточно, без опоры на
+    # «увидит Codex» (связка CODEX_REVIEW_SKIP+подмена его обходит). base=absent/unreadable →
+    # это ВКЛючение/подтверждение гейта (не ослабление) → команда просто бежит.
+    base_state, base_cmd, _ = _empirical_config(REPO_ROOT, baseline)
+    if base_state == "enabled" and base_cmd != cmd:
+        print(f"[codex-gate] ✗ empirical: test_command изменилась с baseline (« {base_cmd[:40]} » "
+              f"→ « {cmd[:40]} ») — смена = потенциальное ослабление, требует EMPIRICAL_SKIP=1 "
+              "(аудит, как снятие гейта). Деплой остановлен.", file=sys.stderr)
+        return 2
     print(f"[codex-gate] empirical: прогон «{cmd[:80]}» (timeout {timeout}s)…", file=sys.stderr)
     result, tail = _run_empirical(cmd, timeout, REPO_ROOT)
     if result != "pass":
