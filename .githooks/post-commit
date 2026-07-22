@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# gates ladder post-commit ledger (шим; спека Фазы 1.5 §3). НИКОГДА не абортит (git не умеет);
+# сбой — громко в stderr: отсутствие записи безопасно, деплой-гейт заблокирует диапазон.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+bash "$HERE/gates-run" ladder_gate.py record-commit \
+  || echo "[gates] post-commit: запись ladder-ledger НЕ удалась (см. выше) — деплой-гейт заблокирует этот диапазон" >&2
+exit 0
