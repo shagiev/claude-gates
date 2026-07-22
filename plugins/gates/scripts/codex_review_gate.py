@@ -227,16 +227,21 @@ def _code_paths_from_config(cfg: "dict | None") -> "tuple[tuple[str, ...] | None
     return tuple(prefixes), set(exact)
 
 
+def _valid_positive_int(v: object, default: int) -> int:
+    """Положительный int из конфига или дефолт (bool — подкласс int, отсекаем явно).
+    Общая валидация для hard_cap и empirical.timeout_s."""
+    if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+        return default
+    return v
+
+
 def _hard_cap_from_config(cfg: "dict | None") -> int:
     if not isinstance(cfg, dict):
         return _DEFAULT_HARD_CAP
     conv = cfg.get("convergence")
     if not isinstance(conv, dict):
         return _DEFAULT_HARD_CAP
-    hc = conv.get("hard_cap", _DEFAULT_HARD_CAP)
-    if not isinstance(hc, int) or isinstance(hc, bool) or hc < 1:
-        return _DEFAULT_HARD_CAP
-    return hc
+    return _valid_positive_int(conv.get("hard_cap", _DEFAULT_HARD_CAP), _DEFAULT_HARD_CAP)
 
 
 REPO_ROOT = _detect_repo_root()
@@ -331,8 +336,10 @@ def git_head() -> str:
                           check=True).stdout.strip()
 
 
-def diff_sha256(base: str) -> str:
-    diff = subprocess.run(["git", "diff", f"{base}..HEAD"], capture_output=True, text=True,
+def diff_sha256(base: str, head: str = "HEAD") -> str:
+    # head явно (R2-F2): check_reviewed биндит всё к захваченному head_before, а не к «HEAD»,
+    # который мог сдвинуться конкурентным коммитом за время гейта.
+    diff = subprocess.run(["git", "diff", f"{base}..{head}"], capture_output=True, text=True,
                           check=True).stdout
     return hashlib.sha256(diff.encode()).hexdigest()
 
@@ -684,21 +691,129 @@ def _adjudication_prompt_block() -> str:
             "[DISPUTE:Fx] and put the evidence in body.")
 
 
+# ═══════ Эмпирический гейт (спека docs/2026-07-22-empirical-gate-design.md, тикет #1) ═══════
+# Механическая проверка (прогон тест-команды) в порядке ladder → empirical → Codex: тесты
+# падают → блок ДО трат на Codex. Tier 2 (actuator-safety): guard над деплой-актуатором.
+_DEFAULT_EMPIRICAL_TIMEOUT = 600
+
+
+def _empirical_config(root: Path, ref: str) -> "tuple[str, str | None, int]":
+    """Состояние эмпирического гейта на ref (EARS-8/9, трёхстатусно):
+    (state, test_command|None, timeout_s), state ∈ {'absent','enabled','unreadable'}.
+    `absent` — ТОЛЬКО при доказанном отсутствии (успешное чтение дерева без пути ЛИБО
+    прочитанный+распарсенный конфиг без валидной секции). ЛЮБАЯ git/tree/object/парс-ошибка →
+    'unreadable' (R4-F1: git-сбой ≠ «чисто»). Доказательство — `git ls-tree`, НЕ код возврата
+    `git show`/`cat-file -e` (те не различают «нет пути» и «объект не читается»).
+
+    NB: парс-слой (yaml-None/YAMLError/decode → «нечитаемо») НЕ переиспользует _read_gate_config:
+    тому нужен ref-bound blob и ТРЁХСТАТУСНЫЙ исход (unreadable≠absent), а _read_gate_config
+    читает worktree и коллапсирует всё в dict|None — контракт эмпирике не подходит."""
+    d = _DEFAULT_EMPIRICAL_TIMEOUT
+    unreadable, absent = ("unreadable", None, d), ("absent", None, d)
+    ls = subprocess.run(["git", "ls-tree", ref, "--", GATE_CONFIG_NAME],
+                        cwd=root, capture_output=True, text=True)
+    if ls.returncode != 0:
+        return unreadable                       # дерево/ref не прочитано — доказательства нет
+    if not ls.stdout.strip():
+        return absent                           # дерево прочитано, пути нет — ДОКАЗАНО absent
+    blob = subprocess.run(["git", "cat-file", "blob", f"{ref}:{GATE_CONFIG_NAME}"],
+                         cwd=root, capture_output=True)
+    if blob.returncode != 0:
+        return unreadable                       # путь есть, но объект не читается
+    if yaml is None:
+        return unreadable                       # нет PyYAML при наличии файла — не подтвердить
+    try:
+        data = yaml.safe_load(blob.stdout.decode())
+    except (yaml.YAMLError, UnicodeError):
+        return unreadable
+    if not isinstance(data, dict):
+        return absent                           # валидный YAML, не dict — секции нет
+    emp = data.get("empirical")
+    if not isinstance(emp, dict):
+        return absent
+    cmd = emp.get("test_command")
+    if not (isinstance(cmd, str) and cmd.strip()):
+        return absent                           # секция без валидной команды — доказанно не opt-in
+    return ("enabled", cmd.strip(), _valid_positive_int(emp.get("timeout_s", d), d))  # S9
+
+
+def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
+    """Прогон тест-команды. ('pass'|'fail'|'timeout'|'error', хвост вывода). Любой не-'pass' →
+    блок (актуатор-урок: «не запустилось/зависло» ≠ «прошло»).
+
+    argv через `shlex.split` + БЕЗ shell (bounded authority, defense-in-depth): `test_command`
+    исполняется как список аргументов, shell-метасимволы не интерпретируются. Покрывает обычные
+    команды (`python3 -m pytest -q`, `make test`); для пайплайнов/`&&` — обернуть в скрипт и
+    указать его (`test_command: ./run-tests.sh`)."""
+    try:
+        argv = shlex.split(cmd)
+    except ValueError as e:
+        return ("error", f"не разобрать test_command: {e}")   # незакрытая кавычка и т.п.
+    if not argv:
+        return ("error", "пустая test_command")
+    try:
+        r = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return ("timeout", "")
+    except OSError as e:
+        return ("error", f"{type(e).__name__}: {e}")   # команда не найдена и т.п.
+    tail = (r.stdout + r.stderr)[-800:]
+    return ("pass" if r.returncode == 0 else "fail", tail)
+
+
+def _empirical_gate(baseline: str, head: str) -> int:
+    """Эмпирический гейт (0=дальше, 2=блок). head=head_before для привязки к SHA (R2-F2).
+    baseline валидирован выше по потоку (check_reviewed_cli, R3-F2)."""
+    state, cmd, timeout = _empirical_config(REPO_ROOT, head)
+    if state == "unreadable":
+        print("[codex-gate] ✗ empirical: .codex-gate.yaml на HEAD нечитаем (git-сбой/битый YAML/"
+              "нет PyYAML при наличии файла) — состояние гейта не подтвердить. Деплой остановлен "
+              "(осознанный обход — EMPIRICAL_SKIP=1, аудируется).", file=sys.stderr)
+        return 2
+    if state == "absent":
+        base_state, _, _ = _empirical_config(REPO_ROOT, baseline)
+        if base_state == "absent":
+            print("[codex-gate] ⚠️ empirical: тест-команда не задана (empirical.test_command) — "
+                  "гейт ПРОПУЩЕН (opt-in; задай команду в .codex-gate.yaml для проверки тестов).",
+                  file=sys.stderr)
+            return 0
+        print(f"[codex-gate] ✗ empirical: гейт был включён в baseline ({base_state}), на HEAD "
+              "отсутствует/сломан — снятие гейта требует EMPIRICAL_SKIP=1 (аудит, как и скип). "
+              "Деплой остановлен.", file=sys.stderr)
+        return 2
+    print(f"[codex-gate] empirical: прогон «{cmd[:80]}» (timeout {timeout}s)…", file=sys.stderr)
+    result, tail = _run_empirical(cmd, timeout, REPO_ROOT)
+    if result != "pass":
+        print(f"[codex-gate] ✗ empirical: тест-команда → {result} — деплой остановлен "
+              "(тесты должны быть зелёными). Хвост вывода:", file=sys.stderr)
+        if tail:
+            print(tail, file=sys.stderr)
+        return 2
+    if git_head() != head or not working_tree_clean():   # R2-F2: тест для задеплоенного состояния
+        print("[codex-gate] ✗ empirical: HEAD/дерево изменились за время прогона — тест был не "
+              "для задеплоенного состояния. Деплой остановлен, перезапусти.", file=sys.stderr)
+        return 2
+    print("[codex-gate] ✓ empirical: тест-команда зелёная", file=sys.stderr)
+    return 0
+
+
 def check_reviewed_cli() -> int:
     if not _require_repo():
         return 2
     warn_if_strict()
-    if not working_tree_clean():                 # R1-3 — ДО обоих SKIP (Codex P1: skip не
+    if not working_tree_clean():                 # R1-3 — ДО всех SKIP (Codex P1: skip не
         print("[codex-gate] ✗ рабочее дерево грязное — reviewed≡deployed держится только на "  # должен пускать грязь)
               "чистом дереве; закоммить перед деплоем.", file=sys.stderr)
         return 2
+    head_before = git_head()   # R2-F2: захват ОДИН раз после clean-tree; всё биндится к нему
     baseline = resolve_baseline()
     ladder_skip = os.environ.get("LADDER_SKIP") == "1"
     codex_skip = skip_requested()
-    # R1-2/ladder (спека §4): baseline+ancestry нужны И ladder-части, И Codex-части — общая
-    # проверка ДО обеих. Пропускается целиком, только если ОБЕ части скипнуты осознанно
-    # (иначе полный обход двумя SKIP требовал бы существующего baseline впустую).
-    if not (ladder_skip and codex_skip):
+    empirical_skip = os.environ.get("EMPIRICAL_SKIP") == "1"
+    # baseline+ancestry нужны ladder-, empirical- И Codex-частям — общая проверка ДО всех.
+    # Пропускается целиком, только если ВСЕ ТРИ части скипнуты осознанно (R3-F2: иначе
+    # HEAD=absent + неизвестный baseline мог бы пройти как absent/absent в эмпирике).
+    if not (ladder_skip and codex_skip and empirical_skip):
         if baseline is None:                         # R1-2
             print("[codex-gate] ✗ baseline деплоя неизвестен (нет .last-deployed-sha и "
                   "CODEX_DEPLOY_BASELINE) — задай задеплоенный SHA. Деплой остановлен.", file=sys.stderr)
@@ -723,16 +838,25 @@ def check_reviewed_cli() -> int:
               file=sys.stderr)
         return 2
 
-    # --- CODEX часть (прежняя логика; теперь ПОСЛЕ ladder — CODEX_REVIEW_SKIP её не пропускает) ---
+    # --- EMPIRICAL часть (тикет #1: механическая проверка ДО Codex; ladder → empirical → Codex) ---
+    if empirical_skip:
+        reason = os.environ.get("EMPIRICAL_SKIP_REASON", "")
+        audit(f"EMPIRICAL_SKIP=1 — эмпирический гейт пропущен (reason={reason!r})")
+        print("[codex-gate] ⚠️ EMPIRICAL_SKIP=1 — эмпирический гейт пропущен (см. audit).",
+              file=sys.stderr)
+    elif _empirical_gate(baseline, head_before) != 0:   # тесты падают/нечитаемо/снят → блок ДО Codex
+        return 2
+
+    # --- CODEX часть (прежняя логика; теперь ПОСЛЕ ladder+empirical — CODEX_REVIEW_SKIP их не пропускает) ---
     if codex_skip:
-        _record_reviewed(git_head())   # осознанный skip — задеплоенный SHA тоже фиксируем
+        _record_reviewed(head_before)   # осознанный skip — задеплоенный SHA тоже фиксируем (R2-F2)
         audit("CODEX_REVIEW_SKIP=1 — деплой-ревью ПРОПУЩЕНО")
         print("[codex-gate] ⚠️ CODEX_REVIEW_SKIP=1 — деплой-ревью ПРОПУЩЕНО (см. audit). "
               "При активном инциденте актуатора: сначала kill-switch проекта, "
               "потом лечи через гейт.", file=sys.stderr)
         return 0
-    head = git_head()
-    diff_sha = diff_sha256(baseline)
+    head = head_before                        # R2-F2: биндим ledger/reviewed к захваченному SHA
+    diff_sha = diff_sha256(baseline, head_before)
     if read_valid_ledger(head, diff_sha) is not None:
         # Кэш чистого ревью НЕ обходит протокол сходимости (Codex-спор F3: конкурентная
         # сессия могла записать open-находку в серию — кэш её не видел).

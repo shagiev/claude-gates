@@ -221,6 +221,8 @@ def _clean(monkeypatch):
     # Task 5: check_reviewed_cli теперь требует ladder-range-покрытие baseline..HEAD;
     # тесты, не проверяющие ladder-логику специально, глушат её нейтральным "покрыт".
     monkeypatch.setattr(g, "_ladder_check", lambda baseline: 0)
+    # тикет #1: эмпирический гейт добавлен в цепочку; тесты, не проверяющие его, глушат в "0".
+    monkeypatch.setattr(g, "_empirical_gate", lambda baseline, head: 0)
 
 
 def test_check_reviewed_blocks_on_critical(tmp_path, monkeypatch):
@@ -697,17 +699,29 @@ def test_check_reviewed_ladder_skip_does_not_bypass_codex(tmp_path, monkeypatch)
     assert "LADDER_SKIP" in (tmp_path / "audit.log").read_text()
 
 
-def test_check_reviewed_both_skips_full_bypass(tmp_path, monkeypatch):   # (г)
+def test_check_reviewed_all_skips_full_bypass(tmp_path, monkeypatch):   # (г) тикет #1: ТРИ скипа
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(g, "working_tree_clean", lambda: True)
-    monkeypatch.setattr(g, "resolve_baseline", lambda: None)   # оба скипа — даже без baseline
+    monkeypatch.setattr(g, "resolve_baseline", lambda: None)   # ВСЕ ТРИ скипа — даже без baseline
     monkeypatch.setenv("LADDER_SKIP", "1")
     monkeypatch.setenv("CODEX_REVIEW_SKIP", "1")
+    monkeypatch.setenv("EMPIRICAL_SKIP", "1")
     assert g.check_reviewed_cli() == 0
     audit_text = (tmp_path / "audit.log").read_text()
     assert "LADDER_SKIP" in audit_text
     assert "CODEX_REVIEW_SKIP" in audit_text
+    assert "EMPIRICAL_SKIP" in audit_text
+
+
+def test_check_reviewed_two_skips_still_needs_baseline(tmp_path, monkeypatch):   # R3-F2
+    # LADDER_SKIP+CODEX_REVIEW_SKIP без EMPIRICAL_SKIP → baseline всё ещё обязателен (эмпирике)
+    monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
+    monkeypatch.setattr(g, "working_tree_clean", lambda: True)
+    monkeypatch.setattr(g, "resolve_baseline", lambda: None)
+    monkeypatch.setenv("LADDER_SKIP", "1")
+    monkeypatch.setenv("CODEX_REVIEW_SKIP", "1")
+    assert g.check_reviewed_cli() == 2   # baseline None + эмпирика не скипнута → блок (S15)
 
 
 def test_dependency_manifests_are_code_paths():   # Codex final P2: манифесты ставятся в прод

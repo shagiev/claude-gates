@@ -32,3 +32,6 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     monkeypatch.setattr(g, "LAST_REVIEWED", tmp_path / ".last-reviewed-sha-auto")
     monkeypatch.setattr(g, "LAST_DEPLOYED", tmp_path / ".last-deployed-sha-auto")
     monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".design-approved-auto")
+    # ambient EMPIRICAL_SKIP (напр. из ручного `EMPIRICAL_SKIP=1 make deploy`) не должен
+    # контаминировать gate-тесты (как LADDER_SKIP/CODEX_REVIEW_SKIP).
+    monkeypatch.delenv("EMPIRICAL_SKIP", raising=False)
