@@ -26,14 +26,20 @@ empirical:
 
 ## Scenario-first: пространство входов (ТЕКСТ до кода)
 
-**Трёхстатусная модель конфига (R2-F1)** `_empirical_state(ref)` — читает `git show
-<ref>:.codex-gate.yaml`, различает ТРИ состояния (нельзя путать «нечитаемо» с «выключено»):
-- **`absent`**: `git show` вернул non-zero (файла нет на ref) ЛИБО файл распарсился и валидной
-  `empirical.test_command` в нём нет. Это *доказанное* отсутствие гейта (PyYAML не нужен, если
-  файла нет вовсе).
-- **`enabled(cmd)`**: файл распарсился И `test_command` — непустая строка.
-- **`unreadable`**: файл ЕСТЬ (git show вернул содержимое), но распарсить нельзя — нет PyYAML,
-  YAML-ошибка, decode-ошибка. «Нет доказательства opt-in» ≠ «доказано, что opt-in нет».
+**Трёхстатусная модель конфига (R2-F1/R3-F1)** `_empirical_state(ref)` различает ТРИ
+состояния; `absent` — только при ДОКАЗАННОМ отсутствии, git-сбой ≠ absent:
+- Сначала валидировать ref (`git rev-parse --verify <ref>^{commit}`) — не валиден → **`unreadable`**.
+- `git cat-file -e <ref>:.codex-gate.yaml`: non-zero при валидном ref = путь не в дереве →
+  кандидат в `absent`; но ЛЮБАЯ git/object/OS-ошибка (не «нет пути») → **`unreadable`**
+  (R3-F1: non-zero от `git show` также даёт битый blob/сбой Git — degraded dependency НЕ
+  трактуем как «чисто»). Доказательство отсутствия — отдельным `cat-file -e` при валидном ref.
+- **`absent`**: ДОКАЗАНО нет файла на ref (валидный ref + `cat-file -e` = «нет пути») ЛИБО файл
+  прочитан и распарсен, но валидной `empirical.test_command` в нём нет. (PyYAML не нужен, если
+  файла нет — доказывается по git, не парсером.)
+- **`enabled(cmd)`**: файл прочитан и распарсен И `test_command` — непустая строка.
+- **`unreadable`**: невалидный ref; ошибка чтения существующего пути (битый blob, OSError);
+  файл есть, но не парсится (нет PyYAML, YAML-ошибка, decode). «Нет доказательства opt-in» ≠
+  «доказано, что opt-in нет».
 
 Измерения:
 - **D1 состояние HEAD**: {absent, enabled(cmd), unreadable}
@@ -42,19 +48,27 @@ empirical:
 - **D4 `EMPIRICAL_SKIP`**: {не задан, "1"}
 - **D5 `timeout_s`**: {отсутствует→дефолт, валидный, невалидный(не-int/<1)→дефолт}
 - **D6 HEAD/дерево во время команды**: {неизменны, HEAD сменился, дерево загрязнилось}
+- **D7 baseline** (R3-F2): {валидный ancestor, неизвестен/невалиден}
+
+**Baseline обязателен эмпирике (R3-F2).** `check_reviewed_cli` валидирует baseline (resolve +
+ancestry) НЕ при «двух скипах», а пока не заданы ВСЕ ТРИ (`ladder_skip and codex_skip and
+empirical_skip`). Эмпирика читает `base_state` от валидированного baseline; если baseline
+неизвестен/не-предок, а `EMPIRICAL_SKIP` не задан → блок ДО чтения base (иначе HEAD=absent +
+неизвестный base мог бы пройти как absent/absent).
 
 **Правило решения (анти-fail-open):**
 ```
 если EMPIRICAL_SKIP=1        → скип + аудит (перекрывает всё)
-иначе если HEAD=unreadable   → БЛОК (не подтвердить состояние гейта; вкл. «нет PyYAML при конфиге»)
+иначе если HEAD=unreadable   → БЛОК (не подтвердить состояние гейта; вкл. git-сбой, «нет PyYAML при конфиге»)
 иначе если HEAD=enabled(cmd) → бежим cmd (D3)
 иначе (HEAD=absent):
+    baseline валидирован выше по потоку (иначе уже блок)
     если baseline=absent     → СКИП (доказано: гейт никогда не был opt-in)
     иначе (base enabled|unreadable) → БЛОК (нельзя доказать, что снятие opt-in легитимно)
 ```
-Скип разрешён ТОЛЬКО при доказанном `absent` на обоих SHA. Отключение гейта (удаление секции/
-подмена на `true`/порча YAML) = скип гейта: оба через один аудируемый `EMPIRICAL_SKIP`.
-Защита самодостаточна (не полагается на «увидит Codex» — связка `CODEX_REVIEW_SKIP`+порча).
+Скип разрешён ТОЛЬКО при доказанном `absent` на обоих SHA И валидном baseline. Отключение
+гейта (удаление секции/подмена на `true`/порча YAML/git-сбой) = скип гейта: все через один
+аудируемый `EMPIRICAL_SKIP`. Не полагается на «увидит Codex» (связка `CODEX_REVIEW_SKIP`+порча).
 
 Сценарии (= тест-матрица):
 
@@ -75,10 +89,13 @@ empirical:
 | S11 | `CODEX_REVIEW_SKIP=1` + HEAD=enabled, D3=exit≠0 | **БЛОК** — эмпирика независима от Codex-скипа |
 | S12 | HEAD=enabled, D3=exit0, D6=HEAD сменился | **БЛОК (2)** — тест не для задеплоенного SHA (R2-F2) |
 | S13 | HEAD=enabled, D3=exit0, D6=дерево загрязнилось | **БЛОК (2)** — дерево ≠ проверенному (R2-F2) |
+| S14 | HEAD: невалидный ref / git-сбой чтения существующего пути | **БЛОК (2)** — `unreadable`, не absent (R3-F1) |
+| S15 | LADDER_SKIP+CODEX_REVIEW_SKIP заданы, EMPIRICAL_SKIP нет, D7=baseline неизвестен | **БЛОК (2)** — baseline обязателен эмпирике (R3-F2) |
 
-Проверка полноты: каждое значение D1–D6 встречается ≥1 раз; ключевые комбинации —
-unreadable≠absent (S7b vs S8), was-on×now-off (S7 vs S8), base-unreadable (S8b),
-ordering (S10), независимость от Codex-скипа (S11), race (S12/S13), escape (S6).
+Проверка полноты: каждое значение D1–D7 встречается ≥1 раз; ключевые комбинации —
+unreadable≠absent (S7b vs S8, S14), was-on×now-off (S7 vs S8), base-unreadable (S8b),
+ordering (S10), независимость от Codex-скипа (S11), race (S12/S13), baseline-обязателен (S15),
+escape (S6).
 
 Осознанно ВНЕ scope: флейки/ретраи (дело стабильной команды пользователя), coverage-порог
 (внутри тест-команды), запуск в контейнере/изоляции (бежим в cwd репо, как деплой), инкрементальный
@@ -99,8 +116,12 @@ ordering (S10), независимость от Codex-скипа (S11), race (S1
 - **EARS-8:** IF HEAD=unreadable (файл есть, парс невозможен) ИЛИ (HEAD=absent И baseline∈
   {enabled, unreadable}) — THEN гейт SHALL заблокировать деплой (fail-closed), кроме
   `EMPIRICAL_SKIP`. (S7, S7b, S8b) — снятие/поломка гейта требует того же аудируемого действия, что и скип.
-- **EARS-9:** Конфиг (HEAD и baseline) SHALL читаться привязанно к SHA (`git show <ref>:…`),
-  не из worktree; `absent` определяется без PyYAML (по коду возврата `git show`).
+- **EARS-9:** Конфиг (HEAD и baseline) SHALL читаться привязанно к SHA, не из worktree;
+  `absent` SHALL доказываться отдельно (валидный ref + `cat-file -e`), а ЛЮБАЯ git/object/OS-
+  ошибка SHALL классифицироваться как `unreadable`, не `absent` (R3-F1). (S14)
+- **EARS-11:** `check_reviewed_cli` SHALL валидировать baseline (resolve + ancestry), пока не
+  заданы ВСЕ ТРИ скипа (`ladder_skip and codex_skip and empirical_skip`); IF эмпирика не
+  скипнута, а baseline неизвестен/не-предок — THEN блок до чтения base_state. (S15)
 - **EARS-10:** `check_reviewed_cli` SHALL захватить `head_before` один раз после clean-tree и
   использовать его ВЕЗДЕ (чтение конфига, diff_sha, все `_record_reviewed`, включая
   `CODEX_REVIEW_SKIP`-ветку); IF после прогона команды `HEAD≠head_before` ИЛИ дерево грязное —
