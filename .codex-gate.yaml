@@ -11,7 +11,7 @@ code_paths:
 
 ladder:
   enabled: true
-  epoch_sha: "4041016436539ee24a4bdeca44f3ded66ecfbdbb"
+  epoch_sha: "da8e727143e4e5795d84b57f31135af33d4bf116"
 
 convergence:
   hard_cap: 8
