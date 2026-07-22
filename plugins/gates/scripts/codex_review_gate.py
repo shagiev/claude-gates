@@ -1027,6 +1027,21 @@ def _hash_file(path: Path) -> "str | None":
         return None
 
 
+@contextlib.contextmanager
+def _marker_lock(session: str):
+    """Эксклюзивный per-session лок (code-R1 F2: незалоченный read-modify-write набора биндингов
+    терял дизайн при конкурентных write-marker одной сессии → дрейф потерянного проходил)."""
+    path = _marker_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lf = open(str(path) + ".lock", "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
+
 def write_marker(kind: str, detail: str, design_hash: str | None = None) -> None:
     """inline/trivial маркер (легаси-контракт). File-режим — add_design_file_binding (тикет #3)."""
     session = _env_session()
@@ -1044,17 +1059,18 @@ def add_design_file_binding(detail: str, design_file: str, reviewed_hash: str) -
     Возвращает 0 при sha256(файл)==reviewed_hash, иначе 2 (записанный несовпадающий биндинг
     делает has_marker drifted — маркер невалиден целиком, R2-F1)."""
     session = _env_session()
-    rec = _load_marker(session)
-    designs = []
-    if rec and rec.get("session") == session and rec.get("kind") == "design" \
-            and isinstance(rec.get("designs"), list):
-        designs = [b for b in rec["designs"]              # прочие биндинги сохраняем
-                   if isinstance(b, dict) and b.get("file") != design_file]
-    designs.append({"file": design_file, "hash": reviewed_hash})
-    _write_marker_payload(session, {
-        "kind": "design", "detail": detail, "designs": designs,
-        "session": session, "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    with _marker_lock(session):                           # code-R1 F2: load+merge+write атомарно
+        rec = _load_marker(session)
+        designs = []
+        if rec and rec.get("session") == session and rec.get("kind") == "design" \
+                and isinstance(rec.get("designs"), list):
+            designs = [b for b in rec["designs"]          # прочие биндинги сохраняем
+                       if isinstance(b, dict) and b.get("file") != design_file]
+        designs.append({"file": design_file, "hash": reviewed_hash})
+        _write_marker_payload(session, {
+            "kind": "design", "detail": detail, "designs": designs,
+            "session": session, "ts": datetime.now(timezone.utc).isoformat(),
+        })
     current = _hash_file(REPO_ROOT / design_file)
     if current != reviewed_hash:
         audit(f"design-file-binding MISMATCH session={session} file={design_file!r} "
@@ -1251,16 +1267,17 @@ def main(argv: list[str]) -> int:
         detail = args[1] if len(args) > 1 else ""
         rest = args[2:]
         design_file = None
-        if "--file" in rest:                       # тикет #3: file-режим design-маркера
+        file_flag = "--file" in rest               # тикет #3: file-режим design-маркера
+        if file_flag:
             i = rest.index("--file")
             design_file = rest[i + 1] if i + 1 < len(rest) else None
             rest = rest[:i] + rest[i + 2:]
         reviewed_hash = rest[0] if rest else None
-        if kind == "design" and design_file:
-            if not reviewed_hash:
+        if file_flag:      # code-R1 F1: --file задан → СТРОГО file-режим, НЕ проваливаться в inline
+            if kind != "design" or not design_file or not reviewed_hash:
                 print("usage: write-marker design <detail> <reviewed_hash> --file <path>",
                       file=sys.stderr)
-                return 1
+                return 1                            # ошибка аргументов НЕ пишет маркер (fail-closed)
             return add_design_file_binding(detail, design_file, reviewed_hash)
         if kind == "design":       # F2 (altitude): inline design без --file = БЕЗ дрейф-защиты —
             print("[codex-gate] ⚠️ inline design-маркер (без --file) НЕ защищён от дрейфа: "  # громко, не молча

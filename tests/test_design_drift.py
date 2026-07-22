@@ -158,3 +158,41 @@ def test_cli_write_marker_file(env):
     assert g.has_marker("s1") is True
     (env / "design.md").write_text("v2")
     assert g.main(["write-marker", "design", "approved", h, "--file", "design.md"]) == 2  # mismatch
+
+
+# ═══ code-R1: аргумент-ошибки --file + конкурентность ═══
+
+def test_cli_file_flag_without_value_fails_no_marker(env):
+    # code-R1 F1: `--file` без пути НЕ должен молча создать валидный inline-маркер
+    assert g.main(["write-marker", "design", "d", _h("x"), "--file"]) == 1
+    assert g.has_marker("s1") is False              # маркер НЕ записан
+    assert g.main(["write-marker", "design", "d", _h("x"), "--file", ""]) == 1
+    assert g.has_marker("s1") is False
+
+
+def test_cli_inline_still_works_and_warns(env, capsys):
+    # без --file — inline легаси, но с громким warning
+    assert g.main(["write-marker", "design", "approved", "deadbeef"]) == 0
+    assert g.has_marker("s1") is True
+    assert "защищён от дрейфа" in capsys.readouterr().err
+
+
+def test_concurrent_bindings_all_survive(env):
+    # code-R1 F2: конкурентные add одной сессии не теряют биндинги (per-session lock)
+    import threading
+    files = [f"d{i}.md" for i in range(12)]
+    hashes = {f: _write_design(env, f, f"content-{f}") for f in files}
+    barrier = threading.Barrier(len(files))
+
+    def add(f):
+        barrier.wait()                              # старт одновременно — провоцируем гонку
+        g.add_design_file_binding("d", f, hashes[f])
+
+    threads = [threading.Thread(target=add, args=(f,)) for f in files]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rec = json.loads((env / ".design-approved-s1").read_text())
+    assert {b["file"] for b in rec["designs"]} == set(files)   # ни один не потерян
+    assert g._marker_state("s1") == "valid"
