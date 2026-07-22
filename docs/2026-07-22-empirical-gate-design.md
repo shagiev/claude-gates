@@ -117,9 +117,12 @@ escape (S6).
 - **EARS-8:** IF HEAD=unreadable (файл есть, парс невозможен) ИЛИ (HEAD=absent И baseline∈
   {enabled, unreadable}) — THEN гейт SHALL заблокировать деплой (fail-closed), кроме
   `EMPIRICAL_SKIP`. (S7, S7b, S8b) — снятие/поломка гейта требует того же аудируемого действия, что и скип.
-- **EARS-9:** Конфиг (HEAD и baseline) SHALL читаться привязанно к SHA, не из worktree;
-  `absent` SHALL доказываться отдельно (валидный ref + `cat-file -e`), а ЛЮБАЯ git/object/OS-
-  ошибка SHALL классифицироваться как `unreadable`, не `absent` (R3-F1). (S14)
+- **EARS-9:** Конфиг (HEAD и baseline) SHALL читаться привязанно к SHA, не из worktree.
+  `absent` SHALL доказываться ТОЛЬКО успешным чтением дерева (`git ls-tree <ref> -- path` →
+  exit 0 + пустой вывод), либо успешно прочитанным-и-распарсенным blob без секции; ЛЮБАЯ
+  git/tree/object/OS-ошибка (ls-tree non-zero, blob не читается) SHALL классифицироваться как
+  `unreadable`, НЕ `absent` (R4-F1). `cat-file -e`/код возврата `git show` как доказательство
+  absent НЕ использовать (не различает «нет пути» и «объект не читается»). (S14)
 - **EARS-11:** `check_reviewed_cli` SHALL валидировать baseline (resolve + ancestry), пока не
   заданы ВСЕ ТРИ скипа (`ladder_skip and codex_skip and empirical_skip`); IF эмпирика не
   скипнута, а baseline неизвестен/не-предок — THEN блок до чтения base_state. (S15)
