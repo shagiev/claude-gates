@@ -702,44 +702,51 @@ def _adjudication_prompt_block() -> str:
 _DEFAULT_EMPIRICAL_TIMEOUT = 600
 
 
-def _empirical_config(root: Path, ref: str) -> "tuple[str, str | None, int]":
-    """Состояние эмпирического гейта на ref (EARS-8/9, трёхстатусно):
-    (state, test_command|None, timeout_s), state ∈ {'absent','enabled','unreadable'}.
+def _config_section_at_ref(root: Path, ref: str, section: str) -> "tuple[str, dict | None]":
+    """SHA-bound чтение секции конфига (generic, спека inframon-интерфейса):
+    (state, секция-dict|None), state ∈ {'absent','enabled','unreadable'}.
     `absent` — ТОЛЬКО при доказанном отсутствии (успешное чтение дерева без пути ЛИБО
-    прочитанный+распарсенный конфиг без валидной секции). ЛЮБАЯ git/tree/object/парс-ошибка →
-    'unreadable' (R4-F1: git-сбой ≠ «чисто»). Доказательство — `git ls-tree`, НЕ код возврата
+    прочитанный+распарсенный конфиг без секции-dict). ЛЮБАЯ git/tree/object/парс-ошибка →
+    'unreadable' (git-сбой ≠ «чисто»). Доказательство — `git ls-tree`, НЕ код возврата
     `git show`/`cat-file -e` (те не различают «нет пути» и «объект не читается»).
 
-    NB: парс-слой (yaml-None/YAMLError/decode → «нечитаемо») НЕ переиспользует _read_gate_config:
-    тому нужен ref-bound blob и ТРЁХСТАТУСНЫЙ исход (unreadable≠absent), а _read_gate_config
-    читает worktree и коллапсирует всё в dict|None — контракт эмпирике не подходит."""
-    d = _DEFAULT_EMPIRICAL_TIMEOUT
-    unreadable, absent = ("unreadable", None, d), ("absent", None, d)
+    NB: парс-слой НЕ переиспользует _read_gate_config: тому нужен ref-bound blob и
+    ТРЁХСТАТУСНЫЙ исход, а _read_gate_config читает worktree и коллапсирует в dict|None."""
     ls = subprocess.run(["git", "ls-tree", ref, "--", GATE_CONFIG_NAME],
                         cwd=root, capture_output=True, text=True)
     if ls.returncode != 0:
-        return unreadable                       # дерево/ref не прочитано — доказательства нет
+        return ("unreadable", None)             # дерево/ref не прочитано — доказательства нет
     if not ls.stdout.strip():
-        return absent                           # дерево прочитано, пути нет — ДОКАЗАНО absent
+        return ("absent", None)                 # дерево прочитано, пути нет — ДОКАЗАНО absent
     blob = subprocess.run(["git", "cat-file", "blob", f"{ref}:{GATE_CONFIG_NAME}"],
                          cwd=root, capture_output=True)
     if blob.returncode != 0:
-        return unreadable                       # путь есть, но объект не читается
+        return ("unreadable", None)             # путь есть, но объект не читается
     if yaml is None:
-        return unreadable                       # нет PyYAML при наличии файла — не подтвердить
+        return ("unreadable", None)             # нет PyYAML при наличии файла — не подтвердить
     try:
         data = yaml.safe_load(blob.stdout.decode())
     except (yaml.YAMLError, UnicodeError):
-        return unreadable
+        return ("unreadable", None)
     if not isinstance(data, dict):
-        return absent                           # валидный YAML, не dict — секции нет
-    emp = data.get("empirical")
-    if not isinstance(emp, dict):
-        return absent
-    cmd = emp.get("test_command")
+        return ("absent", None)                 # валидный YAML, не dict — секции нет
+    sec = data.get(section)
+    if not isinstance(sec, dict):
+        return ("absent", None)
+    return ("enabled", sec)
+
+
+def _empirical_config(root: Path, ref: str) -> "tuple[str, str | None, int]":
+    """Состояние эмпирического гейта на ref (EARS-8/9 эмпирики, поверх generic-читателя):
+    (state, test_command|None, timeout_s). Секция без валидной команды = absent (не opt-in)."""
+    d = _DEFAULT_EMPIRICAL_TIMEOUT
+    state, sec = _config_section_at_ref(root, ref, "empirical")
+    if state != "enabled":
+        return (state, None, d)
+    cmd = sec.get("test_command")
     if not (isinstance(cmd, str) and cmd.strip()):
-        return absent                           # секция без валидной команды — доказанно не opt-in
-    return ("enabled", cmd.strip(), _valid_positive_int(emp.get("timeout_s", d), d))  # S9
+        return ("absent", None, d)              # секция без валидной команды — доказанно не opt-in
+    return ("enabled", cmd.strip(), _valid_positive_int(sec.get("timeout_s", d), d))  # S9
 
 
 def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
@@ -764,6 +771,180 @@ def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
         return ("error", f"{type(e).__name__}: {e}")   # команда не найдена и т.п.
     tail = (r.stdout + r.stderr)[-800:]
     return ("pass" if r.returncode == 0 else "fail", tail)
+
+
+# ═══════ Локальная Фаза 2: интерфейс к inframon (спека 2026-07-23-inframon-interface) ═══════
+# Ф1: authoritative baseline через deploy.baseline_command (pin одобренной секции — анти-
+# self-hiding); Ф2: машиночитаемый вердикт деплой-гейта для внешнего guard'а (inframon).
+_DEFAULT_BASELINE_TIMEOUT = 30
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+DEPLOY_PIN = (REPO_ROOT / ".claude" / ".deploy-section-pin") if REPO_ROOT else None
+_verdict_env = os.environ.get("CODEX_VERDICT_DIR")
+VERDICT_DIR = Path(_verdict_env) if _verdict_env else (
+    (REPO_ROOT / "logs" / "review_verdicts") if REPO_ROOT else None)
+
+
+def _deploy_section_hash(sec: dict) -> str:
+    return hashlib.sha256(json.dumps(sec, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _read_pin() -> "str | None | object":
+    """Значение pin ('<hash>'|'disabled') | None (нет файла) | _PIN_CORRUPT (битый —
+    fail-closed как несовпадение, спека B9b)."""
+    if not DEPLOY_PIN.exists():
+        return None
+    try:
+        rec = json.loads(DEPLOY_PIN.read_text())
+        pin = rec.get("pin")
+        return pin if isinstance(pin, str) and pin else _PIN_CORRUPT
+    except (OSError, json.JSONDecodeError):
+        return _PIN_CORRUPT
+
+
+_PIN_CORRUPT = object()
+
+
+def _write_pin(value: str) -> None:
+    _atomic_write_json(DEPLOY_PIN, {"pin": value, "ts": datetime.now(timezone.utc).isoformat()})
+
+
+def _run_baseline_command(cmd: str, timeout_s: int) -> "str | None":
+    """Прогон baseline_command (argv, без shell — как test_command). Полный 40-hex SHA после
+    strip; всё прочее (fail/timeout/мусор) → None (fail-closed у вызывающего, НЕ фолбэк)."""
+    try:
+        argv = shlex.split(cmd)
+        if not argv:
+            return None
+        r = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
+                          timeout=timeout_s)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip().lower()
+    return out if _SHA40_RE.match(out) else None
+
+
+def _resolve_baseline_gate(head: str) -> "tuple[str | None, int]":
+    """(baseline, rc). rc=2 — блок (сообщение напечатано); rc=0 — baseline (может быть None →
+    существующая R1-2 логика решает дальше). Порядок (спека B1–B12): env-переход (аудит EARS-3/3b,
+    обновление pin) → pin-сверка секции deploy (head_before) → команда (no-fallback) → легаси."""
+    env = os.environ.get("CODEX_DEPLOY_BASELINE", "").strip()
+    state, sec = _config_section_at_ref(REPO_ROOT, head, "deploy")
+    if state == "unreadable" and not env:
+        print("[codex-gate] ✗ секция deploy в .codex-gate.yaml на HEAD нечитаема (git-сбой/битый "
+              "YAML/нет PyYAML) — состояние authoritative-baseline не подтвердить. Деплой "
+              "остановлен (переход/обход — явный CODEX_DEPLOY_BASELINE).", file=sys.stderr)
+        return (None, 2)
+    cmd = None
+    timeout = _DEFAULT_BASELINE_TIMEOUT
+    if state == "enabled":
+        c = sec.get("baseline_command")
+        if isinstance(c, str) and c.strip():
+            cmd = c.strip()
+            timeout = _valid_positive_int(sec.get("baseline_timeout_s", timeout), timeout)
+    section_pin = _deploy_section_hash(sec) if cmd else "disabled"
+    pin = _read_pin()
+    if env:
+        # env-переход: EARS-3 (перебив authoritative) + EARS-3b (ЛЮБОЕ изменение pin — аудит)
+        if cmd:
+            audit(f"CODEX_DEPLOY_BASELINE={env[:12]} перебил authoritative baseline_command (B7)")
+        if pin is _PIN_CORRUPT or pin != section_pin:
+            old = "corrupt" if pin is _PIN_CORRUPT else (pin or "none")
+            audit(f"deploy-section pin переход: {old} → {section_pin[:12] if cmd else 'disabled'} "
+                  f"(env-переход, EARS-3b)")
+            _write_pin(section_pin)
+        return (env, 0)
+    if cmd:                                       # секция enabled
+        if pin is None:
+            print("[codex-gate] ✗ deploy.baseline_command активирован впервые — переходный деплой "
+                  "только через явный CODEX_DEPLOY_BASELINE (аудируется, запишет pin). Деплой "
+                  "остановлен.", file=sys.stderr)
+            return (None, 2)
+        if pin is _PIN_CORRUPT or pin != section_pin:
+            print("[codex-gate] ✗ секция deploy изменилась относительно одобренного pin (или pin "
+                  "битый) — самоскрывающаяся смена baseline_command блокируется (спека R1-F1). "
+                  "Переход — явный CODEX_DEPLOY_BASELINE. Деплой остановлен.", file=sys.stderr)
+            return (None, 2)
+        sha = _run_baseline_command(cmd, timeout)
+        if sha is None:                           # no-fallback (EARS-2): НЕ откатываемся на файл
+            print("[codex-gate] ✗ authoritative baseline_command упал/таймаут/невалидный вывод — "
+                  "деплой остановлен. Фолбэк на локальный .last-deployed-sha ЗАПРЕЩЁН (протухший "
+                  "файл = не тот диапазон ревью). Почини источник или явный CODEX_DEPLOY_BASELINE.",
+                  file=sys.stderr)
+            return (None, 2)
+        return (sha, 0)
+    # секция absent
+    if pin is None:                               # bootstrap (R2-F1): absent не доказывает legacy
+        legacy = resolve_baseline()
+        if legacy is not None:
+            b_state, b_sec = _config_section_at_ref(REPO_ROOT, legacy, "deploy")
+            b_cmd = b_state == "enabled" and isinstance(b_sec.get("baseline_command"), str) \
+                and b_sec["baseline_command"].strip()
+            if b_state == "unreadable" or b_cmd:
+                print("[codex-gate] ✗ на baseline секция deploy была включена/нечитаема, на HEAD "
+                      "отсутствует, pin нет (новая машина?) — удаление authoritative-источника "
+                      "требует явного CODEX_DEPLOY_BASELINE (аудируется). Деплой остановлен.",
+                      file=sys.stderr)
+                return (None, 2)
+            _write_pin("disabled")                # честный legacy — bootstrap завершён (B12)
+        return (legacy, 0)
+    if pin is _PIN_CORRUPT or pin != "disabled":  # была enabled, секцию удалили без перехода
+        print("[codex-gate] ✗ секция deploy удалена, но pin помнит authoritative-источник — "
+              "удаление без перехода блокируется. Явный CODEX_DEPLOY_BASELINE (аудируется). "
+              "Деплой остановлен.", file=sys.stderr)
+        return (None, 2)
+    return (resolve_baseline(), 0)                # pin=disabled → легаси честно
+
+
+def _ladder_range_skips(baseline: str) -> "list[str]":
+    try:
+        from ladder_gate import range_skips
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from ladder_gate import range_skips  # type: ignore[no-redef]
+    return range_skips(REPO_ROOT, baseline)
+
+
+@contextlib.contextmanager
+def _verdict_lock():
+    VERDICT_DIR.mkdir(parents=True, exist_ok=True)
+    lf = open(VERDICT_DIR / ".lock", "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+        lf.close()
+
+
+def _write_deploy_verdict(head: str, baseline: "str | None", diff_sha: str,
+                          ladder_st: str, empirical_st: str, codex_st: str) -> int:
+    """Ф2: машиночитаемый вердикт для inframon. Delete-then-write под локом (R1-F2/R2-F2).
+    0 = ок/best-effort-warning; 2 = блок (unlink упал, старый вердикт остался бы маскировать)."""
+    path = VERDICT_DIR / f"{head}.json"
+    import time as _time
+    payload = {
+        "schema": 1, "run_id": f"{int(_time.time() * 1000)}-{os.getpid()}",
+        "head_sha": head, "baseline_sha": baseline or "", "diff_sha256": diff_sha,
+        "gates": {"ladder": ladder_st, "empirical": empirical_st, "codex": codex_st},
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    with _verdict_lock():
+        try:
+            path.unlink(missing_ok=True)          # delete-then-write: старый НЕ должен пережить
+        except OSError:
+            if path.exists():                     # V5b: не убрать вводящий в заблуждение старый
+                print("[codex-gate] ✗ не удалить старый вердикт — он маскировал бы текущие "
+                      "скипы. Деплой остановлен.", file=sys.stderr)
+                return 2
+        try:
+            _atomic_write_json(path, payload, indent=2)
+        except OSError as e:                      # V5: файла нет → consumer fail-closed честен
+            print(f"[codex-gate] ⚠️ вердикт НЕ записан ({type(e).__name__}: {e}) — inframon "
+                  "увидит отсутствие вердикта (его fail-closed). Деплой продолжается.",
+                  file=sys.stderr)
+    return 0
 
 
 def _empirical_gate(baseline: str, head: str) -> int:
@@ -822,7 +1003,9 @@ def check_reviewed_cli() -> int:
               "чистом дереве; закоммить перед деплоем.", file=sys.stderr)
         return 2
     head_before = git_head()   # R2-F2: захват ОДИН раз после clean-tree; всё биндится к нему
-    baseline = resolve_baseline()
+    baseline, rc_b = _resolve_baseline_gate(head_before)   # inframon Ф1: pin/authoritative/легаси
+    if rc_b:
+        return 2
     ladder_skip = os.environ.get("LADDER_SKIP") == "1"
     codex_skip = skip_requested()
     empirical_skip = os.environ.get("EMPIRICAL_SKIP") == "1"
@@ -863,6 +1046,19 @@ def check_reviewed_cli() -> int:
     elif _empirical_gate(baseline, head_before) != 0:   # тесты падают/нечитаемо/снят → блок ДО Codex
         return 2
 
+    # Статусы для вердикта inframon (Ф2): скипы и исторические обходы диапазона — видимы
+    def _verdict_statuses(codex_st: str) -> "tuple[str, str, str]":
+        if ladder_skip:
+            ladder_st = "skipped"
+        else:
+            ladder_st = "covered-with-skips" if _ladder_range_skips(baseline) else "covered"
+        if empirical_skip:
+            empirical_st = "skipped"
+        else:
+            e_state = _empirical_config(REPO_ROOT, head_before)[0]
+            empirical_st = "pass" if e_state == "enabled" else "not-configured"
+        return (ladder_st, empirical_st, codex_st)
+
     # --- CODEX часть (прежняя логика; теперь ПОСЛЕ ladder+empirical — CODEX_REVIEW_SKIP их не пропускает) ---
     if codex_skip:
         _record_reviewed(head_before)   # осознанный skip — задеплоенный SHA тоже фиксируем (R2-F2)
@@ -870,6 +1066,11 @@ def check_reviewed_cli() -> int:
         print("[codex-gate] ⚠️ CODEX_REVIEW_SKIP=1 — деплой-ревью ПРОПУЩЕНО (см. audit). "
               "При активном инциденте актуатора: сначала kill-switch проекта, "
               "потом лечи через гейт.", file=sys.stderr)
+        l_st, e_st, c_st = _verdict_statuses("skipped")
+        if _write_deploy_verdict(head_before, baseline,
+                                 diff_sha256(baseline, head_before) if baseline else "",
+                                 l_st, e_st, c_st):
+            return 2
         return 0
     head = head_before                        # R2-F2: биндим ledger/reviewed к захваченному SHA
     diff_sha = diff_sha256(baseline, head_before)
@@ -892,6 +1093,9 @@ def check_reviewed_cli() -> int:
             return 2
         else:
             _record_reviewed(head)
+            l_st, e_st, c_st = _verdict_statuses("cached")
+            if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st):
+                return 2
             print("[codex-gate] ✓ валидная запись ревью для HEAD — деплой разрешён")
             return 0
     # Ledger серии — ДО прогона ревью (протокол-догфуд F2: иначе адъюдикации ПРОШЛОЙ
@@ -937,6 +1141,9 @@ def check_reviewed_cli() -> int:
         for sev, title in verdict.findings:
             if sev not in SEVERITY_BLOCKING:   # совещательные — показать оператору
                 print(f"    [{sev}] {title}", file=sys.stderr)
+        l_st, e_st, c_st = _verdict_statuses("allow")
+        if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st):
+            return 2
         print(msg)
         print("[codex-gate] ✓ деплой разрешён (протокол сходимости)")
         return 0

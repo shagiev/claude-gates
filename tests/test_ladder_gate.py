@@ -514,3 +514,20 @@ def test_compute_tree_immune_to_racy_same_size_edit(repo):
     t0 = lg.compute_tree(repo)
     (repo / "app" / "x.py").write_text("x = 2\n")   # same size, та же секунда
     assert lg.compute_tree(repo) != t0
+
+
+def test_range_skips_lists_only_skipped(repo, monkeypatch):
+    # inframon-интерфейс (R1-F3): исторические LADDER_SKIP-коммиты диапазона — видимы
+    baseline = _head(repo)
+    (repo / "app" / "x.py").write_text("x = 2\n")
+    _git(repo, "add", "-A")
+    monkeypatch.setenv("LADDER_SKIP", "1")
+    _git(repo, "commit", "-m", "skip commit")
+    lg.record_commit(repo)
+    skipped_sha = _head(repo)
+    monkeypatch.delenv("LADDER_SKIP")
+    (repo / "README.md").write_text("hi\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "docs")
+    lg.record_commit(repo)                                # exempt-noncode — НЕ skip
+    assert lg.range_skips(repo, baseline) == [skipped_sha]

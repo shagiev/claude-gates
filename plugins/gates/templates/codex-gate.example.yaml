@@ -44,3 +44,13 @@ empirical:
   # загрязнят дерево и пост-командная проверка «HEAD/дерево не сдвинулись» ложно заблокирует.
   test_command: "python3 -m pytest -q"
   timeout_s: 600   # опц., дефолт 600; невалидное → дефолт
+
+deploy:
+  # Опц. (интерфейс к внешнему guard'у/inframon): authoritative-источник задеплоенного SHA —
+  # команда (argv, без shell), печатающая полный 40-hex SHA. Настроена и упала/мусор → БЛОК
+  # (фолбэка на локальный .last-deployed-sha НЕТ — он и есть проблема). Активация/смена/
+  # удаление секции пинуются локально: переходный деплой — через явный CODEX_DEPLOY_BASELINE
+  # (аудируется). Вердикт гейта пишется в logs/review_verdicts/<sha>.json (schema 1) — его
+  # может проверять внешний guard; скипы в вердикте видимы.
+  baseline_command: "ssh myhost cat /app/.deployed-sha"
+  baseline_timeout_s: 30   # опц., дефолт 30

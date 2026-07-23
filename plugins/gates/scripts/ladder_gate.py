@@ -461,6 +461,21 @@ def check_range(root: Path, baseline: str) -> int:
     return 0
 
 
+def range_skips(root: Path, baseline: str) -> "list[str]":
+    """SHA коммитов диапазона baseline..HEAD с ledger-записью skipped=true (спека inframon-
+    интерфейса R1-F3): исторические LADDER_SKIP-обходы для вердикта деплой-гейта —
+    `covered-with-skips` вместо маскирующего `covered`."""
+    out = _git_out(root, ["rev-list", f"{baseline}..HEAD"])
+    skipped = []
+    for sha in out.splitlines():
+        if not sha:
+            continue
+        rec = read_ledger(root, sha)
+        if rec is not None and rec.get("skipped") is True:
+            skipped.append(sha)
+    return skipped
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "check-precommit":
         return check_precommit(Path.cwd())

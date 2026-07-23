@@ -38,3 +38,8 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # реальный CLAUDE_CODE_SESSION_ID не должен перебивать сессию, которую тест задаёт через
     # CLAUDE_SESSION_ID (иначе _env_session вернёт реальный id и маркер-тесты сломаются).
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    # inframon-интерфейс: pin/вердикты — в tmp (не трогать боевые), range_skips детерминирован
+    monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
+    monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
+    monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: [])
+    monkeypatch.delenv("CODEX_DEPLOY_BASELINE", raising=False)
