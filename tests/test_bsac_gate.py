@@ -40,10 +40,20 @@ def test_has_bsac_case_insensitive():
     assert g._has_bsac("сЦеНаРиИ") is True
 
 
-def test_has_bsac_ears_case_sensitive_no_false_positive():
+def test_has_bsac_ears_token_no_false_positive():
     assert g._has_bsac("EARS") is True
-    assert g._has_bsac("over the years appears clearly") is False   # 'ears' НЕ ложно ловится
+    assert g._has_bsac("## EARS-критерии") is True                  # с дефисом — граница токена
+    assert g._has_bsac("over the years appears clearly") is False   # строчное
+    assert g._has_bsac("FIVE YEARS PLAN, IT APPEARS") is False      # ВЕРХНИЙ регистр (Codex code-R1)
+    assert g._has_bsac("YEARSEARS EARSY") is False                  # EARS внутри слова — не токен
     assert g._has_bsac("just a three-line stub design") is False
+
+
+def test_stub_with_uppercase_years_blocks(env):
+    # code-R1: hash-валидный стаб с 'YEARS' НЕ должен пройти как BSAC
+    h = _put(env, "stub.md", "# FIVE YEARS PLAN\nделаем X")
+    assert g.add_design_file_binding("d", "stub.md", h) == 2
+    assert g._marker_state("s1") == "drifted"
 
 
 # ═══ S1-S4/S6: распознавание секции ═══

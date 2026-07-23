@@ -1025,11 +1025,14 @@ def _load_marker(session: str) -> "dict | None":
 # lowercase 'ears' ложно совпал бы с 'years'/'appears' → fail-open).
 _BSAC_MARKERS_CI = ("bsac", "бизнес-сценар", "сценари", "приёмочны", "приемочны",
                     "acceptance criteria", "scenario")
+# EARS — как отдельный ТОКЕН (границы), иначе 'YEARS'/'APPEARS' в верхнем регистре ложно
+# проходят → стаб без BSAC разблокировал бы код (Codex code-R1).
+_EARS_RE = re.compile(r"(?<![A-Za-z])EARS(?![A-Za-z])")
 
 
 def _has_bsac(text: str) -> bool:
     low = text.lower()
-    return any(m in low for m in _BSAC_MARKERS_CI) or "EARS" in text
+    return any(m in low for m in _BSAC_MARKERS_CI) or bool(_EARS_RE.search(text))
 
 
 def _read_design(path: Path) -> "tuple[str, str] | None":
