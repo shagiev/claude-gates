@@ -1020,10 +1020,27 @@ def _load_marker(session: str) -> "dict | None":
         return None
 
 
-def _hash_file(path: Path) -> "str | None":
+# Распознаваемые маркеры секции сценариев/BSAC (тикет #2, EARS-1). Ловим СЛУЧАЙНЫЙ пропуск
+# (стаб без матрицы) — семантику судит Codex-ревью. Регистронезависимо, кроме EARS (акроним:
+# lowercase 'ears' ложно совпал бы с 'years'/'appears' → fail-open).
+_BSAC_MARKERS_CI = ("bsac", "бизнес-сценар", "сценари", "приёмочны", "приемочны",
+                    "acceptance criteria", "scenario")
+
+
+def _has_bsac(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _BSAC_MARKERS_CI) or "EARS" in text
+
+
+def _read_design(path: Path) -> "tuple[str, str] | None":
+    """(sha256_hex, текст) дизайн-файла; None при OSError/decode (fail-closed → дрейф)."""
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()   # None → не прочитан (fail-closed)
+        data = path.read_bytes()
     except OSError:
+        return None
+    try:
+        return hashlib.sha256(data).hexdigest(), data.decode()
+    except UnicodeError:
         return None
 
 
@@ -1071,12 +1088,19 @@ def add_design_file_binding(detail: str, design_file: str, reviewed_hash: str) -
             "kind": "design", "detail": detail, "designs": designs,
             "session": session, "ts": datetime.now(timezone.utc).isoformat(),
         })
-    current = _hash_file(REPO_ROOT / design_file)
-    if current != reviewed_hash:
+    # exit-код информативный (немедленный совет); авторитетная проверка — в _marker_state (R3).
+    read = _read_design(REPO_ROOT / design_file)
+    if read is None or read[0] != reviewed_hash:
         audit(f"design-file-binding MISMATCH session={session} file={design_file!r} "
-              f"reviewed={reviewed_hash[:12]} current={str(current)[:12]}")
+              f"reviewed={reviewed_hash[:12]} current={str(read and read[0])[:12]}")
         print(f"[codex-gate] ⚠️ файл {design_file} НЕ совпал с reviewed_hash — записан как дрейф, "
               "маркер невалиден до совпадения/ре-ревью. Codex ревьюил не этот текст?", file=sys.stderr)
+        return 2
+    if not _has_bsac(read[1]):                            # тикет #2: стаб без BSAC/сценариев
+        audit(f"design-file-binding NO-BSAC session={session} file={design_file!r}")
+        print(f"[codex-gate] ⚠️ дизайн-файл {design_file} без секции BSAC/сценариев/EARS — маркер "
+              "невалиден до добавления (см. /design-review) или используй --trivial для простой "
+              "правки. Отревьюенный дизайн ОБЯЗАН нести сценарную матрицу.", file=sys.stderr)
         return 2
     return 0
 
@@ -1106,8 +1130,13 @@ def _marker_state(session: str) -> str:
         for b in designs:
             if not isinstance(b, dict) or not b.get("file") or not b.get("hash"):
                 return "invalid"
-            if _hash_file(REPO_ROOT / b["file"]) != b["hash"]:
+            read = _read_design(REPO_ROOT / b["file"])
+            if read is None or read[0] != b["hash"]:
                 return "drifted"                  # файл изменён/удалён/непрочитан (fail-closed)
+            # тикет #2 (R3): BSAC пере-выводится из hash-валидированного контента (== reviewed) —
+            # исключает разъезд версий; стаб без секции → drifted (не разблокирует)
+            if not _has_bsac(read[1]):
+                return "drifted"
         return "valid"
     return "valid" if rec.get("design_hash") else "invalid"   # легаси inline (без дрейф-проверки)
 

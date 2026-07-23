@@ -21,9 +21,15 @@ def env(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _body(text: str) -> str:
+    # дизайн-контент с распознаваемым заголовком секции (тикет #2: иначе bsac=false → стаб)
+    return f"## Сценарии\n{text}\n"
+
+
 def _write_design(root, name, text):
-    (root / name).write_text(text)
-    return _h(text)
+    body = _body(text)
+    (root / name).write_text(body)
+    return _h(body)
 
 
 # ═══ S8/S8b: write-marker --file (reviewed-hash биндинг) ═══
@@ -81,9 +87,9 @@ def test_foreign_branch_mismatched_internal_session(env):
 def test_s9_rereview_heals_drift(env):
     h1 = _write_design(env, "design.md", "v1")
     g.add_design_file_binding("d", "design.md", h1)
-    (env / "design.md").write_text("v2")                  # дрейф
+    (env / "design.md").write_text(_body("v2"))           # дрейф (контент с BSAC-заголовком)
     assert g._marker_state("s1") == "drifted"
-    g.add_design_file_binding("d", "design.md", _h("v2")) # пере-пометка новым reviewed_hash
+    g.add_design_file_binding("d", "design.md", _h(_body("v2")))   # пере-пометка новым hash
     assert g._marker_state("s1") == "valid"
 
 
@@ -141,13 +147,11 @@ def test_gate_edit_denies_on_drift(env, monkeypatch):
     monkeypatch.setattr(g, "ONBOARDED", True)
     h = _write_design(env, "design.md", "v1")
     g.add_design_file_binding("d", "design.md", h)
-    (env / "design.md").write_text("v1 + new surface")     # дрейф
+    (env / "design.md").write_text(_body("v1 + new surface"))   # дрейф (контент с заголовком)
     hook = json.dumps({"session_id": "s1", "tool_input": {"file_path": "app/x.py"}})
     assert g.gate_edit_cli(hook) == 2                       # правка кода заблокирована
-    hook_ok_after_reremark = json.dumps({"session_id": "s1",
-                                         "tool_input": {"file_path": "app/x.py"}})
-    g.add_design_file_binding("d", "design.md", _h("v1 + new surface"))   # ре-ревью
-    assert g.gate_edit_cli(hook_ok_after_reremark) == 0     # снова разблокировано
+    g.add_design_file_binding("d", "design.md", _h(_body("v1 + new surface")))   # ре-ревью
+    assert g.gate_edit_cli(hook) == 0                       # снова разблокировано
 
 
 # ═══ CLI write-marker --file ═══
