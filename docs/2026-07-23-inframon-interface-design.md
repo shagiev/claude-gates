@@ -32,6 +32,14 @@ strip → полный 40-hex SHA, иначе невалиден. Исполне
 Env-override при настроенном command — аудит-строка (оператор перебил authoritative источник:
 видимо, аварийно; след обязателен).
 
+**Base-vs-head для секции `deploy` (R1-F1).** Изменённая/активированная/удалённая
+`baseline_command` может вернуть свежий SHA (вплоть до HEAD) → диапазон `baseline..HEAD`
+сузится/опустеет → сама правка команды НЕ ревьюится (self-hiding, без злого умысла — напр.
+staging вместо prod). Правило: секция `deploy` на head_before сравнивается с baseline (тот же
+SHA-bound механизм); ЛЮБОЕ отличие (absent→enabled, смена command, enabled→absent) → **БЛОК**
+с инструкцией «переходный деплой — задай `CODEX_DEPLOY_BASELINE` явно» (env-путь уже
+аудируется, B7). После перехода (command в baseline == head) — обычная работа.
+
 ### Ф2. Экспорт вердикта деплой-гейта (контракт для inframon)
 
 При КАЖДОМ allow-выходе `check_reviewed_cli` пишется машиночитаемый вердикт
@@ -42,12 +50,18 @@ Env-override при настроенном command — аудит-строка (
            "codex": "allow|cached|skipped"},
  "ts": "..."}
 ```
-Скипы НЕ прячутся — вердикт, полученный через `*_SKIP`, прямо говорит об этом: inframon сам
-решает, доверять ли такому деплою (его fail-closed — его сторона). Запись — общий
-`_atomic_write_json`. **Провал записи вердикта (OSError) — ГРОМКИЙ warning, но allow стоит**:
-producer best-effort + loud, consumer (inframon) fail-closed на отсутствие вердикта — это
-правильное распределение по границе (иначе полный диск брикует деплой ради артефакта, который
-пока никто не потребляет). Задокументировано как контрактное решение.
+Скипы НЕ прячутся — вердикт прямо говорит и о ТЕКУЩИХ скипах, и об ИСТОРИЧЕСКИХ обходах
+диапазона (R1-F3): `gates.ladder ∈ {covered, covered-with-skips, skipped}` — `covered-with-skips`,
+когда в `baseline..HEAD` есть ledger-записи `skipped=true` (новая `range_skips()` в
+ladder_gate). Inframon сам решает, доверять ли (его fail-closed — его сторона).
+
+**Delete-then-write (R1-F2):** перед записью нового вердикта старый файл этого head СНАЧАЛА
+удаляется, потом пишется новый (`_atomic_write_json`). Провал ЗАПИСИ после успешного unlink →
+вердикта НЕТ → consumer fail-closed сработает честно (громкий warning, allow стоит). Провал
+UNLINK при существующем старом файле → **БЛОК** (нельзя ни опубликовать честный вердикт, ни
+убрать вводящий в заблуждение — старый «чистый» вердикт того же head замаскировал бы скипы
+текущего прогона). Иначе — producer best-effort + loud, consumer fail-closed на отсутствие:
+правильное распределение по границе. Задокументировано как контрактное решение.
 
 Контракт для inframon: сверять `head_sha`/`diff_sha256` с фактически деплоящимся состоянием,
 трактовать отсутствие вердикта/скипы по своей политике.
@@ -74,15 +88,19 @@ producer best-effort + loud, consumer (inframon) fail-closed на отсутст
 | B6 | ничего нет | None → блок (существующий R1-2) |
 | B7 | env И command оба | env выигрывает + АУДИТ-строка (аварийный перебив authoritative) |
 | B8 | секция deploy unreadable (битый конфиг на head_before) | **БЛОК** (unreadable ≠ absent, как эмпирика) |
+| B9 | секция deploy отличается base↔head (активация/смена/удаление command) | **БЛОК** — переходный деплой только через явный `CODEX_DEPLOY_BASELINE` (R1-F1) |
 | V1 | allow (fresh-ревью) | вердикт записан: gates.codex=allow, ladder/empirical по факту |
 | V2 | allow (кэш чистого ревью) | вердикт записан: gates.codex=cached |
 | V3 | allow (три скипа) | вердикт записан: все gates=skipped — скипы видимы |
 | V4 | блок (любой) | вердикт НЕ пишется для этого прогона |
-| V5 | запись вердикта OSError | ГРОМКИЙ warning, allow стоит (контракт producer/consumer) |
+| V5 | ЗАПИСЬ вердикта OSError (после unlink) | ГРОМКИЙ warning, allow стоит; старого файла НЕТ (consumer fail-closed честен) |
+| V5b | UNLINK старого вердикта упал, файл существует | **БЛОК** — старый чистый вердикт маскировал бы скипы (R1-F2) |
 | V6 | `CODEX_VERDICT_DIR` задан | вердикт в него (изоляция тестов) |
+| V7 | в диапазоне есть исторические skipped-ledger-записи | `gates.ladder = covered-with-skips` (R1-F3) |
 
-Полнота: D1–D6 покрыты; ключевые — no-fallback (B3/B4), unreadable≠absent (B8), env-аудит
-(B7), скипы видимы (V3), OSError не брикует (V5).
+Полнота: D1–D6 покрыты; ключевые — no-fallback (B3/B4), unreadable≠absent (B8), base-vs-head
+секции deploy (B9), env-аудит (B7), скипы видимы включая исторические (V3/V7), delete-then-write
+(V5/V5b).
 
 Вне scope (граница): проверка вердикта, политика доверия к скипам, серверное состояние,
 негеймибельность — inframon. Подпись/подделка вердикта — локальный файл, тот же класс, что
@@ -97,11 +115,16 @@ producer best-effort + loud, consumer (inframon) fail-closed на отсутст
 - **EARS-3:** WHERE env `CODEX_DEPLOY_BASELINE` задан — он SHALL выигрывать; IF при этом
   command настроен — THEN SHALL писаться аудит-строка. (B1, B7)
 - **EARS-4:** Секция `deploy` SHALL читаться SHA-bound (head_before) трёхстатусно; `unreadable`
-  → блок; `absent` → легаси-поведение. (B5, B8)
+  → блок; `absent` на ОБОИХ SHA → легаси-поведение. (B5, B8)
+- **EARS-4b:** IF секция `deploy` на head_before отличается от baseline (активация/смена/
+  удаление) — THEN гейт SHALL заблокировать деплой; переход — только через явный
+  `CODEX_DEPLOY_BASELINE` (аудируемый). (B9)
 - **EARS-5:** WHEN `check_reviewed_cli` возвращает allow — THEN SHALL быть записан вердикт
-  (schema 1) с фактическими статусами гейтов, включая скипы. (V1–V3)
-- **EARS-6:** IF запись вердикта упала (OSError) — THEN SHALL быть громкий stderr-warning;
-  allow НЕ отменяется. (V5)
+  (schema 1) с фактическими статусами гейтов, включая текущие скипы И исторические
+  (`covered-with-skips` при skipped-записях диапазона, через `range_skips()`). (V1–V3, V7)
+- **EARS-6:** Перед записью SHALL удаляться старый вердикт этого head (delete-then-write);
+  IF unlink упал при существующем файле — THEN БЛОК; IF запись упала после unlink — THEN
+  громкий warning, allow стоит (файла нет → consumer fail-closed честен). (V5, V5b)
 - **EARS-7:** Команда SHALL исполняться как argv (shlex, без shell), с таймаутом
   (`baseline_timeout_s`, дефолт 30, валидация как `timeout_s` эмпирики).
 
@@ -112,11 +135,11 @@ producer best-effort + loud, consumer (inframon) fail-closed на отсутст
 - **BS-I2:** inframon получает проверяемый контракт (вердикт с head/diff/статусами/скипами). (V1–V3)
 - **ML-I1** отказ command → фолбэк на протухший файл → не тот диапазон ревьюится. → EARS-2
   no-fallback (блок).
-- **ML-I2** command подменён на `echo <sha>` — та же граница доверия, что test_command:
-  закоммичен, clean-tree, жёсткий код-путь, виден Codex-ревью диффа; смена command НЕ
-  блокируется base-vs-head (в отличие от test_command: у baseline_command нет «ослабления» —
-  любой валидный вывод дальше проверяется ancestry-гейтом). Остаток: злонамеренный оператор —
-  вне охвата (как EMPIRICAL_SKIP).
+- **ML-I2 [R1-F1]** смена/активация command сузила диапазон и спрятала саму себя (изменённая
+  команда возвращает HEAD → пустой дифф → правка не ревьюится). → base-vs-head секции deploy:
+  любое отличие → блок; переход только через явный аудируемый `CODEX_DEPLOY_BASELINE` (EARS-4b).
+  Прежний аргумент «ancestry-проверка достаточна» ОПРОВЕРГНУТ Codex-ревью (negative result).
+  Остаток: злонамеренный оператор — вне охвата.
 - **ML-I3** вердикт со скипами выглядит как «проверено». → скипы — явные поля; политика
   доверия — сторона inframon.
 
@@ -126,14 +149,16 @@ producer best-effort + loud, consumer (inframon) fail-closed на отсутст
   потребителя; consumer-side fail-closed правильнее по границе.
 - **Криптоподпись вердикта:** локальный секрет у того же актёра = театр; реальная
   верификация — пересборка/сверка на стороне inframon.
-- **base-vs-head блок на смену baseline_command:** у команды нет монотонного «ослабления»
-  (любой вывод валидируется ancestry); лишнее трение.
+- ~~«base-vs-head не нужен: вывод валидируется ancestry»~~ — ОТВЕРГНУТО Codex R1 (negative
+  result): изменённая команда возвращает свежий SHA → диапазон пуст → правка себя прячет;
+  ancestry этого не ловит. base-vs-head ПРИНЯТ (EARS-4b).
 - **Фолбэк на локальный файл при отказе command с warning:** ровно тот fail-open, ради
   которого фича существует.
 
 ## Тестирование
 
-Юнит: B1–B8 через `resolve_baseline`/`check_reviewed_cli` (command-стабы: echo sha / exit 1 /
-sleep / мусор); V1–V6 через `check_reviewed_cli` (fresh/кэш/скипы; monkeypatch OSError записи).
+Юнит: B1–B9 через `resolve_baseline`/`check_reviewed_cli` (command-стабы: echo sha / exit 1 /
+sleep / мусор); V1–V7 через `check_reviewed_cli` (fresh/кэш/скипы; monkeypatch OSError записи И unlink;
+исторические skipped-записи диапазона → covered-with-skips).
 Generic-refactor читателя секций: существующие empirical-тесты остаются зелёными (регресс).
 Реальный маршрут: вердикт-файл существует и валиден как JSON со schema=1 после allow.
