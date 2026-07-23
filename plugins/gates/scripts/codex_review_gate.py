@@ -843,6 +843,13 @@ def _resolve_baseline_gate(head: str) -> "tuple[str | None, int]":
         if isinstance(c, str) and c.strip():
             cmd = c.strip()
             timeout = _valid_positive_int(sec.get("baseline_timeout_s", timeout), timeout)
+        elif "baseline_command" in sec and not env:
+            # code-R1 F2: ключ ПРИСУТСТВУЕТ, но невалиден (список/пусто/не-строка) — опечатка
+            # НЕ должна тихо откатывать к протухшему локальному файлу (запрещённый фолбэк)
+            print("[codex-gate] ✗ deploy.baseline_command присутствует, но невалиден (ожидается "
+                  "непустая строка) — тихий откат на локальный файл запрещён. Почини конфиг или "
+                  "явный CODEX_DEPLOY_BASELINE. Деплой остановлен.", file=sys.stderr)
+            return (None, 2)
     section_pin = _deploy_section_hash(sec) if cmd else "disabled"
     pin = _read_pin()
     if env:
@@ -934,10 +941,12 @@ def _write_deploy_verdict(head: str, baseline: "str | None", diff_sha: str,
         try:
             path.unlink(missing_ok=True)          # delete-then-write: старый НЕ должен пережить
         except OSError:
-            if path.exists():                     # V5b: не убрать вводящий в заблуждение старый
-                print("[codex-gate] ✗ не удалить старый вердикт — он маскировал бы текущие "
-                      "скипы. Деплой остановлен.", file=sys.stderr)
-                return 2
+            # V5b (code-R1): ЛЮБОЙ OSError = блок — exists() не проверяем (при stat-сбое он
+            # врёт False, а старый вердикт мог остаться и маскировать скипы); отсутствие файла
+            # уже покрыто missing_ok=True, до except не доходит.
+            print("[codex-gate] ✗ не удалить старый вердикт — он маскировал бы текущие "
+                  "скипы. Деплой остановлен.", file=sys.stderr)
+            return 2
         try:
             _atomic_write_json(path, payload, indent=2)
         except OSError as e:                      # V5: файла нет → consumer fail-closed честен

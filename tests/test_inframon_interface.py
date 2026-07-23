@@ -14,7 +14,7 @@ HEAD_SHA = "b" * 40
 def _sec(cmd="echo " + H, to=None):
     s = {"baseline_command": cmd}
     if to is not None:
-        s["timeout_s"] = to
+        s["baseline_timeout_s"] = to             # именно baseline_timeout_s (code-R1 F3)
     return s
 
 
@@ -257,3 +257,34 @@ def test_v7_historical_ladder_skips_visible(env, tmp_path, monkeypatch):
                    g.parse_review_output("Verdict: approve\nNo material findings.\n"))
     assert g.check_reviewed_cli() == 0
     assert _read_verdict()["gates"]["ladder"] == "covered-with-skips"
+
+
+def test_invalid_command_key_blocks_not_legacy(env, monkeypatch):
+    # code-R1 F2: присутствующий невалидный baseline_command НЕ откатывает тихо к легаси
+    for bad in ([1, 2], "", "   ", 42):
+        _states(monkeypatch, ("enabled", {"baseline_command": bad}))
+        g._write_pin("disabled")                            # даже при disabled-pin
+        monkeypatch.setattr(g, "resolve_baseline", lambda: "stale")
+        assert g._resolve_baseline_gate(HEAD_SHA)[1] == 2, bad
+
+
+def test_v5b_any_unlink_oserror_blocks(env, monkeypatch):
+    # code-R1 F1: любой OSError unlink = блок, без exists()-проверки (stat может врать)
+    g.VERDICT_DIR.mkdir(parents=True, exist_ok=True)
+    target = g.VERDICT_DIR / f"{HEAD_SHA}.json"
+    def bad_unlink(self, missing_ok=False):
+        raise OSError("I/O error")
+    monkeypatch.setattr(type(target), "unlink", bad_unlink)
+    assert g._write_deploy_verdict(HEAD_SHA, H, "d" * 64, "covered", "pass", "allow") == 2
+
+
+def test_b3_timeout_branch_really_times_out(env, monkeypatch):
+    # code-R1 F3: подтверждаем вход именно в TimeoutExpired-ветку
+    import subprocess as sp
+    calls = {}
+    def fake_run(argv, cwd=None, capture_output=None, text=None, timeout=None):
+        calls["timeout"] = timeout
+        raise sp.TimeoutExpired(argv, timeout)
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    assert g._run_baseline_command("sleep 5", 1) is None
+    assert calls["timeout"] == 1                            # переданный baseline_timeout_s
