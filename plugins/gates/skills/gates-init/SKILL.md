@@ -32,6 +32,12 @@ python3 -c "import yaml" 2>&1
 пользователю список prefixes/exact через AskUserQuestion и дай поправить.
 `ladder.epoch_sha` = `git rev-parse HEAD` (вся прошлая история grandfathered — гейты
 начинаются «с этого момента»). `convergence.hard_cap: 8`.
+Опциональные секции (предложи, если у проекта есть тесты/внешний деплой-стейт):
+- `empirical.test_command` — тест-команда как условие деплоя (напр. `python3 -m pytest -q`;
+  argv без shell, для пайплайнов — обёртка-скрипт). ВАЖНО: включённую секцию потом нельзя
+  тихо снять/ослабить — только аудируемый `EMPIRICAL_SKIP`.
+- `deploy.baseline_command` — authoritative-источник задеплоенного SHA (inframon/ssh);
+  активация пинуется: первый деплой после включения — через явный `CODEX_DEPLOY_BASELINE`.
 NB: `.codex-gate.yaml`, `Makefile`, `.githooks/` — всегда код-пути (жёстко в коде гейта),
 в конфиг их писать не нужно.
 
