@@ -152,12 +152,22 @@ _REDACT_RULES = (
     (re.compile(r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9_]*"
                 r"(?:api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
                 r"passwd|pwd|authorization|private[-_]?key)[A-Za-z0-9_]*)"
-                r"[\"']?(\s*[:=]\s*)[\"']?(?:bearer\s+)?[^\s,;\"']{4,}[\"']?"),
+                r"[\"']?(\s*[:=]\s*)[\"']?"
+                # СХЕМА аутентификации перед credential (R7: поглощался только `bearer`,
+                # поэтому `Authorization: Basic dXNlcjpwYXNz==` теряло схему, но не credential;
+                # base64 короче 40 и с `=` не ловился и правилом длинного токена)
+                r"(?:(?:bearer|basic|digest|negotiate|ntlm|hoba|mutual|apikey|token)\s+)?"
+                r"[^\s,;\"']{4,}[\"']?"),
      r"\1\2" + _REDACTED),
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{16,}"), _REDACTED),
+    # схема + credential без метки-ключа (`Bearer <tok>` / `Basic <b64>` сами по себе)
+    (re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9_\-\.=+/]{12,}"), _REDACTED),
     (re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{8,}|gho_[A-Za-z0-9]{8,}|"
                 r"github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9\-]{8,}|"
                 r"AKIA[0-9A-Z]{8,}|ASIA[0-9A-Z]{8,})"), _REDACTED),
+    # поля Digest-auth: значение обязано быть длинным hash-подобным (иначе съедалось бы
+    # обычное слово «response=ok») — R7
+    (re.compile(r"(?i)\b(response|nonce|cnonce|opaque)(\s*=\s*)[\"']?[A-Za-z0-9+/=_-]{16,}[\"']?"),
+     r"\1\2" + _REDACTED),
     (re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}"), _REDACTED),
     # подписи/токены в URL — сохраняем имя параметра
     (re.compile(r"(?i)([?&](?:sig|signature|x-amz-signature|x-amz-credential|access_token|"

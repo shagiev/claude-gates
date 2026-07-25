@@ -351,3 +351,13 @@ def test_r6_diagnostics_still_intact():
     for keep in ("auth failed: retry in 30s", "set timeout = 30",
                  "usage limit resets at 8:06 PM", "exit=1: connection reset by peer"):
         assert g.redact_secrets(keep) == keep, keep
+
+
+def test_r7_auth_schemes_redacted():
+    # R7: правило поглощало только `bearer`, поэтому Basic-credential оставался открытым
+    for text, secret in [("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+                         ("Authorization: Bearer sk-abc123def456ghi", "sk-abc123def456ghi"),
+                         ("Basic dXNlcjpwYXNz1234", "dXNlcjpwYXNz1234"),
+                         ("Proxy-Authorization: Digest username=admin, "
+                          "response=abc123def456789012", "abc123def456789012")]:
+        assert secret not in g.redact_secrets(text), text
