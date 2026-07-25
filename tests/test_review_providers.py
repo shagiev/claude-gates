@@ -305,3 +305,10 @@ def test_f3_codex_model_from_config_in_verdict(gate, monkeypatch):
     assert g.check_reviewed_cli() == 0
     prov = _verdict()["providers"][0]
     assert prov["provider"] == "codex" and prov["model"] not in ("", "codex")   # реальная модель
+
+
+def test_r2_prose_appended_to_clean_marker_rejected():
+    # ревью R2: search() принимал любую строку, СОДЕРЖАЩУЮ маркер
+    assert g.normalize_reviewer_text(
+        "Verdict: approve\n\nNo material findings. I could not inspect the diff.") is None
+    assert g.normalize_reviewer_text("Verdict: approve\n\nNo material findings.") is not None

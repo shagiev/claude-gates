@@ -1235,7 +1235,10 @@ def normalize_reviewer_text(text: str) -> "str | None":
     # давала бы чистый approve, т.е. ОТКАЗ ревьюера засчитывался бы как одобрение.
     for line in block.splitlines():
         t = line.strip()
-        if not t or _VERDICT_LINE_RE.match(line) or _NO_FINDINGS_RE.search(t):
+        # ТОЧНОЕ совпадение строки, не «содержит» (ревью R2): `No material findings. I could
+        # not inspect the diff.` проходило по search() и давало валидный чистый вердикт
+        if not t or _VERDICT_LINE_RE.match(line) or re.fullmatch(
+                r"no material findings\.?", t, re.IGNORECASE):
             continue
         if re.match(r"^-\s*\[[^\]]+\]", t):       # строка находки
             continue
