@@ -122,7 +122,13 @@ def _verdict_from_json(text: str) -> "ReviewVerdict | None":
     result = obj.get("result")
     if not isinstance(result, dict) or not _result_schema_ok(result):
         return ReviewVerdict(verdict=None)   # неполная/дрейфнувшая схема → невалидно (fail-closed)
-    findings = [(f["severity"].strip().lower(), str(f.get("title", "")).strip())
+    # CHOKEPOINT редакции (ревью 25.07 R2): заголовки находок — НЕдоверенный текст ревьюера,
+    # который может процитировать секрет из ревьюируемого кода. Редактируем ЗДЕСЬ, в единой
+    # точке входа, чтобы всё ниже по потоку (ledger-файл, сообщение блока, advisory-вывод,
+    # аудит carry-over) наследовало редакцию автоматически — инвариант в одной точке, а не
+    # залатанный у каждого потребителя.
+    findings = [(f["severity"].strip().lower(),
+                 redact_secrets(str(f.get("title", "")).strip()))
                 for f in result["findings"]]
     return ReviewVerdict(
         verdict=result["verdict"], findings=findings,
@@ -217,8 +223,8 @@ def parse_review_output(text: str) -> ReviewVerdict:
         return js
     m = _VERDICT_RE.search(clean)             # текст-фолбэк (рендер Verdict:/[severity])
     verdict = m.group(1).strip() if m else None
-    findings = [(mm.group("sev").strip().lower(), mm.group("rest").strip())
-                for mm in _FINDING_RE.finditer(clean)]
+    findings = [(mm.group("sev").strip().lower(), redact_secrets(mm.group("rest").strip()))
+                for mm in _FINDING_RE.finditer(clean)]   # тот же chokepoint для текст-контракта
     return ReviewVerdict(
         verdict=verdict, findings=findings,
         malformed=bool(_MALFORMED_FINDING_RE.search(clean)),
