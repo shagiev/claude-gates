@@ -141,30 +141,28 @@ def _verdict_from_json(text: str) -> "ReviewVerdict | None":
 # Вывод зависимостей (companion-stderr/stdout, хвост тест-команды) — НЕдоверенный текст: там
 # могут оказаться Authorization-заголовки, API-ключи, signed URL, DSN с паролем, секреты,
 # повторённые из ревьюируемого кода. Усечение НЕ защищает — нужна редакция по образцам.
-_REDACT_RULES = (
-    # помеченные пары ключ=значение. Разделитель ОБЯЗАТЕЛЬНО `:`/`=` (не пробел): иначе
-    # правило съедало обычные слова — «auth failed» превращалось в «auth «скрыто»» и
-    # диагностика терялась (поймано собственным тестом 25.07). Кавычки вокруг ключа И
-    # значения допускаются (ревью R3-F1: `api_key="secret"` и JSON-стиль
-    # `"access_token": "abc/def+ghi"` обходили правило). Значение может начинаться с `Bearer `.
-    re.compile(r"(?i)\b(api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
-               r"passwd|pwd|authorization|private[-_]?key)"
-               r"[\"']?(\s*[:=]\s*)[\"']?(?:bearer\s+)?[^\s,;\"']{4,}[\"']?"),
-    re.compile(r"(?i)\bbearer\s+([A-Za-z0-9_\-\.=]{16,})"),   # Bearer <token> без метки
-    # известные префиксы провайдеров
-    re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{8,}|gho_[A-Za-z0-9]{8,}|"
-               r"github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9\-]{8,}|"
-               r"AKIA[0-9A-Z]{8,}|ASIA[0-9A-Z]{8,})"),
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}"),  # JWT
-    # подписи/токены в URL
-    re.compile(r"(?i)([?&](?:sig|signature|x-amz-signature|x-amz-credential|access_token|"
-               r"token|key)=)([^&\s]+)"),
-    # DSN с паролем: scheme://user:pass@host
-    re.compile(r"://([^\s:/@]+):([^\s@]{3,})@"),
-    # длинный неразрывный токен (без точек/слэшей — URL и фразы не задеваются)
-    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
-)
 _REDACTED = "«скрыто»"
+# (regex, шаблон замены) — шаблон задан РЯДОМ с правилом (ревью R4: выбор замены по числу
+# групп путал три правила с разной семантикой и уродовал signed URL в DSN-форму).
+_REDACT_RULES = (
+    # помеченные пары ключ=значение; кавычки вокруг ключа и значения допускаются
+    (re.compile(r"(?i)\b(api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
+                r"passwd|pwd|authorization|private[-_]?key)"
+                r"[\"']?(\s*[:=]\s*)[\"']?(?:bearer\s+)?[^\s,;\"']{4,}[\"']?"),
+     r"\1\2" + _REDACTED),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{16,}"), _REDACTED),
+    (re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{8,}|gho_[A-Za-z0-9]{8,}|"
+                r"github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9\-]{8,}|"
+                r"AKIA[0-9A-Z]{8,}|ASIA[0-9A-Z]{8,})"), _REDACTED),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}"), _REDACTED),
+    # подписи/токены в URL — сохраняем имя параметра
+    (re.compile(r"(?i)([?&](?:sig|signature|x-amz-signature|x-amz-credential|access_token|"
+                r"token|key)=)[^&\s]+"), r"\1" + _REDACTED),
+    # DSN с паролем: scheme://user:pass@host — сохраняем пользователя
+    (re.compile(r"://([^\s:/@]+):[^\s@]{3,}@"), r"://\1:" + _REDACTED + "@"),
+    # длинный неразрывный токен (без точек/слэшей — URL и фразы не задеваются)
+    (re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"), _REDACTED),
+)
 
 
 # ПОЛНЫЙ реестр источников недоверенного текста, попадающего оператору/в файлы (ревью 25.07,
@@ -182,18 +180,8 @@ def redact_secrets(text: str) -> str:
     """Замена секрето-образных подстрок на «скрыто». Сохраняет читаемую причину отказа
     (напр. «You have hit your usage limit… try again at 8:06 PM» не задевается)."""
     out = text
-    for rx in _REDACT_RULES:
-        if rx.groups == 2:
-            # (ключ, разделитель) для помеченных пар и URL-параметров → сохраняем префикс;
-            # (user, pass) для DSN → сохраняем пользователя
-            def _sub(m):
-                a, b = m.group(1), m.group(2)
-                if b.strip().startswith(("=", ":")) or b.endswith("="):
-                    return f"{a}{b}{_REDACTED}"          # ключ=… / ?sig=…
-                return f"://{a}:{_REDACTED}@"            # DSN scheme://user:pass@
-            out = rx.sub(_sub, out)
-        else:
-            out = rx.sub(_REDACTED, out)
+    for rx, template in _REDACT_RULES:
+        out = rx.sub(template, out)
     return out
 
 
@@ -205,13 +193,16 @@ def outage_details(text: "str | None") -> str:
     извлекаем текст причины для сообщения."""
     if not text:
         return ""
-    clean = redact_secrets(strip_ansi(text).strip())   # редакция ДО усечения (ревью 25.07)
+    raw = strip_ansi(text).strip()
     try:
-        obj = json.loads(clean)
+        obj = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        return clean[:300]                       # сырой текст (напр. лимит) — показать как есть
+        return redact_secrets(raw)[:300]         # сырой текст (напр. лимит) — показать как есть
     if not isinstance(obj, dict):
-        return clean[:300]
+        return redact_secrets(raw)[:300]
+    # R4-F1: редакция ПО ПОЛЯМ после парсинга. Раньше редактировался сериализованный JSON, где
+    # кавычки экранированы (\"), и labeled-pair правило их не видело → секрет уходил оператору.
+    # Разбор снимает экранирование, поэтому правила работают на настоящем тексте.
     parts = []
     codex = obj.get("codex")
     if isinstance(codex, dict):
@@ -220,14 +211,15 @@ def outage_details(text: "str | None") -> str:
         for k in ("stderr", "stdout"):
             v = codex.get(k)
             if isinstance(v, str) and v.strip():
-                parts.append(f"{k}: {v.strip()[:200]}")
+                parts.append(f"{k}: {redact_secrets(v.strip())[:200]}")
                 break                            # достаточно первого непустого
     pe = obj.get("parseError")
     if isinstance(pe, str) and pe.strip():
-        parts.append(f"parseError: {pe.strip()[:150]}")
-    raw = obj.get("rawOutput")
-    if isinstance(raw, str) and raw.strip() and not any("stdout" in p or "stderr" in p for p in parts):
-        parts.append(f"raw: {raw.strip()[:200]}")
+        parts.append(f"parseError: {redact_secrets(pe.strip())[:150]}")
+    raw_out = obj.get("rawOutput")
+    if isinstance(raw_out, str) and raw_out.strip() and not any(
+            "stdout" in p or "stderr" in p for p in parts):
+        parts.append(f"raw: {redact_secrets(raw_out.strip())[:200]}")
     return "; ".join(parts)[:400]
 
 
@@ -1088,8 +1080,9 @@ def _empirical_gate(baseline: str, head: str) -> int:
     # это ВКЛючение/подтверждение гейта (не ослабление) → команда просто бежит.
     base_state, base_cmd, _ = _empirical_config(REPO_ROOT, baseline)
     if base_state == "enabled" and base_cmd != cmd:
-        print(f"[codex-gate] ✗ empirical: test_command изменилась с baseline (« {base_cmd[:40]} » "
-              f"→ « {cmd[:40]} ») — смена = потенциальное ослабление, требует EMPIRICAL_SKIP=1 "
+        print(f"[codex-gate] ✗ empirical: test_command изменилась с baseline "
+              f"(« {redact_secrets(base_cmd)[:40]} » → « {redact_secrets(cmd)[:40]} ») — "
+              f"смена = потенциальное ослабление, требует EMPIRICAL_SKIP=1 "
               "(аудит, как снятие гейта). Деплой остановлен.", file=sys.stderr)
         return 2
     print(f"[codex-gate] empirical: прогон «{redact_secrets(cmd)[:80]}» "
@@ -1332,7 +1325,13 @@ def _marker_path(session: str) -> Path:
 
 
 def _write_marker_payload(session: str, payload: dict) -> None:
-    _atomic_write_json(_marker_path(session), payload)   # общий атомарный писатель
+    # R4-F3: `detail` (текст оператора) редактируется ЗДЕСЬ — единая точка записи всех маркеров
+    # (design/trivial/file-binding), иначе секрет оставался в persisted JSON, хотя аудит был чист.
+    # Редактируем ТОЛЬКО detail: хэши (design_hash/designs[].hash) — 64-hex, их правило длинного
+    # токена превратило бы в «скрыто» и сломало бы маркер.
+    if isinstance(payload.get("detail"), str):
+        payload = {**payload, "detail": redact_secrets(payload["detail"])}
+    _atomic_write_json(_marker_path(session), payload)
 
 
 def _load_marker(session: str) -> "dict | None":

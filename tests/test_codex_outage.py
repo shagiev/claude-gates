@@ -260,3 +260,57 @@ def test_r3_test_command_echo_redacted(gate_env, monkeypatch, capsys):
     monkeypatch.setattr(g, "_run_empirical", lambda cmd, t, root: ("fail", ""))
     g._empirical_gate("HEAD~1", g.git_head())
     assert "SUPERSECRETTOKEN1" not in capsys.readouterr().err
+
+
+# ═══ Ревью R4: структурная переделка редакции ═══
+
+def test_r4_escaped_quotes_in_envelope_redacted():
+    # R4-F1: редактировался сериализованный JSON (кавычки экранированы) → секрет проходил
+    env = json.dumps({"codex": {"status": 1, "stderr": 'fatal api_key="ABCD1234EFGH"'},
+                      "parseError": None})
+    out = g.outage_details(env)
+    assert "ABCD1234EFGH" not in out and "fatal" in out
+    env2 = json.dumps({"codex": {"status": 1, "stderr": '{"access_token": "abc/def+ghi123"}'}})
+    assert "abc/def+ghi123" not in g.outage_details(env2)
+
+
+def test_r4_signed_url_shape_preserved():
+    # R4-F4: эвристика по числу групп уродовала signed URL в DSN-форму
+    out = g.redact_secrets("https://x/?sig=deadbeefcafe1234&x=1")
+    assert "deadbeefcafe1234" not in out
+    assert out.startswith("https://x/?sig=") and out.endswith("&x=1"), out
+    dsn = g.redact_secrets("postgres://user:supersecret@db/x")
+    assert dsn == "postgres://user:«скрыто»@db/x"
+
+
+def test_r4_marker_detail_redacted_in_persisted_file(tmp_path, monkeypatch):
+    # R4-F3: detail сохранялся в .claude/.design-approved-<session> ДО редакции
+    monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".design-approved")
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a3.log")
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    g.write_marker("trivial", "быстрый фикс, password=hunter2hunter2")
+    persisted = (tmp_path / ".design-approved-s1").read_text()
+    assert "hunter2hunter2" not in persisted and "скрыто" in persisted
+    # design-маркер и file-binding идут через ту же точку записи
+    (tmp_path / "d.md").write_text("## Сценарии\nv1")
+    monkeypatch.setattr(g, "REPO_ROOT", tmp_path)
+    import hashlib
+    h = hashlib.sha256((tmp_path / "d.md").read_bytes()).hexdigest()
+    g.add_design_file_binding("api_key=SECRETINDETAIL1", "d.md", h)
+    rec = json.loads((tmp_path / ".design-approved-s1").read_text())
+    assert "SECRETINDETAIL1" not in rec["detail"]
+    assert rec["designs"][0]["hash"] == h            # хэш НЕ отредактирован (64-hex цел)
+
+
+def test_r4_test_command_change_message_redacted(tmp_path, monkeypatch, capsys):
+    # R4-F2: ветка смены команды печатала обе версии дословно.
+    # NB: без фикстуры gate_env — она мокает _empirical_gate целиком, а нам нужен настоящий.
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a4.log")
+    def cfg(root, ref):
+        return ("enabled", "pytest --api-key=NEWSECRETTOKEN1", 600) if ref != "HEAD~1" \
+            else ("enabled", "pytest --api-key=OLDSECRETTOKEN1", 600)
+    monkeypatch.setattr(g, "_empirical_config", cfg)
+    assert g._empirical_gate("HEAD~1", g.git_head()) == 2
+    err = capsys.readouterr().err
+    assert "NEWSECRETTOKEN1" not in err and "OLDSECRETTOKEN1" not in err
+    assert "изменилась" in err                        # смысл блока сохранён
