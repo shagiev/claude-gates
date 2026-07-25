@@ -193,7 +193,7 @@ def test_v1_fresh_allow_writes_verdict(env, tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_COMPANION_CMD", f"bash {fix}")
     assert g.check_reviewed_cli() == 0
     v = _read_verdict()
-    assert v["schema"] == 1 and v["gates"]["codex"] == "allow"
+    assert v["schema"] == 2 and v["gates"]["codex"] == "allow"   # схема 2: + providers
     assert v["gates"]["ladder"] == "covered" and v["gates"]["empirical"] == "not-configured"
     assert v["head_sha"] == g.git_head() and v["run_id"]
 

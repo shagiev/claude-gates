@@ -509,10 +509,12 @@ def ledger_path(head_sha: str) -> Path:
     return LEDGER_DIR / f"{head_sha}.json"
 
 
-def write_ledger(head_sha: str, diff_sha: str, baseline: str, verdict: ReviewVerdict) -> None:
+def write_ledger(head_sha: str, diff_sha: str, baseline: str, verdict: ReviewVerdict,
+                 reviewers: "list[dict] | None" = None) -> None:
     LEDGER_DIR.mkdir(parents=True, exist_ok=True)
     ledger_path(head_sha).write_text(json.dumps({
         "head_sha": head_sha, "diff_sha256": diff_sha, "baseline_sha": baseline,
+        "reviewers": reviewers if reviewers is not None else [],
         "verdict": verdict.verdict, "findings": verdict.findings,
         "no_findings_marker": verdict.no_findings_marker,
         "malformed": verdict.malformed,
@@ -520,7 +522,13 @@ def write_ledger(head_sha: str, diff_sha: str, baseline: str, verdict: ReviewVer
     }, ensure_ascii=False, indent=2))
 
 
-def read_valid_ledger(head_sha: str, diff_sha: str) -> ReviewVerdict | None:
+def _reviewers_key(reviewers: "list[dict] | None") -> "list[tuple[str, str]]":
+    return sorted((str(r.get("provider", "")), str(r.get("model", "")))
+                  for r in (reviewers or []) if isinstance(r, dict))
+
+
+def read_valid_ledger(head_sha: str, diff_sha: str,
+                      reviewers: "list[dict] | None" = None) -> ReviewVerdict | None:
     p = ledger_path(head_sha)
     if not p.exists():
         return None
@@ -530,6 +538,21 @@ def read_valid_ledger(head_sha: str, diff_sha: str) -> ReviewVerdict | None:
         return None
     if rec.get("head_sha") != head_sha or rec.get("diff_sha256") != diff_sha:
         return None
+    if reviewers is not None:
+        # EARS-5b: кэш годен ТОЛЬКО при совпадении набора {провайдер, модель}. Иначе запрос
+        # `both` удовлетворялся бы записью от одного (гейт ЗАЯВЛЯЛ бы двухглазое ревью, которого
+        # не было), а кэш cursor+GPT — запросом cursor+Grok (подмена разнообразия). Запись без
+        # поля `reviewers` (легаси) годна только для запроса «только codex».
+        cached = rec.get("reviewers")
+        if cached is None or not isinstance(cached, list) or not cached:
+            if _reviewers_key(reviewers) != [("codex", "codex")]:
+                return None
+        elif _reviewers_key(cached) != _reviewers_key(reviewers):
+            return None
+        else:
+            for r in cached:                       # переоценка по ТЕКУЩЕМУ allow-list
+                if r.get("provider") == "cursor" and r.get("model") not in _CURSOR_MODEL_ALLOW:
+                    return None
     v = ReviewVerdict(verdict=rec.get("verdict"),
                       findings=[tuple(f) for f in rec.get("findings", [])],
                       no_findings_marker=rec.get("no_findings_marker", False),
@@ -650,22 +673,29 @@ def save_findings_ledger(led: dict) -> None:
     _atomic_write_json(FINDINGS_DIR / "current.json", led, indent=2)
 
 
-def merge_round(led: dict, blocking_findings: "list[tuple[str, str]]",
-                review_started_ts: "float | None" = None) -> None:
+def merge_round(led: dict, blocking_findings: "list[tuple]",
+                review_started_ts: "float | None" = None, partial: bool = False) -> None:
     """Влить раунд Codex в ledger. [DUP:открытого/fixed] → duplicate-привязка;
     [DUP:residual/refuted] → пере-подъём = dispute (спека R1: DUP ≠ согласие);
     [DISPUTE:Fx] → disputes+1 + re-open; прочее → новый open."""
-    led["rounds"] = int(led.get("rounds") or 0) + 1
-    # Флаг чистится, только если review СТАРТОВАЛ после последней адъюдикации (спор F3-3:
-    # старый review, финишировавший после адъюдикации, очищал флаг, не видев её).
-    if review_started_ts is None or review_started_ts >= float(led.get("last_adj_ts") or 0):
-        led["needs_review_round"] = False
+    # partial=True (EARS-14c): раунд НЕ состоялся (один из запрошенных провайдеров отказал) —
+    # счётчик не инкрементим (outage не должен жечь hard-cap) и needs_review_round не сбрасываем
+    # (адъюдикации показаны не ВСЕМ запрошенным ревьюерам), НО находки успешного вливаем, иначе
+    # уже найденный blocking потеряется между прогонами (ledger — единственная память серии).
+    if not partial:
+        led["rounds"] = int(led.get("rounds") or 0) + 1
+        # Флаг чистится, только если review СТАРТОВАЛ после последней адъюдикации (спор F3-3:
+        # старый review, финишировавший после адъюдикации, очищал флаг, не видев её).
+        if review_started_ts is None or review_started_ts >= float(led.get("last_adj_ts") or 0):
+            led["needs_review_round"] = False
     fnd = led.setdefault("findings", {})
 
     def new_fid() -> str:
         return f"F{len(fnd) + 1}"
 
-    for sev, title in blocking_findings:
+    for item in blocking_findings:
+        sev, title = item[0], item[1]
+        provider = item[2] if len(item) > 2 else None      # EARS-15: кто поднял находку
         kind, fid, rest = parse_finding_prefix(title)
         target = fnd.get(fid) if fid else None
         if kind in ("dup", "dispute") and target is not None:
@@ -685,7 +715,8 @@ def merge_round(led: dict, blocking_findings: "list[tuple[str, str]]",
                 target["status"] = "open"
                 target["disputes"] = int(target.get("disputes") or 0) + 1
             fnd[new_fid()] = {"severity": sev, "title": rest, "status": "duplicate",
-                              "dup_of": fid, "disputes": 0, "round": led["rounds"]}
+                              "dup_of": fid, "disputes": 0, "round": led["rounds"],
+                              "provider": provider}
             continue
         if kind == "dispute" and target is not None:
             if target["status"] == "resolved-by-user":
@@ -695,8 +726,11 @@ def merge_round(led: dict, blocking_findings: "list[tuple[str, str]]",
             target["disputes"] = int(target.get("disputes") or 0) + 1
             target["dispute_note"] = rest
             continue
-        fnd[new_fid()] = {"severity": sev, "title": rest, "status": "open",
-                          "dup_of": None, "disputes": 0, "round": led["rounds"]}
+        rec_new = {"severity": sev, "title": rest, "status": "open", "dup_of": None,
+                   "disputes": 0, "round": led["rounds"], "provider": provider}
+        if partial:
+            rec_new["from_partial_round"] = True
+        fnd[new_fid()] = rec_new
 
 
 def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
@@ -1043,15 +1077,17 @@ def _verdict_lock():
 
 
 def _write_deploy_verdict(head: str, baseline: "str | None", diff_sha: str,
-                          ladder_st: str, empirical_st: str, codex_st: str) -> int:
+                          ladder_st: str, empirical_st: str, codex_st: str,
+                          reviewers: "list[dict] | None" = None) -> int:
     """Ф2: машиночитаемый вердикт для inframon. Delete-then-write под локом (R1-F2/R2-F2).
     0 = ок/best-effort-warning; 2 = блок (unlink упал, старый вердикт остался бы маскировать)."""
     path = VERDICT_DIR / f"{head}.json"
     import time as _time
     payload = {
-        "schema": 1, "run_id": f"{int(_time.time() * 1000)}-{os.getpid()}",
+        "schema": 2, "run_id": f"{int(_time.time() * 1000)}-{os.getpid()}",
         "head_sha": head, "baseline_sha": baseline or "", "diff_sha256": diff_sha,
         "gates": {"ladder": ladder_st, "empirical": empirical_st, "codex": codex_st},
+        "providers": reviewers if reviewers is not None else [],   # Ф1: кто судил (схема 2)
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     with _verdict_lock():
@@ -1120,6 +1156,140 @@ def _empirical_gate(baseline: str, head: str) -> int:
         return 2
     print("[codex-gate] ✓ empirical: тест-команда зелёная", file=sys.stderr)
     return 0
+
+
+# ═══════ Ф1/Ф3: провайдеры ревью (спека 2026-07-25-reviewer-provider-switch-design.md) ═══════
+# REVIEW_PROVIDER=codex|cursor|both. Неизвестное значение → БЛОК (тихий фолбэк скрыл бы опечатку
+# и создал ложное впечатление «ревьюил тот, кого просили»). Адаптер cursor — В КОДЕ, а не в
+# шаблоне: allow-list модели, --trust, --mode ask и таймаут обязаны быть неотключаемыми.
+_PROVIDERS = ("codex", "cursor", "both")
+_CURSOR_MODEL = "cursor-grok-4.5-high"     # другое СЕМЕЙСТВО, чем codex (gpt-5.6-sol) → разнообразие
+_CURSOR_TIMEOUT_S = 600
+_CURSOR_DIFF_LIMIT = 300_000
+# Разрешены ТОЛЬКО не-Anthropic модели: Claude пишет код в этом контуре, Claude-ревьюер молча
+# превращает независимый гейт в самопроверку. `auto` запрещён — скрытая маршрутизация.
+_CURSOR_MODEL_ALLOW = frozenset({
+    "cursor-grok-4.5-high", "cursor-grok-4.5-high-fast", "cursor-grok-4.5-low",
+    "gpt-5.3-codex", "gpt-5.3-codex-high", "gpt-5.3-codex-high-fast", "gpt-5.3-codex-xhigh",
+    "gpt-5.2", "gpt-5.4-high", "gpt-5.4-high-fast", "gpt-5.5-high", "gpt-5.5-high-fast",
+    "gpt-5.6-sol-high", "gpt-5.6-sol-high-fast", "gpt-5.6-sol-xhigh",
+})
+_VERDICT_LINE_RE = re.compile(r"^\s*Verdict:\s*(?:approve|needs-attention)\s*$",
+                              re.IGNORECASE | re.MULTILINE)
+
+
+def resolve_providers() -> "tuple[tuple[str, ...] | None, str]":
+    """(провайдеры, сообщение об ошибке). None = неизвестное значение → блок (EARS-3)."""
+    raw = os.environ.get("REVIEW_PROVIDER")
+    if raw is None:
+        return (("codex",), "")
+    v = raw.strip().lower()
+    if v not in _PROVIDERS:
+        return (None, f"[codex-gate] \u2717 REVIEW_PROVIDER={raw!r} неизвестен (ожидается "
+                      f"{'|'.join(_PROVIDERS)}) — деплой остановлен, тихого фолбэка на codex НЕТ.")
+    return ((("codex", "cursor") if v == "both" else (v,)), "")
+
+
+def resolve_cursor_model() -> "tuple[str | None, str]":
+    """(модель, ошибка). Оверрайд только через CURSOR_REVIEW_MODEL и только из allow-list."""
+    m = (os.environ.get("CURSOR_REVIEW_MODEL") or _CURSOR_MODEL).strip()
+    low = m.lower()
+    if "claude" in low or low == "auto" or m not in _CURSOR_MODEL_ALLOW:
+        return (None, f"[codex-gate] \u2717 модель ревьюера {m!r} недопустима: ревьюер обязан быть "
+                      "НЕ-Anthropic (Claude пишет код — Claude-ревьюер это самопроверка), "
+                      "`auto` запрещён (скрытая маршрутизация).")
+    return (m, "")
+
+
+def normalize_reviewer_text(text: str) -> "str | None":
+    """Нормализация ответа cursor: он склеивает narration своих tool-call с ответом БЕЗ перевода
+    строки, поэтому строгий `^Verdict:` не матчится (живой прогон 25.07). Правило — РОВНО ОДНО
+    вхождение `Verdict: approve|needs-attention`: нет → None; больше одного → None (ambiguous:
+    «берём последнее» спуфилось цитатой `Verdict: approve` ниже реальной находки, R2-F2)."""
+    if not text:
+        return None
+    prepared = re.sub(r"(?<!\n)(Verdict:\s*(?:approve|needs-attention))", r"\n\1", text,
+                      flags=re.IGNORECASE)
+    if len(_VERDICT_LINE_RE.findall(prepared)) != 1:
+        return None
+    return prepared[_VERDICT_LINE_RE.search(prepared).start():]
+
+
+def _build_cursor_prompt(diff_text: str) -> str:
+    agents = ""
+    if REPO_ROOT is not None and (REPO_ROOT / "AGENTS.md").exists():
+        try:
+            agents = (REPO_ROOT / "AGENTS.md").read_text()[:20000]
+        except OSError:
+            agents = ""
+    return (
+        "You are an independent adversarial code reviewer. Review the diff below.\n"
+        "Reply in EXACTLY this format and NOTHING else — no preamble, no markdown fences, and "
+        "do NOT write the word 'Verdict:' anywhere except the very first line:\n"
+        "first line 'Verdict: approve' or 'Verdict: needs-attention'; then a blank line; then "
+        "either 'No material findings.' or a bullet list where each line is "
+        "'- [severity] title (file:line)' with severity one of critical/high/medium/low.\n"
+        + (f"\nProject review constitution (AGENTS.md):\n{agents}\n" if agents else "")
+        + _REVIEW_FOCUS + _adjudication_prompt_block()
+        + f"\n\nDiff to review:\n```\n{diff_text}\n```\n")
+
+
+def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
+    """(текст в нашем контракте | None, диагностика). None = отказ → fail-closed у вызывающего."""
+    model, err = resolve_cursor_model()
+    if model is None:
+        return (None, err)
+    try:
+        diff_text = subprocess.run(["git", "diff", f"{base}..{head}"], cwd=REPO_ROOT,
+                                   capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError) as e:
+        return (None, f"не получить дифф: {type(e).__name__}")
+    if len(diff_text) > _CURSOR_DIFF_LIMIT:
+        return (None, f"дифф {len(diff_text)} символов > лимита {_CURSOR_DIFF_LIMIT} — сузь "
+                      "диапазон или REVIEW_PROVIDER=codex (усечённое ревью выглядело бы полным)")
+    cmd = ["cursor-agent", "-p", "--output-format", "json", "--mode", "ask", "--trust",
+           "--model", model, _build_cursor_prompt(diff_text)]
+    try:
+        r = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True,
+                           timeout=_CURSOR_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return (None, f"таймаут {_CURSOR_TIMEOUT_S}s")
+    except OSError as e:
+        return (None, redact_secrets(f"{type(e).__name__}: {e}"))
+    if r.returncode != 0:
+        return (None, redact_secrets((r.stderr or r.stdout or "").strip())[:300])
+    try:
+        env = json.loads((r.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return (None, "вывод cursor-agent не JSON")
+    usage = env.get("usage") or {}
+    audit(f"cursor-review model={model} in={usage.get('inputTokens')} "
+          f"out={usage.get('outputTokens')}")           # наблюдаемость затрат
+    normalized = normalize_reviewer_text(env.get("result") or "")
+    if normalized is None:
+        return (None, "ответ не в контракте (нет ровно одного 'Verdict:') — narration или "
+                      "цитата-пример; ревью не засчитано")
+    return (normalized, f"model={model}")
+
+
+def review_with_provider(provider: str, base: str,
+                         head: str) -> "tuple[ReviewVerdict | None, str, str]":
+    """(вердикт|None, модель, диагностика) для ОДНОГО провайдера."""
+    if provider == "codex":
+        out = run_companion_review(base=base, scope="branch")
+        if out is None:
+            return (None, "codex", "companion недоступен")
+        v = parse_review_output(out)
+        return ((v if v.valid else None), "codex",
+                "" if v.valid else (outage_details(out) or "невалидный вывод"))
+    text, info = run_cursor_review(base, head)
+    model = info[len("model="):] if info.startswith("model=") else \
+        (os.environ.get("CURSOR_REVIEW_MODEL") or _CURSOR_MODEL)
+    if text is None:
+        return (None, model, info)
+    v = parse_review_output(text)
+    return ((v if v.valid else None), model,
+            "" if v.valid else "вывод не прошёл валидацию контракта")
 
 
 def check_reviewed_cli() -> int:
@@ -1214,7 +1384,17 @@ def check_reviewed_cli() -> int:
         return 0
     head = head_before                        # R2-F2: биндим ledger/reviewed к захваченному SHA
     diff_sha = diff_sha256(baseline, head_before)
-    if read_valid_ledger(head, diff_sha) is not None:
+    providers, perr = resolve_providers()     # Ф1: неизвестное значение → блок (EARS-3)
+    if providers is None:
+        print(perr, file=sys.stderr)
+        return 2
+    cursor_model, merr = (resolve_cursor_model() if "cursor" in providers else ("codex", ""))
+    if "cursor" in providers and cursor_model is None:
+        print(merr, file=sys.stderr)          # EARS-4: allow-list моделей в коде
+        return 2
+    requested_reviewers = [{"provider": p, "model": (cursor_model if p == "cursor" else "codex")}
+                           for p in providers]
+    if read_valid_ledger(head, diff_sha, requested_reviewers) is not None:
         # Кэш чистого ревью НЕ обходит протокол сходимости (Codex-спор F3: конкурентная
         # сессия могла записать open-находку в серию — кэш её не видел).
         with findings_lock():
@@ -1234,7 +1414,8 @@ def check_reviewed_cli() -> int:
         else:
             _record_reviewed(head)
             l_st, e_st, c_st = _verdict_statuses("cached")
-            if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st):
+            if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st,
+                                     requested_reviewers):
                 return 2
             print("[codex-gate] ✓ валидная запись ревью для HEAD — деплой разрешён")
             return 0
@@ -1249,42 +1430,63 @@ def check_reviewed_cli() -> int:
         save_findings_ledger(led)   # свежая/архивированная серия видна промпт-блоку
     import time as _time
     review_started_ts = _time.time()   # для ts-guard needs_review_round (спор F3-3)
-    out = run_companion_review(base=baseline, scope="branch")
-    verdict = parse_review_output(out) if out is not None else None
-    if verdict is None:          # ML6: реальный outage/timeout → аварийный контур БЕЗ Codex
-        print("[codex-gate] ✗ Codex недоступен/невалидный вывод — деплой остановлен. "
-              "При АКТИВНОМ инциденте актуатора: СНАЧАЛА kill-switch проекта (freeze — "
-              "останавливает актуатор без Codex); ЗАТЕМ при необходимости rollback (пока "
-              "заморожено). Rollback БЕЗ freeze актуатор НЕ останавливает. Ремонт — через гейт.",
+    # Ф3: КАЖДЫЙ запрошенный провайдер ревьюит один и тот же дифф в ОДНОМ прогоне; второй проход
+    # выполняется ДАЖЕ при blocking у первого (union за один раунд — адъюдикация разом, EARS-14b).
+    results, failures, advisory = [], [], []
+    for prov in providers:
+        v, model, detail = review_with_provider(prov, baseline, head)
+        if v is None:
+            failures.append((prov, model, detail))
+            print(f"[codex-gate] ✗ ревьюер {prov} ({model}) не дал валидный вердикт: {detail}",
+                  file=sys.stderr)
+            continue
+        results.append((prov, model, v))
+        print(f"[codex-gate] ревьюер {prov} ({model}): {v.verdict}, находок {len(v.findings)}",
               file=sys.stderr)
+    # union находок с пометкой провайдера (EARS-12/15)
+    blocking = [(sev, title, prov) for prov, _m, v in results for sev, title in v.findings
+                if sev in SEVERITY_BLOCKING or sev not in KNOWN_SEVERITIES]
+    advisory = [(sev, title, prov) for prov, _m, v in results for sev, title in v.findings
+                if sev in KNOWN_SEVERITIES and sev not in SEVERITY_BLOCKING]
+    if failures:
+        # EARS-14: отказ ЛЮБОГО → блок без деградации; EARS-14c: находки успешного ВЛИВАЕМ
+        # (partial: rounds не инкрементим, needs_review_round не сбрасываем)
+        if blocking:
+            with findings_lock():
+                led_p = load_findings_ledger(baseline)
+                if led_p is not None:
+                    merge_round(led_p, blocking, partial=True)
+                    save_findings_ledger(led_p)
+            print("[codex-gate] находки успевшего ревьюера сохранены в серию (частичный раунд: "
+                  "счётчик раундов НЕ увеличен)", file=sys.stderr)
+        names = ", ".join(f"{p}" for p, _m, _d in failures)
+        print(f"[codex-gate] ✗ не все запрошенные ревьюеры отработали ({names}) — деплой "
+              "остановлен без деградации до одного. Осознанное понижение: REVIEW_PROVIDER=codex "
+              "(или cursor).\n"
+              "ML6 (аварийный контур, если СЕЙЧАС идёт инцидент актуатора): СНАЧАЛА kill-switch "
+              "проекта (freeze — останавливает актуатор без ревьюера); ЗАТЕМ при необходимости "
+              "rollback (пока заморожено). Rollback БЕЗ freeze актуатор НЕ останавливает. "
+              "Ремонт — через гейт.", file=sys.stderr)
         return 2
-    if not verdict.valid:        # дрейф схемы/outage — ledger не кормим мусором
-        details = outage_details(out)
-        print("[codex-gate] ✗ невалидный вывод ревью — деплой остановлен."
-              + (f" Причина от companion: {details}" if details else " (дрейф схемы, деталей нет)"),
-              file=sys.stderr)
-        return 2
-    # ─ Протокол сходимости (Фаза 1.6): память между раундами вместо стены high'ов ─
-    blocking = [(s, t) for s, t in verdict.findings
-                if s in SEVERITY_BLOCKING or s not in KNOWN_SEVERITIES]
+    verdict = results[0][2]      # для кэша достаточно любого валидного (union решает ниже)
     with findings_lock():        # догфуд F3: RE-LOAD под локом — ревью шло минуты, конкурентная
         led = load_findings_ledger(baseline)   # сессия могла изменить серию; merge поверх свежего
         if led is None:
             print("[codex-gate] ✗ findings-ledger повреждён. Деплой остановлен.", file=sys.stderr)
             return 2
-        merge_round(led, blocking, review_started_ts=review_started_ts)
+        merge_round(led, blocking, review_started_ts=review_started_ts)   # ОДИН раунд (EARS-13)
         apply_carry_over(led)
         save_findings_ledger(led)
         decision, msg = convergence_decision(led)
     if decision == "allow":
         if not verdict.blocking:
-            write_ledger(head, diff_sha, baseline, verdict)   # чистый вердикт кэшируем
+            write_ledger(head, diff_sha, baseline, verdict, requested_reviewers)   # кэш
         _record_reviewed(head)
-        for sev, title in verdict.findings:
-            if sev not in SEVERITY_BLOCKING:   # совещательные — показать оператору
-                print(f"    [{sev}] {title}", file=sys.stderr)
+        for sev, title, prov in advisory:      # совещательные — с пометкой провайдера
+            print(f"    [{sev}] ({prov}) {title}", file=sys.stderr)
         l_st, e_st, c_st = _verdict_statuses("allow")
-        if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st):
+        if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st,
+                                 requested_reviewers):
             return 2
         print(msg)
         print("[codex-gate] ✓ деплой разрешён (протокол сходимости)")
