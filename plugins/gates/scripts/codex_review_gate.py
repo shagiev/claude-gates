@@ -1188,6 +1188,17 @@ def check_reviewed_cli() -> int:
             empirical_st = "pass" if e_state == "enabled" else "not-configured"
         return (ladder_st, empirical_st, codex_st)
 
+    # --- Ф2: сессионное выключение ревьюера. Проверка ДО кэш-ветки и до любого раннего allow
+    # (EARS-9b): иначе валидный кэш разрешил бы деплой при «выключенном» ревьюере. Исключение —
+    # осознанный CODEX_REVIEW_SKIP (аварийный контур сохраняется).
+    _disabled = review_disabled_reason(_env_session())
+    if _disabled is not None and not codex_skip:
+        _disabled_banner(_disabled)
+        print("[codex-gate] ✗ ревьюер выключен в этой сессии — деплой остановлен. Два выхода: "
+              "`review-enable` (вернуть ревьюера) ИЛИ аварийный CODEX_REVIEW_SKIP=1 (аудируется). "
+              "Смена провайдера выключение НЕ обходит.", file=sys.stderr)
+        return 2
+
     # --- CODEX часть (прежняя логика; теперь ПОСЛЕ ladder+empirical — CODEX_REVIEW_SKIP их не пропускает) ---
     if codex_skip:
         _record_reviewed(head_before)   # осознанный skip — задеплоенный SHA тоже фиксируем (R2-F2)
@@ -1517,9 +1528,40 @@ def _hook_session(data: dict) -> str:
     return data.get("session_id") or _env_session()
 
 
+def _review_disabled_path(session: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session or "nosession")
+    return DESIGN_MARKER.with_name(".review-disabled-" + safe)
+
+
+def review_disabled_reason(session: str) -> "str | None":
+    """Причина выключения ревьюера в ЭТОЙ сессии, иначе None. Пер-сессионность = авто-истечение
+    (Ф2 спеки): «навсегда выключен» невозможен by construction."""
+    if not session or DESIGN_MARKER is None:
+        return None
+    p = _review_disabled_path(session)
+    if not p.exists():
+        return None
+    try:
+        rec = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "(причина нечитаема)"          # маркер есть → выключено (fail-closed к состоянию)
+    r = rec.get("reason")
+    return r if isinstance(r, str) and r.strip() else "(без причины)"
+
+
+def _disabled_banner(reason: str) -> None:
+    """ГРОМКО, пока включён (actuator-safety: забытый kill-switch недопустим)."""
+    print(f"[codex-gate] ⚠️⚠️ РЕВЬЮЕР ВЫКЛЮЧЕН в этой сессии (причина: {reason}) — G1 пропускает "
+          "правки кода, деплой ЗАБЛОКИРОВАН. Вернуть: `review-enable`.", file=sys.stderr)
+
+
 def _design_gate(session: str, drift_msg: str, unreviewed_msg: str) -> int:
     """Общая ветка design-гейта по состоянию маркера (тикет #3): drifted → своё сообщение,
     не-valid → generic, valid → 0."""
+    reason = review_disabled_reason(session)
+    if reason is not None:                    # Ф2: дизайн-гейт fail-open by design (BS3)
+        _disabled_banner(reason)
+        return 0
     state = _marker_state(session)
     if state == "drifted":
         return _deny(drift_msg)
@@ -1583,6 +1625,12 @@ def main(argv: list[str]) -> int:
         if skip_requested():                   # F5: аварийный CODEX_REVIEW_SKIP жив и здесь
             audit("CODEX_REVIEW_SKIP=1 — check-decision пропущен (аварийный контур)")
             return 0
+        _dis = review_disabled_reason(_env_session())
+        if _dis is not None:                   # Ф2: выключенный ревьюер блокирует и здесь
+            _disabled_banner(_dis)
+            print("[codex-gate] ✗ ревьюер выключен — выкатка остановлена (`review-enable` или "
+                  "аварийный CODEX_REVIEW_SKIP=1).", file=sys.stderr)
+            return 2
         with findings_lock():                  # перечитать серию ПРЯМО перед rsync — конкурентная
             led = load_findings_ledger(None)   # сессия могла записать open/адъюдикацию после allow
             if led is None:
@@ -1629,6 +1677,38 @@ def main(argv: list[str]) -> int:
                 return 2
             save_findings_ledger(led)
         print(f"{argv[1]} → {argv[2]}")
+        return 0
+    if cmd in ("review-disable", "review-enable", "review-status"):
+        if DESIGN_MARKER is None:
+            print("[codex-gate] ✗ не git-репозиторий", file=sys.stderr)
+            return 2
+        session = _env_session()
+        if not session:                        # S10: нечего скоупить → fail-closed
+            print("[codex-gate] ✗ сессия неизвестна — выключение нечего скоупить "
+                  "(пер-сессионный маркер). Команда отклонена.", file=sys.stderr)
+            return 2
+        path = _review_disabled_path(session)
+        if cmd == "review-status":
+            reason = review_disabled_reason(session)
+            print(f"ревьюер: {'ВЫКЛЮЧЕН (' + reason + ')' if reason else 'включён'}")
+            return 0
+        if cmd == "review-enable":
+            existed = path.exists()
+            path.unlink(missing_ok=True)
+            if existed:
+                audit(f"review-enable session={session} — ревьюер снова включён")
+            print("[codex-gate] ✓ ревьюер включён" + ("" if existed else " (и не был выключен)"))
+            return 0
+        reason = argv[1].strip() if len(argv) > 1 else ""
+        if not reason:                         # S2: причина обязательна (как у адъюдикаций)
+            print("usage: review-disable \"<причина>\"  — причина обязательна (аудит)",
+                  file=sys.stderr)
+            return 1
+        _atomic_write_json(path, {"reason": redact_secrets(reason), "session": session,
+                                  "ts": datetime.now(timezone.utc).isoformat()})
+        audit(f"review-disable session={session} reason={redact_secrets(reason)!r} — "
+              "ревьюер ВЫКЛЮЧЕН в сессии (деплой заблокирован, G1 пропускает)")
+        _disabled_banner(redact_secrets(reason))
         return 0
     if cmd == "gate-edit":
         return gate_edit_cli(sys.stdin.read())
