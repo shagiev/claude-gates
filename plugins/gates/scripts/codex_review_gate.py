@@ -1217,6 +1217,17 @@ def resolve_cursor_model() -> "tuple[str | None, str]":
     return (m, "")
 
 
+# Явный отказ ревьюера в narration ДО вердикта (ревью R4). Полностью запретить префикс нельзя —
+# cursor всегда предваряет ответ narration своих tool-call, ради чего нормализация и существует.
+# Но «не смог посмотреть дифф» + «Verdict: approve» — машинно-детектируемое противоречие, в
+# отличие от просто неверного вердикта. Формулировки узкие: «could not find issues» (легитимный
+# чистый результат) НЕ должен ловиться — поэтому объект отказа обязателен.
+_REFUSAL_RE = re.compile(
+    r"(?i)\b(?:could\s*n[o']?t|cannot|can't|unable\s+to|failed\s+to|was\s*n[o']?t\s+able\s+to)"
+    r"\s+(?:\w+\s+){0,3}?(?:inspect|read|access|fetch|retrieve|open|see|review|analyz|examin|"
+    r"obtain|load)\w*\s+(?:the\s+)?(?:diff|change|patch|code|file|repo|content|source)")
+
+
 def normalize_reviewer_text(text: str) -> "str | None":
     """Нормализация ответа cursor: он склеивает narration своих tool-call с ответом БЕЗ перевода
     строки, поэтому строгий `^Verdict:` не матчится (живой прогон 25.07). Правило — РОВНО ОДНО
@@ -1228,7 +1239,10 @@ def normalize_reviewer_text(text: str) -> "str | None":
                       flags=re.IGNORECASE)
     if len(_VERDICT_LINE_RE.findall(prepared)) != 1:
         return None
-    block = prepared[_VERDICT_LINE_RE.search(prepared).start():]
+    start = _VERDICT_LINE_RE.search(prepared).start()
+    if _REFUSAL_RE.search(prepared[:start]):   # R4: отказ в narration ≠ одобрение
+        return None
+    block = prepared[start:]
     # F1 (ревью реализации): недостаточно «одного Verdict:» — суффикс должен ЦЕЛИКОМ
     # соответствовать контракту. Иначе narration с примером в блоке кода
     # (```\nVerdict: approve\nNo material findings.\n```  «я не смог посмотреть дифф»)

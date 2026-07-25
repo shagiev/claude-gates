@@ -320,3 +320,21 @@ def test_r3_markdown_heading_escape_removed():
         "Verdict: approve\n\nNo material findings.\n# I could not inspect the diff.") is None
     assert g.normalize_reviewer_text(
         "Verdict: needs-attention\n\nFindings:\n- [high] x (a:1)\n") is not None   # контракт цел
+
+
+def test_r4_pre_verdict_refusal_rejected():
+    # ревью R4: narration отбрасывалась, поэтому «не смог посмотреть» + approve = одобрение
+    for refusal in ("I could not inspect the diff.Verdict: approve\n\nNo material findings.",
+                    "Unable to access the changes.Verdict: approve\n\nNo material findings.",
+                    "I failed to read the patch.Verdict: approve\n\nNo material findings.",
+                    "I wasn't able to review the code.Verdict: approve\n\nNo material findings."):
+        assert g.normalize_reviewer_text(refusal) is None, refusal
+
+
+def test_r4_legitimate_narration_still_accepted():
+    # ключевое: обычная narration и «не нашёл проблем» НЕ должны ловиться детектором отказа
+    for ok in ("I'll check the repo invariants first.Verdict: approve\n\nNo material findings.",
+               "I could not find any issues after reading the diff.Verdict: approve\n\n"
+               "No material findings.",
+               "Reviewed all files.Verdict: needs-attention\n\n- [high] x (a:1)\n"):
+        assert g.normalize_reviewer_text(ok) is not None, ok
