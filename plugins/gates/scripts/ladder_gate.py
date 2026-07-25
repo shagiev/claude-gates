@@ -1,5 +1,5 @@
 """Ladder gate: tree-хэш «всё изменённое» (временный индекс) + begin/mark протокол
-проходов /simplify → /code-review; pre-commit/post-commit энфорсмент; деплой range-проверка
+проходов /simplify → /code-review → security; pre-commit/post-commit энфорсмент; range-проверка
 `check_range` — покрытие ВСЕГО `baseline..HEAD`, канонические проходы независимо от config.
 Chain-семантика, анти-replay (R7), consume-then-publish (R8). Порт из боевого проекта-источника в плагин
 gates: конфиг — `.codex-gate.yaml` (было config.yaml), эпоха — из конфига root'а с
@@ -30,12 +30,18 @@ except ImportError:                                    # запуск как г�
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import is_code_path  # type: ignore[no-redef]
 
-DEPLOY_REQUIRED_PASSES = ("simplify", "code-review")
+DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
+# Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
+# security-прохода не существовало — такой коммит не мог его иметь (grandfathering по
+# ПРОИСХОЖДЕНИЮ записи, спека 2026-07-25-security-ladder-pass-design.md, EARS-5).
+LEGACY_REQUIRED_PASSES = ("simplify", "code-review")
+LADDER_SCHEMA = 2                     # текущая схема ledger-записи (пишется новым кодом)
 GATE_CONFIG_NAME = ".codex-gate.yaml"
 
 # Точные пути ladder-бухгалтерии для исключения из tree-хэша (ревью Task 1: широкий glob
-# `.ladder-*` прятал бы от хэша и ПРОИЗВОЛЬНЫЙ файл/каталог под этим префиксом — сузено
-# до 4 конкретных литералов; всё прочее под .claude/.ladder-* попадает в хэш). Плоские пути
+# `.ladder-*` прятал бы от хэша и ПРОИЗВОЛЬНЫЙ файл/каталог под этим префиксом — сужено до
+# конкретных литералов, по два на каждый канонический проход; всё прочее под
+# .claude/.ladder-* попадает в хэш). Плоские пути
 # (не pathspec-негации, см. compute_tree fix Task 4) — потребляются `git rm --cached`.
 _BOOKKEEPING_PATHS = tuple(
     f".claude/.ladder-{name}"
@@ -175,18 +181,21 @@ def _atomic_write(path: Path, payload: dict) -> None:
 
 def begin_pass(root: Path, pass_name: str) -> None:
     """Снимает tree_before ДО прохода, пишет pending (перезапись своего — ок).
-    Для code-review валидирует chain-start: текущий tree == simplify.tree_after,
-    иначе LadderError (ручная правка между проходами / /simplify не запускался)."""
+    Для КАЖДОГО прохода кроме первого валидирует chain-start: текущий tree ==
+    tree_after ПРЕДЫДУЩЕГО прохода канонического порядка, иначе LadderError (ручная правка
+    между проходами / предыдущий проход не запускался). EARS-2 security-спеки."""
     if pass_name not in DEPLOY_REQUIRED_PASSES:
         raise LadderError(f"неизвестный проход {pass_name!r} — ожидается один из "
                           f"{DEPLOY_REQUIRED_PASSES}")
     tree = compute_tree(root)
-    if pass_name == "code-review":
-        simplify_marker = read_marker(root, "simplify")
-        if simplify_marker is None or simplify_marker.get("tree_after") != tree:
+    idx = DEPLOY_REQUIRED_PASSES.index(pass_name)
+    if idx > 0:
+        prev = DEPLOY_REQUIRED_PASSES[idx - 1]
+        prev_marker = read_marker(root, prev)
+        if prev_marker is None or prev_marker.get("tree_after") != tree:
             raise LadderError(
-                "code-review: старт цепочки не совпадает с simplify.tree_after — "
-                "сначала /simplify (или ручная правка сломала цепочку между проходами)")
+                f"{pass_name}: старт цепочки не совпадает с {prev}.tree_after — "
+                f"сначала пройди {prev} (или ручная правка сломала цепочку между проходами)")
     _atomic_write(_pending_path(root, pass_name), {
         "tree_before": tree,
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -222,10 +231,13 @@ _AUDIT_LOG_RELPATH = Path("logs") / "codex_review_audit.log"
 _LEDGER_DIR_RELPATH = Path("logs") / "ladder_ledger"
 
 _CHAIN_INSTRUCTIONS = (
-    "[ladder-gate] цепочка /simplify → /code-review не подтверждена для этого коммита.\n"
+    "[ladder-gate] цепочка /simplify → /code-review → security не подтверждена для этого коммита.\n"
     "Прогони протокол: `ladder_gate.py begin simplify` → /simplify → "
     "`ladder_gate.py mark simplify` → `ladder_gate.py begin code-review` → /code-review → "
-    "`ladder_gate.py mark code-review`, затем закоммить снова.\n"
+    "`ladder_gate.py mark code-review` → `ladder_gate.py begin security` → "
+    "security-проход (`/security-review` или security-фокус по AGENTS.md: внешний ввод в "
+    "опасный сток, секреты, авторизация, слабая криптография) → "
+    "`ladder_gate.py mark security`, затем закоммить снова.\n"
     "Обход (осознанно, с аудитом): LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ..."
 )
 
@@ -267,13 +279,17 @@ def ladder_enabled(root: Path) -> bool:
 
 
 def _chain_valid_against(root: Path, expected_tree: str) -> bool:
-    """Chain-валидность (спека §1/§2): simplify.tree_after == codereview.tree_before И
-    codereview.tree_after == expected_tree (индекс на pre-commit, HEAD^{tree} на post-commit)."""
-    simplify = read_marker(root, "simplify")
-    codereview = read_marker(root, "code-review")
-    return (simplify is not None and codereview is not None
-            and simplify.get("tree_after") == codereview.get("tree_before")
-            and codereview.get("tree_after") == expected_tree)
+    """Chain-валидность по ВСЕМ звеньям канонического порядка (EARS-3 security-спеки):
+    для каждой соседней пары `prev.tree_after == next.tree_before`, и `последний.tree_after ==
+    expected_tree` (индекс на pre-commit, HEAD^{tree} на post-commit). Разрыв ЛЮБОГО звена или
+    отсутствие любого маркера → невалидно (SEC2/SEC3/SEC17/SEC18)."""
+    markers = [read_marker(root, name) for name in DEPLOY_REQUIRED_PASSES]
+    if any(m is None for m in markers):
+        return False
+    for prev, nxt in zip(markers, markers[1:]):
+        if prev.get("tree_after") != nxt.get("tree_before"):
+            return False
+    return markers[-1].get("tree_after") == expected_tree
 
 
 def check_precommit(root: Path) -> int:
@@ -352,17 +368,20 @@ def _record_commit_impl(root: Path) -> None:
     # worktree-ослабление конфига чеканит exempt-noncode ledger для код-коммита; без записи —
     # fail-closed: деплой-гейт заблокирует диапазон)
     if not commit_touches_code(changed) and classification_trustworthy(root, "HEAD"):
-        _write_ledger(root, head, {"passes": ["exempt-noncode"], "tree": tree, "ts": ts})
+        _write_ledger(root, head, {"passes": ["exempt-noncode"], "tree": tree, "ts": ts,
+                                   "ladder_schema": LADDER_SCHEMA})
         return
     if os.environ.get("LADDER_SKIP") == "1":
         reason = os.environ.get("LADDER_SKIP_REASON", "")
-        _write_ledger(root, head, {"skipped": True, "reason": reason, "tree": tree, "ts": ts})
+        _write_ledger(root, head, {"skipped": True, "reason": reason, "tree": tree, "ts": ts,
+                                   "ladder_schema": LADDER_SCHEMA})
         return
     if _chain_valid_against(root, tree):
-        codereview = read_marker(root, "code-review") or {}
+        last = read_marker(root, DEPLOY_REQUIRED_PASSES[-1]) or {}
         _write_ledger(root, head, {
             "passes": list(DEPLOY_REQUIRED_PASSES), "tree": tree,
-            "session": codereview.get("session", ""), "ts": ts,
+            "session": last.get("session", ""), "ts": ts,
+            "ladder_schema": LADDER_SCHEMA,
         })
         return
     print(f"[ladder-gate] post-commit: HEAD {head[:12]} — код-коммит без валидной лесенки, "
@@ -410,8 +429,20 @@ def _is_ancestor(root: Path, sha: str, ancestor_of: str) -> bool:
     return r.returncode == 0
 
 
-def _passes_complete(passes: object) -> bool:
-    return isinstance(passes, list) and all(p in passes for p in DEPLOY_REQUIRED_PASSES)
+def _required_for_record(record: dict) -> tuple:
+    """Набор проходов, обязательный для ЭТОЙ записи, по её происхождению (EARS-5):
+    есть `ladder_schema >= 2` → текущий канонический набор; поля нет (легаси, писал старый код
+    до появления security-прохода) → легаси-набор. Невалидная/меньшая схема → трактуем как
+    легаси (fail-safe: не блокируем старые диапазоны из-за мусора в поле)."""
+    schema = record.get("ladder_schema")
+    if isinstance(schema, int) and not isinstance(schema, bool) and schema >= 2:
+        return DEPLOY_REQUIRED_PASSES
+    return LEGACY_REQUIRED_PASSES
+
+
+def _passes_complete(passes: object, record: dict) -> bool:
+    """Полнота набора проходов; обязательный набор определяется ПРОИСХОЖДЕНИЕМ записи."""
+    return isinstance(passes, list) and all(p in passes for p in _required_for_record(record))
 
 
 def check_range(root: Path, baseline: str) -> int:
@@ -444,7 +475,7 @@ def check_range(root: Path, baseline: str) -> int:
             tree = _git_out(root, ["rev-parse", f"{sha}^{{tree}}"])
             if record.get("tree") == tree:
                 passes = record.get("passes")
-                if _passes_complete(passes) or passes == ["exempt-noncode"]:
+                if _passes_complete(passes, record) or passes == ["exempt-noncode"]:
                     continue
                 if record.get("skipped") is True:
                     print(f"[ladder-gate] коммит {sha[:12]} прошёл под LADDER_SKIP "

@@ -153,13 +153,17 @@ def _head_tree(repo) -> str:
 
 
 def _grow_valid_chain(repo):
-    """begin/mark simplify → begin/mark code-review, оставляя финальные правки в app/x.py."""
+    """Полная цепочка канонических проходов (после security-спеки — ТРИ звена):
+    begin/mark simplify → code-review → security, финальные правки в app/x.py."""
     lg.begin_pass(repo, "simplify")
     (repo / "app" / "x.py").write_text("x = 2\n")
     lg.mark_pass(repo, "simplify")
     lg.begin_pass(repo, "code-review")
     (repo / "app" / "x.py").write_text("x = 2  # reviewed\n")
     lg.mark_pass(repo, "code-review")
+    lg.begin_pass(repo, "security")
+    (repo / "app" / "x.py").write_text("x = 2  # reviewed, security-checked\n")
+    lg.mark_pass(repo, "security")
 
 
 # --- changed_paths_staged / commit_touches_code ---
@@ -267,7 +271,8 @@ def test_record_commit_exempt_noncode(repo):
     head, tree = _head(repo), _head_tree(repo)
     lg.record_commit(repo)
     rec = lg.read_ledger(repo, head)
-    assert rec == {"passes": ["exempt-noncode"], "tree": tree, "ts": rec["ts"]}
+    assert rec == {"passes": ["exempt-noncode"], "tree": tree, "ts": rec["ts"],
+                   "ladder_schema": lg.LADDER_SCHEMA}
 
 
 def test_record_commit_skipped(repo, monkeypatch):
@@ -291,7 +296,8 @@ def test_record_commit_valid_chain_full_record(repo):
     head, tree = _head(repo), _head_tree(repo)
     lg.record_commit(repo)
     rec = lg.read_ledger(repo, head)
-    assert rec["passes"] == ["simplify", "code-review"]
+    assert rec["passes"] == ["simplify", "code-review", "security"]
+    assert rec["ladder_schema"] == lg.LADDER_SCHEMA
     assert rec["tree"] == tree
 
 
@@ -531,3 +537,126 @@ def test_range_skips_lists_only_skipped(repo, monkeypatch):
     _git(repo, "commit", "-m", "docs")
     lg.record_commit(repo)                                # exempt-noncode — НЕ skip
     assert lg.range_skips(repo, baseline) == [skipped_sha]
+
+
+# ═══ Третий проход security (спека docs/2026-07-25-security-ladder-pass-design.md) ═══
+
+def test_sec1_full_three_pass_chain_precommit_and_record(repo):
+    _grow_valid_chain(repo)
+    _git(repo, "add", "app/x.py")
+    assert lg.check_precommit(repo) == 0                       # SEC1: цепочка из трёх звеньев
+    _git(repo, "commit", "-m", "three-pass change")
+    lg.record_commit(repo)
+    rec = lg.read_ledger(repo, _head(repo))
+    assert rec["passes"] == ["simplify", "code-review", "security"]
+    assert rec["ladder_schema"] == lg.LADDER_SCHEMA
+
+
+def test_sec2_missing_security_blocks_precommit(repo, capsys):
+    lg.begin_pass(repo, "simplify")
+    (repo / "app" / "x.py").write_text("x = 2\n")
+    lg.mark_pass(repo, "simplify")
+    lg.begin_pass(repo, "code-review")
+    (repo / "app" / "x.py").write_text("x = 2  # reviewed\n")
+    lg.mark_pass(repo, "code-review")                          # security НЕ пройден
+    _git(repo, "add", "app/x.py")
+    assert lg.check_precommit(repo) == 2                       # SEC2
+    assert "security" in capsys.readouterr().err               # инструкция включает третий шаг
+
+
+def test_sec3_begin_security_validates_chain_start(repo):
+    lg.begin_pass(repo, "simplify")
+    (repo / "app" / "x.py").write_text("x = 2\n")
+    lg.mark_pass(repo, "simplify")
+    lg.begin_pass(repo, "code-review")
+    lg.mark_pass(repo, "code-review")
+    (repo / "app" / "x.py").write_text("x = 3\n")              # ручная правка МЕЖДУ проходами
+    with pytest.raises(lg.LadderError):                        # SEC3
+        lg.begin_pass(repo, "security")
+
+
+def test_sec4_security_mark_without_begin_and_replay(repo):
+    with pytest.raises(lg.LadderError):                        # SEC4: mark без begin
+        lg.mark_pass(repo, "security")
+    lg.begin_pass(repo, "simplify"); lg.mark_pass(repo, "simplify")
+    lg.begin_pass(repo, "code-review"); lg.mark_pass(repo, "code-review")
+    lg.begin_pass(repo, "security"); lg.mark_pass(repo, "security")
+    with pytest.raises(lg.LadderError):                        # анти-replay
+        lg.mark_pass(repo, "security")
+
+
+def test_sec17_break_second_link_blocks(repo):
+    # все три маркера есть, но code-review.after != security.before (правка между 2-м и 3-м)
+    _grow_valid_chain(repo)
+    mp = repo / ".claude" / ".ladder-security"
+    m = json.loads(mp.read_text())
+    m["tree_before"] = "0" * 40                                # искусственный разрыв звена
+    mp.write_text(json.dumps(m))
+    _git(repo, "add", "app/x.py")
+    assert lg.check_precommit(repo) == 2                       # SEC17
+
+
+def test_sec18_stale_security_marker_blocks(repo):
+    # цепочка связна, но код правили ПОСЛЕ mark security -> security.after != индекс
+    _grow_valid_chain(repo)
+    (repo / "app" / "x.py").write_text("x = 999  # правка ПОСЛЕ security\n")
+    _git(repo, "add", "app/x.py")
+    assert lg.check_precommit(repo) == 2                       # SEC18
+
+
+def _commit_with_record(repo, record, msg):
+    """Код-коммит + подложенная ledger-запись (tree подставляется настоящий)."""
+    (repo / "app" / "x.py").write_text(f"x = {abs(hash(msg)) % 100}\n")
+    _git(repo, "add", "app/x.py")
+    _git(repo, "commit", "-m", msg)
+    head, tree = _head(repo), _head_tree(repo)
+    rec = dict(record); rec["tree"] = tree
+    lg._write_ledger(repo, head, rec)
+    return head
+
+
+def test_sec7_sec8_schema2_requires_canonical_set(repo):
+    baseline = _head(repo)
+    _commit_with_record(repo, {"passes": ["simplify", "code-review", "security"],
+                               "ladder_schema": 2, "ts": "t"}, "schema2 full")
+    assert lg.check_range(repo, baseline) == 0                 # SEC7
+    _commit_with_record(repo, {"passes": ["simplify", "code-review"],
+                               "ladder_schema": 2, "ts": "t"}, "schema2 partial")
+    assert lg.check_range(repo, baseline) == 2                 # SEC8
+
+
+def test_sec9_legacy_record_two_passes_covered(repo):
+    # СЕРДЦЕ обратной совместимости: коммит до фичи (запись без ladder_schema) остаётся покрыт
+    baseline = _head(repo)
+    _commit_with_record(repo, {"passes": ["simplify", "code-review"], "ts": "t"}, "legacy full")
+    assert lg.check_range(repo, baseline) == 0                 # SEC9
+
+
+def test_sec10_legacy_record_one_pass_blocks(repo):
+    baseline = _head(repo)
+    _commit_with_record(repo, {"passes": ["simplify"], "ts": "t"}, "legacy partial")
+    assert lg.check_range(repo, baseline) == 2                 # SEC10
+
+
+def test_sec19_sec20_legacy_exempt_and_skipped_covered(repo):
+    baseline = _head(repo)
+    _commit_with_record(repo, {"passes": ["exempt-noncode"], "ts": "t"}, "legacy exempt")
+    assert lg.check_range(repo, baseline) == 0                 # SEC19
+    _commit_with_record(repo, {"skipped": True, "reason": "old", "ts": "t"}, "legacy skipped")
+    assert lg.check_range(repo, baseline) == 0                 # SEC20
+
+
+def test_sec11_config_cannot_weaken_canonical_set(repo):
+    # урезанный required_passes в конфиге не ослабляет деплой (существующий инвариант ML-L7)
+    (repo / ".codex-gate.yaml").write_text("ladder:\n  required_passes: [simplify]\n")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-m", "config")
+    baseline = _head(repo)
+    _commit_with_record(repo, {"passes": ["simplify"], "ladder_schema": 2, "ts": "t"}, "one pass")
+    assert lg.check_range(repo, baseline) == 2                 # SEC11
+
+
+def test_required_for_record_provenance():
+    assert lg._required_for_record({"ladder_schema": 2}) == lg.DEPLOY_REQUIRED_PASSES
+    assert lg._required_for_record({}) == lg.LEGACY_REQUIRED_PASSES          # легаси
+    for junk in ({"ladder_schema": True}, {"ladder_schema": "2"}, {"ladder_schema": 1}):
+        assert lg._required_for_record(junk) == lg.LEGACY_REQUIRED_PASSES, junk  # fail-safe
