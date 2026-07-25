@@ -190,7 +190,8 @@ _REDACT_RULES = (
 #   5. *_SKIP_REASON (LADDER/EMPIRICAL) и detail тривиального маркера → audit;
 #   6. эхо `empirical.test_command` в сообщении прогона;
 #   7. хвост stdout/stderr тест-команды → _run_empirical();
-#   8. ТЕКСТ ИСКЛЮЧЕНИЯ (TimeoutExpired/OSError/ValueError) — включает весь argv команды.
+#   8. ТЕКСТ ИСКЛЮЧЕНИЯ (TimeoutExpired/OSError/ValueError) — включает весь argv команды;
+#   9. stdout/stderr `cursor-agent` (провайдер cursor) → run_cursor_review().
 # Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей.
 def redact_secrets(text: str) -> str:
     """Замена секрето-образных подстрок на «скрыто». Сохраняет читаемую причину отказа
@@ -1394,6 +1395,8 @@ def check_reviewed_cli() -> int:
         return 2
     requested_reviewers = [{"provider": p, "model": (cursor_model if p == "cursor" else "codex")}
                            for p in providers]
+    audit("review-providers запрошены: "                   # EARS-5: кто судил — в аудит
+          + ", ".join(f"{r['provider']}({r['model']})" for r in requested_reviewers))
     if read_valid_ledger(head, diff_sha, requested_reviewers) is not None:
         # Кэш чистого ревью НЕ обходит протокол сходимости (Codex-спор F3: конкурентная
         # сессия могла записать open-находку в серию — кэш её не видел).
@@ -1479,7 +1482,7 @@ def check_reviewed_cli() -> int:
         save_findings_ledger(led)
         decision, msg = convergence_decision(led)
     if decision == "allow":
-        if not verdict.blocking:
+        if not blocking:      # кэшируем ТОЛЬКО чистый UNION всех провайдеров (не первого)
             write_ledger(head, diff_sha, baseline, verdict, requested_reviewers)   # кэш
         _record_reviewed(head)
         for sev, title, prov in advisory:      # совещательные — с пометкой провайдера

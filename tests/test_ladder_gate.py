@@ -605,8 +605,10 @@ def test_sec18_stale_security_marker_blocks(repo):
 
 
 def _commit_with_record(repo, record, msg):
-    """Код-коммит + подложенная ledger-запись (tree подставляется настоящий)."""
-    (repo / "app" / "x.py").write_text(f"x = {abs(hash(msg)) % 100}\n")
+    """Код-коммит + подложенная ledger-запись (tree подставляется настоящий).
+    Содержимое уникально по msg: hash() рандомизирован по процессу (PYTHONHASHSEED), и при
+    коллизии по модулю содержимое не менялось → пустой коммит → нестабильное падение."""
+    (repo / "app" / "x.py").write_text(f"# {msg}\nx = 1\n")
     _git(repo, "add", "app/x.py")
     _git(repo, "commit", "-m", msg)
     head, tree = _head(repo), _head_tree(repo)

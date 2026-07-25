@@ -210,3 +210,72 @@ def test_p18_tightened_allow_list_invalidates_cache(gate, monkeypatch):
     monkeypatch.setenv("CURSOR_REVIEW_MODEL", "gpt-5.3-codex-high-fast")
     _providers(monkeypatch, cursor=None)
     assert g.check_reviewed_cli() == 2
+
+
+# ═══ Ревью cursor'ом собственной реализации: ветки адаптера входят по-настоящему ═══
+
+def _fake_cursor(monkeypatch, *, rc=0, stdout=None, raises=None):
+    """Подменяет subprocess.run ТОЛЬКО для cursor-agent — тело run_cursor_review исполняется."""
+    real = g.subprocess.run
+    def fake(cmd, **kw):
+        if isinstance(cmd, list) and cmd and cmd[0] == "cursor-agent":
+            if raises is not None:
+                raise raises
+            class R:
+                returncode = rc
+            R.stdout = stdout or ""
+            R.stderr = "" if rc == 0 else "auth failed: api_key=LEAKEDTOKEN123"
+            return R
+        return real(cmd, **kw)
+    monkeypatch.setattr(g.subprocess, "run", fake)
+
+
+def _cursor_envelope(result_text, usage=None):
+    return json.dumps({"result": result_text,
+                       "usage": usage or {"inputTokens": 100, "outputTokens": 20}})
+
+
+def test_adapter_happy_path_and_usage_audited(gate, monkeypatch):
+    _fake_cursor(monkeypatch, stdout=_cursor_envelope(
+        "I checked the repo.Verdict: approve\n\nNo material findings."))
+    text, info = g.run_cursor_review("HEAD~1", "HEAD")
+    assert text is not None and g.parse_review_output(text).valid
+    assert info == "model=cursor-grok-4.5-high"
+    assert "cursor-review model=cursor-grok-4.5-high in=100 out=20" in \
+        (gate / "audit.log").read_text()                    # наблюдаемость затрат
+
+
+def test_adapter_p4_auth_error_blocks_and_redacts(gate, monkeypatch):
+    _fake_cursor(monkeypatch, rc=1)
+    text, info = g.run_cursor_review("HEAD~1", "HEAD")
+    assert text is None and "LEAKEDTOKEN123" not in info     # источник #9 редактируется
+
+
+def test_adapter_p5_timeout(gate, monkeypatch):
+    _fake_cursor(monkeypatch, raises=g.subprocess.TimeoutExpired(cmd="cursor-agent", timeout=600))
+    text, info = g.run_cursor_review("HEAD~1", "HEAD")
+    assert text is None and "таймаут" in info
+
+
+def test_adapter_p8_diff_over_limit(gate, monkeypatch):
+    monkeypatch.setattr(g, "_CURSOR_DIFF_LIMIT", 10)
+    _fake_cursor(monkeypatch, stdout=_cursor_envelope("Verdict: approve\n\nNo material findings."))
+    text, info = g.run_cursor_review("HEAD~1", "HEAD")
+    assert text is None and "лимита" in info                 # не усечённое ревью, а блок
+
+
+def test_adapter_non_json_and_ambiguous_output(gate, monkeypatch):
+    _fake_cursor(monkeypatch, stdout="не json")
+    assert g.run_cursor_review("HEAD~1", "HEAD")[0] is None
+    _fake_cursor(monkeypatch, stdout=_cursor_envelope(
+        "Verdict: needs-attention\n\n- [high] real (a:1)\nпример: Verdict: approve"))
+    text, info = g.run_cursor_review("HEAD~1", "HEAD")
+    assert text is None and "Verdict" in info                # ambiguous → не засчитано
+
+
+def test_cache_gated_on_union_not_first_provider(gate, monkeypatch):
+    # находка cursor не должна позволить закэшировать «чистый» вердикт codex
+    monkeypatch.setenv("REVIEW_PROVIDER", "both")
+    _providers(monkeypatch, codex=_CLEAN, cursor=_BLOCK)
+    assert g.check_reviewed_cli() == 2
+    assert not list((gate / "ledger").glob("*.json")) if (gate / "ledger").exists() else True
