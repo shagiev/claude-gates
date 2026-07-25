@@ -130,6 +130,40 @@ def _verdict_from_json(text: str) -> "ReviewVerdict | None":
     )
 
 
+def outage_details(text: "str | None") -> str:
+    """Диагностический хвост для невалидного вывода ревью (проверка quota-деградации,
+    2026-07-25): реальная причина (напр. «You have hit your usage limit … resets at 15:00»)
+    лежит в codex.stderr/parseError/rawOutput envelope и раньше ВЫБРАСЫВАЛАСЬ — оператор
+    видел вводящий в заблуждение «дрейф схемы». Контракт парсера не трогаем — только
+    извлекаем текст причины для сообщения."""
+    if not text:
+        return ""
+    clean = strip_ansi(text).strip()
+    try:
+        obj = json.loads(clean)
+    except (json.JSONDecodeError, ValueError):
+        return clean[:300]                       # сырой текст (напр. лимит) — показать как есть
+    if not isinstance(obj, dict):
+        return clean[:300]
+    parts = []
+    codex = obj.get("codex")
+    if isinstance(codex, dict):
+        if codex.get("status") not in (0, None):
+            parts.append(f"codex exit={codex.get('status')}")
+        for k in ("stderr", "stdout"):
+            v = codex.get(k)
+            if isinstance(v, str) and v.strip():
+                parts.append(f"{k}: {v.strip()[:200]}")
+                break                            # достаточно первого непустого
+    pe = obj.get("parseError")
+    if isinstance(pe, str) and pe.strip():
+        parts.append(f"parseError: {pe.strip()[:150]}")
+    raw = obj.get("rawOutput")
+    if isinstance(raw, str) and raw.strip() and not any("stdout" in p or "stderr" in p for p in parts):
+        parts.append(f"raw: {raw.strip()[:200]}")
+    return "; ".join(parts)[:400]
+
+
 def parse_review_output(text: str) -> ReviewVerdict:
     clean = strip_ansi(text)
     js = _verdict_from_json(clean)            # JSON-first (contract adversarial-review --json)
@@ -1127,8 +1161,10 @@ def check_reviewed_cli() -> int:
               "заморожено). Rollback БЕЗ freeze актуатор НЕ останавливает. Ремонт — через гейт.",
               file=sys.stderr)
         return 2
-    if not verdict.valid:        # дрейф схемы — ledger не кормим мусором
-        print("[codex-gate] ✗ невалидный вывод ревью (дрейф схемы) — деплой остановлен",
+    if not verdict.valid:        # дрейф схемы/outage — ledger не кормим мусором
+        details = outage_details(out)
+        print("[codex-gate] ✗ невалидный вывод ревью — деплой остановлен."
+              + (f" Причина от companion: {details}" if details else " (дрейф схемы, деталей нет)"),
               file=sys.stderr)
         return 2
     # ─ Протокол сходимости (Фаза 1.6): память между раундами вместо стены high'ов ─

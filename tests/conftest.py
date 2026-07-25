@@ -38,6 +38,12 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # реальный CLAUDE_CODE_SESSION_ID не должен перебивать сессию, которую тест задаёт через
     # CLAUDE_SESSION_ID (иначе _env_session вернёт реальный id и маркер-тесты сломаются).
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    # ИНЦИДЕНТ 2026-07-25: FINDINGS_DIR/LEDGER_DIR были изолированы только в фикстуре
+    # ОДНОГО тест-файла — новый тест-файл без локального мока писал в БОЕВОЙ
+    # logs/review_findings (создал мусорную серию с critical-находкой из фикстуры, уронил
+    # 7 соседних тестов). Инвариант «тесты не трогают боевые ledger'ы» — в ОБЩЕМ chokepoint.
+    monkeypatch.setattr(g, "FINDINGS_DIR", tmp_path / "rf_conftest")
+    monkeypatch.setattr(g, "LEDGER_DIR", tmp_path / "ledger_conftest")
     # inframon-интерфейс: pin/вердикты — в tmp (не трогать боевые), range_skips детерминирован
     monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
