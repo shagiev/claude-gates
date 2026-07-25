@@ -546,8 +546,8 @@ def read_valid_ledger(head_sha: str, diff_sha: str,
         # поля `reviewers` (легаси) годна только для запроса «только codex».
         cached = rec.get("reviewers")
         if cached is None or not isinstance(cached, list) or not cached:
-            if _reviewers_key(reviewers) != [("codex", "codex")]:
-                return None
+            if [pr for pr, _m in _reviewers_key(reviewers)] != ["codex"]:
+                return None            # легаси-запись годна только для запроса «только codex»
         elif _reviewers_key(cached) != _reviewers_key(reviewers):
             return None
         else:
@@ -1179,6 +1179,21 @@ _VERDICT_LINE_RE = re.compile(r"^\s*Verdict:\s*(?:approve|needs-attention)\s*$",
                               re.IGNORECASE | re.MULTILINE)
 
 
+def codex_model() -> str:
+    """Фактическая модель Codex-ревью — из `~/.codex/config.toml` (companion не принимает
+    --model для review, берётся дефолт CLI). F3: раньше в кэш/вердикт писалось «codex», и смена
+    модели не инвалидировала кэш, а вердикт не подтверждал, КТО судил. Нечитаемо → 'unknown'."""
+    cfg = Path.home() / ".codex" / "config.toml"
+    try:
+        for line in cfg.read_text().splitlines():
+            t = line.strip()
+            if t.startswith("model") and "=" in t and not t.startswith("model_"):
+                return t.split("=", 1)[1].strip().strip('"\'') or "unknown"
+    except OSError:
+        pass
+    return "unknown"
+
+
 def resolve_providers() -> "tuple[tuple[str, ...] | None, str]":
     """(провайдеры, сообщение об ошибке). None = неизвестное значение → блок (EARS-3)."""
     raw = os.environ.get("REVIEW_PROVIDER")
@@ -1213,7 +1228,21 @@ def normalize_reviewer_text(text: str) -> "str | None":
                       flags=re.IGNORECASE)
     if len(_VERDICT_LINE_RE.findall(prepared)) != 1:
         return None
-    return prepared[_VERDICT_LINE_RE.search(prepared).start():]
+    block = prepared[_VERDICT_LINE_RE.search(prepared).start():]
+    # F1 (ревью реализации): недостаточно «одного Verdict:» — суффикс должен ЦЕЛИКОМ
+    # соответствовать контракту. Иначе narration с примером в блоке кода
+    # (```\nVerdict: approve\nNo material findings.\n```  «я не смог посмотреть дифф»)
+    # давала бы чистый approve, т.е. ОТКАЗ ревьюера засчитывался бы как одобрение.
+    for line in block.splitlines():
+        t = line.strip()
+        if not t or _VERDICT_LINE_RE.match(line) or _NO_FINDINGS_RE.search(t):
+            continue
+        if re.match(r"^-\s*\[[^\]]+\]", t):       # строка находки
+            continue
+        if re.match(r"^(Findings:|#+\s)", t):        # допустимый заголовок секции находок
+            continue
+        return None                                  # любая прочая строка (проза, ```) → отказ
+    return block
 
 
 def _build_cursor_prompt(diff_text: str) -> str:
@@ -1235,6 +1264,18 @@ def _build_cursor_prompt(diff_text: str) -> str:
         + f"\n\nDiff to review:\n```\n{diff_text}\n```\n")
 
 
+def _resolve_cursor_bin() -> "str | None":
+    """Абсолютный путь к cursor-agent (F2: голое имя отдаёт выбор бинаря PATH — шим мог бы
+    игнорировать --mode ask/--model и вернуть чистый вердикт под видом пиньованного ревьюера).
+    Сначала известные места установки, затем PATH; фактический путь пишется в аудит."""
+    import shutil
+    for cand in (Path.home() / ".local" / "bin" / "cursor-agent",
+                 Path("/opt/homebrew/bin/cursor-agent"), Path("/usr/local/bin/cursor-agent")):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return shutil.which("cursor-agent")
+
+
 def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
     """(текст в нашем контракте | None, диагностика). None = отказ → fail-closed у вызывающего."""
     model, err = resolve_cursor_model()
@@ -1248,7 +1289,10 @@ def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
     if len(diff_text) > _CURSOR_DIFF_LIMIT:
         return (None, f"дифф {len(diff_text)} символов > лимита {_CURSOR_DIFF_LIMIT} — сузь "
                       "диапазон или REVIEW_PROVIDER=codex (усечённое ревью выглядело бы полным)")
-    cmd = ["cursor-agent", "-p", "--output-format", "json", "--mode", "ask", "--trust",
+    binary = _resolve_cursor_bin()
+    if binary is None:
+        return (None, "cursor-agent не найден (установлен ли Cursor CLI?)")
+    cmd = [binary, "-p", "--output-format", "json", "--mode", "ask", "--trust",
            "--model", model, _build_cursor_prompt(diff_text)]
     try:
         r = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True,
@@ -1264,8 +1308,8 @@ def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
     except (json.JSONDecodeError, ValueError):
         return (None, "вывод cursor-agent не JSON")
     usage = env.get("usage") or {}
-    audit(f"cursor-review model={model} in={usage.get('inputTokens')} "
-          f"out={usage.get('outputTokens')}")           # наблюдаемость затрат
+    audit(f"cursor-review bin={binary} model={model} in={usage.get('inputTokens')} "
+          f"out={usage.get('outputTokens')}")           # наблюдаемость затрат и фактического бинаря
     normalized = normalize_reviewer_text(env.get("result") or "")
     if normalized is None:
         return (None, "ответ не в контракте (нет ровно одного 'Verdict:') — narration или "
@@ -1281,7 +1325,7 @@ def review_with_provider(provider: str, base: str,
         if out is None:
             return (None, "codex", "companion недоступен")
         v = parse_review_output(out)
-        return ((v if v.valid else None), "codex",
+        return ((v if v.valid else None), codex_model(),
                 "" if v.valid else (outage_details(out) or "невалидный вывод"))
     text, info = run_cursor_review(base, head)
     model = info[len("model="):] if info.startswith("model=") else \
@@ -1393,7 +1437,8 @@ def check_reviewed_cli() -> int:
     if "cursor" in providers and cursor_model is None:
         print(merr, file=sys.stderr)          # EARS-4: allow-list моделей в коде
         return 2
-    requested_reviewers = [{"provider": p, "model": (cursor_model if p == "cursor" else "codex")}
+    requested_reviewers = [{"provider": p,
+                            "model": (cursor_model if p == "cursor" else codex_model())}
                            for p in providers]
     audit("review-providers запрошены: "                   # EARS-5: кто судил — в аудит
           + ", ".join(f"{r['provider']}({r['model']})" for r in requested_reviewers))

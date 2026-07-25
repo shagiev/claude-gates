@@ -89,8 +89,8 @@ def test_n2_ambiguous_two_verdicts_rejected():
 def test_n3_n4_no_verdict_or_invalid():
     assert g.normalize_reviewer_text("просто текст без вердикта") is None
     assert g.normalize_reviewer_text("") is None
-    out = g.normalize_reviewer_text("Verdict: approve\n\nSummary: ok")   # без маркера находок
-    assert out is not None and not g.parse_review_output(out).valid      # дрейф → invalid
+    # строгая структурная валидация (F1 ревью): прочая проза в блоке → отказ УЖЕ на нормализации
+    assert g.normalize_reviewer_text("Verdict: approve\n\nSummary: ok") is None
 
 
 # ═══ P2/P3: cursor как единственный провайдер ═══
@@ -218,7 +218,9 @@ def _fake_cursor(monkeypatch, *, rc=0, stdout=None, raises=None):
     """Подменяет subprocess.run ТОЛЬКО для cursor-agent — тело run_cursor_review исполняется."""
     real = g.subprocess.run
     def fake(cmd, **kw):
-        if isinstance(cmd, list) and cmd and cmd[0] == "cursor-agent":
+        # сопоставляем по БАЗОВОМУ имени: адаптер вызывает абсолютный путь (F2), и проверка
+        # по голому имени пропускала бы вызов к НАСТОЯЩЕМУ cursor-agent (тест повисал на 600с)
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("cursor-agent"):
             if raises is not None:
                 raise raises
             class R:
@@ -241,8 +243,9 @@ def test_adapter_happy_path_and_usage_audited(gate, monkeypatch):
     text, info = g.run_cursor_review("HEAD~1", "HEAD")
     assert text is not None and g.parse_review_output(text).valid
     assert info == "model=cursor-grok-4.5-high"
-    assert "cursor-review model=cursor-grok-4.5-high in=100 out=20" in \
-        (gate / "audit.log").read_text()                    # наблюдаемость затрат
+    audit = (gate / "audit.log").read_text()
+    assert "cursor-review bin=" in audit and "cursor-agent" in audit     # фактический бинарь (F2)
+    assert "model=cursor-grok-4.5-high in=100 out=20" in audit           # наблюдаемость затрат
 
 
 def test_adapter_p4_auth_error_blocks_and_redacts(gate, monkeypatch):
@@ -279,3 +282,26 @@ def test_cache_gated_on_union_not_first_provider(gate, monkeypatch):
     _providers(monkeypatch, codex=_CLEAN, cursor=_BLOCK)
     assert g.check_reviewed_cli() == 2
     assert not list((gate / "ledger").glob("*.json")) if (gate / "ledger").exists() else True
+
+
+def test_f1_quoted_example_not_accepted_as_clean_review():
+    # F1 (финальное ревью): narration с примером в блоке кода + отказ ревьюера давала approve
+    refusal = ("I could not fetch the diff. Example of the expected format:\n"
+               "```\nVerdict: approve\nNo material findings.\n```\n"
+               "Sorry, I was unable to inspect the changes.")
+    assert g.normalize_reviewer_text(refusal) is None        # отказ НЕ засчитывается одобрением
+
+
+def test_f1_real_contract_still_accepted():
+    ok = ("Checking the repo now.Verdict: needs-attention\n\nFindings:\n"
+          "- [high] реальная проблема (app/x.py:1)\n- [low] мелочь (b.py:2)\n")
+    out = g.normalize_reviewer_text(ok)
+    assert out is not None and g.parse_review_output(out).blocking
+
+
+def test_f3_codex_model_from_config_in_verdict(gate, monkeypatch):
+    monkeypatch.setenv("REVIEW_PROVIDER", "codex")
+    _providers(monkeypatch, codex=_CLEAN)
+    assert g.check_reviewed_cli() == 0
+    prov = _verdict()["providers"][0]
+    assert prov["provider"] == "codex" and prov["model"] not in ("", "codex")   # реальная модель
