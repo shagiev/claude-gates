@@ -144,11 +144,12 @@ def _verdict_from_json(text: str) -> "ReviewVerdict | None":
 _REDACT_RULES = (
     # помеченные пары ключ=значение. Разделитель ОБЯЗАТЕЛЬНО `:`/`=` (не пробел): иначе
     # правило съедало обычные слова — «auth failed» превращалось в «auth «скрыто»» и
-    # диагностика терялась (поймано собственным тестом 25.07). Значение может начинаться
-    # с `Bearer `, чтобы «Authorization: Bearer <tok>» скрывался целиком.
+    # диагностика терялась (поймано собственным тестом 25.07). Кавычки вокруг ключа И
+    # значения допускаются (ревью R3-F1: `api_key="secret"` и JSON-стиль
+    # `"access_token": "abc/def+ghi"` обходили правило). Значение может начинаться с `Bearer `.
     re.compile(r"(?i)\b(api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
                r"passwd|pwd|authorization|private[-_]?key)"
-               r"(\s*[:=]\s*)((?:bearer\s+)?[^\s,;'\"]{6,})"),
+               r"[\"']?(\s*[:=]\s*)[\"']?(?:bearer\s+)?[^\s,;\"']{4,}[\"']?"),
     re.compile(r"(?i)\bbearer\s+([A-Za-z0-9_\-\.=]{16,})"),   # Bearer <token> без метки
     # известные префиксы провайдеров
     re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{8,}|gho_[A-Za-z0-9]{8,}|"
@@ -166,17 +167,31 @@ _REDACT_RULES = (
 _REDACTED = "«скрыто»"
 
 
+# ПОЛНЫЙ реестр источников недоверенного текста, попадающего оператору/в файлы (ревью 25.07,
+# три раунда — перечислен целиком вместо латания по одному):
+#   1. невалидный вывод companion → outage_details();
+#   2. stderr companion при non-zero exit → run_companion_review();
+#   3. заголовки находок валидного вердикта → chokepoint разбора (_verdict_from_json + текст);
+#   4. причина адъюдикации (ввод оператора/автоматики) → adjudicate(): ledger + audit +
+#      команда `findings` + промпт следующего раунда;
+#   5. *_SKIP_REASON (LADDER/EMPIRICAL) и detail тривиального маркера → audit;
+#   6. эхо `empirical.test_command` в сообщении прогона;
+#   7. хвост stdout/stderr тест-команды → _run_empirical().
+# Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей.
 def redact_secrets(text: str) -> str:
     """Замена секрето-образных подстрок на «скрыто». Сохраняет читаемую причину отказа
     (напр. «You have hit your usage limit… try again at 8:06 PM» не задевается)."""
     out = text
     for rx in _REDACT_RULES:
-        if rx.groups >= 3:                       # помеченная пара: сохраняем имя ключа
-            out = rx.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", out)
-        elif rx.groups == 2:                     # URL-параметр / DSN: сохраняем префикс
-            out = rx.sub(lambda m: f"{m.group(1)}{_REDACTED}"
-                         if m.group(0).startswith(("?", "&", "?", "&")) or "=" in m.group(1)
-                         else f"://{m.group(1)}:{_REDACTED}@", out)
+        if rx.groups == 2:
+            # (ключ, разделитель) для помеченных пар и URL-параметров → сохраняем префикс;
+            # (user, pass) для DSN → сохраняем пользователя
+            def _sub(m):
+                a, b = m.group(1), m.group(2)
+                if b.strip().startswith(("=", ":")) or b.endswith("="):
+                    return f"{a}{b}{_REDACTED}"          # ключ=… / ?sig=…
+                return f"://{a}:{_REDACTED}@"            # DSN scheme://user:pass@
+            out = rx.sub(_sub, out)
         else:
             out = rx.sub(_REDACTED, out)
     return out
@@ -412,7 +427,8 @@ def run_companion_review(base: str | None, scope: str) -> str | None:
         print(f"[codex-gate] review не удался: {type(e).__name__}: {e}", file=sys.stderr)
         return None
     if r.returncode != 0:
-        print(f"[codex-gate] review exit={r.returncode}: {r.stderr.strip()[:400]}", file=sys.stderr)
+        print(f"[codex-gate] review exit={r.returncode}: "
+              f"{redact_secrets(r.stderr.strip())[:400]}", file=sys.stderr)   # источник #2
         return None
     return r.stdout
 
@@ -688,11 +704,13 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
             "critical-находка не адъюдицируется в residual (ML-C1): только "
             "fixed/refuted, спорная → эскалация человеку")
     f["status"] = status
-    f["reason"] = reason.strip()
+    # источник #4: причина от оператора/автоматики может нести секрет-улику; редактируем ДО
+    # сохранения — тогда ledger, audit, вывод `findings` и промпт следующего раунда чисты
+    f["reason"] = redact_secrets(reason.strip())
     import time as _time
     led["last_adj_ts"] = _time.time()
     led["needs_review_round"] = True   # Codex должен УВИДЕТЬ адъюдикацию (спор F3-2: кэш
-    audit(f"adjudicate {fid} → {status}: {reason.strip()!r}")   # позволял allow без его раунда)
+    audit(f"adjudicate {fid} → {status}: {f['reason']!r}")   # позволял allow без его раунда)
 
 
 def apply_carry_over(led: dict) -> "list[str]":
@@ -1074,7 +1092,8 @@ def _empirical_gate(baseline: str, head: str) -> int:
               f"→ « {cmd[:40]} ») — смена = потенциальное ослабление, требует EMPIRICAL_SKIP=1 "
               "(аудит, как снятие гейта). Деплой остановлен.", file=sys.stderr)
         return 2
-    print(f"[codex-gate] empirical: прогон «{cmd[:80]}» (timeout {timeout}s)…", file=sys.stderr)
+    print(f"[codex-gate] empirical: прогон «{redact_secrets(cmd)[:80]}» "
+          f"(timeout {timeout}s)…", file=sys.stderr)   # источник #6
     result, tail = _run_empirical(cmd, timeout, REPO_ROOT)
     if result != "pass":
         print(f"[codex-gate] ✗ empirical: тест-команда → {result} — деплой остановлен "
@@ -1125,7 +1144,7 @@ def check_reviewed_cli() -> int:
     # --- LADDER часть (спека §4: /simplify → /code-review покрытие ВСЕГО baseline..HEAD) ---
     if ladder_skip:
         reason = os.environ.get("LADDER_SKIP_REASON", "")
-        audit(f"LADDER_SKIP=1 — ladder-range пропущен (reason={reason!r})")
+        audit(f"LADDER_SKIP=1 — ladder-range пропущен (reason={redact_secrets(reason)!r})")
         print("[codex-gate] ⚠️ LADDER_SKIP=1 — ladder-range пропущен (см. audit).",
               file=sys.stderr)
     elif _ladder_check(baseline) != 0:
@@ -1136,7 +1155,8 @@ def check_reviewed_cli() -> int:
     # --- EMPIRICAL часть (тикет #1: механическая проверка ДО Codex; ladder → empirical → Codex) ---
     if empirical_skip:
         reason = os.environ.get("EMPIRICAL_SKIP_REASON", "")
-        audit(f"EMPIRICAL_SKIP=1 — эмпирический гейт пропущен (reason={reason!r})")
+        audit(f"EMPIRICAL_SKIP=1 — эмпирический гейт пропущен "
+              f"(reason={redact_secrets(reason)!r})")
         print("[codex-gate] ⚠️ EMPIRICAL_SKIP=1 — эмпирический гейт пропущен (см. audit).",
               file=sys.stderr)
     elif _empirical_gate(baseline, head_before) != 0:   # тесты падают/нечитаемо/снят → блок ДО Codex
@@ -1375,7 +1395,7 @@ def write_marker(kind: str, detail: str, design_hash: str | None = None) -> None
         "session": session, "ts": datetime.now(timezone.utc).isoformat(),
     })
     if kind == "trivial":                        # R1-6b: тривиальный маркер — осознанно, в аудит
-        audit(f"trivial-marker session={session} reason={detail!r}")
+        audit(f"trivial-marker session={session} reason={redact_secrets(detail)!r}")
 
 
 def add_design_file_binding(detail: str, design_file: str, reviewed_hash: str) -> int:

@@ -209,3 +209,54 @@ def test_redacted_title_propagates_to_ledger_and_message(tmp_path, monkeypatch):
     assert "SUPERSECRETVALUE" not in stored
     decision, msg = g.convergence_decision(L)
     assert decision == "block" and "SUPERSECRETVALUE" not in msg
+
+
+# ═══ Ревью R3: все источники недоверенного текста (реестр #1-#7 в коде) ═══
+
+def test_r3_quoted_and_json_style_values_redacted():
+    for text, secret in [('Hardcoded api_key="supersecret123" in cfg', "supersecret123"),
+                         ('{"access_token": "abc/def+ghi123456"}', "abc/def+ghi123456"),
+                         ("password: 'hunter2hunter2'", "hunter2hunter2"),
+                         ('secret = "shortish12"', "shortish12")]:
+        assert secret not in g.redact_secrets(text), text
+
+
+def test_r3_companion_stderr_redacted(gate_env, monkeypatch, capsys):
+    # источник #2: non-zero exit печатал stderr дословно
+    monkeypatch.setenv("CODEX_COMPANION_CMD",
+                       "bash -c 'echo \"fatal: api_key=LEAKEDSECRET123\" >&2; exit 1'")
+    assert g.check_reviewed_cli() == 2
+    err = capsys.readouterr().err
+    assert "LEAKEDSECRET123" not in err and "fatal" in err     # секрета нет, смысл есть
+
+
+def test_r3_adjudication_reason_redacted(tmp_path, monkeypatch):
+    # источник #4: причина уходила в ledger, audit, `findings` и промпт следующего раунда
+    monkeypatch.setattr(g, "FINDINGS_DIR", tmp_path / "rf")
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("high", "issue")])
+    g.adjudicate(L, "F1", "refuted", "проверено: token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig1")
+    assert "eyJhbGciOiJIUzI1NiJ9" not in L["findings"]["F1"]["reason"]
+    assert "eyJhbGciOiJIUzI1NiJ9" not in (tmp_path / "a.log").read_text()
+    g.save_findings_ledger(L)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in (g.FINDINGS_DIR / "current.json").read_text()
+    assert "eyJhbGciOiJIUzI1NiJ9" not in g._adjudication_prompt_block()   # не циркулирует
+
+
+def test_r3_skip_reasons_and_trivial_detail_redacted(tmp_path, monkeypatch):
+    # источник #5
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a2.log")
+    monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".dm")
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    g.write_marker("trivial", "быстрый фикс, password=hunter2hunter2")
+    assert "hunter2hunter2" not in (tmp_path / "a2.log").read_text()
+
+
+def test_r3_test_command_echo_redacted(gate_env, monkeypatch, capsys):
+    # источник #6: эхо test_command в сообщении прогона
+    monkeypatch.setattr(g, "_empirical_config",
+                        lambda root, ref: ("enabled", "pytest --token=SUPERSECRETTOKEN1", 600))
+    monkeypatch.setattr(g, "_run_empirical", lambda cmd, t, root: ("fail", ""))
+    g._empirical_gate("HEAD~1", g.git_head())
+    assert "SUPERSECRETTOKEN1" not in capsys.readouterr().err
