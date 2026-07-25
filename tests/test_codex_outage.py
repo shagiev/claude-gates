@@ -106,3 +106,19 @@ def test_valid_review_message_unaffected(gate_env, monkeypatch, capsys):
     monkeypatch.setenv("CODEX_COMPANION_CMD", f"bash {fix}")
     assert g.check_reviewed_cli() == 2                        # блок по находке
     assert "невалидный вывод" not in capsys.readouterr().err
+
+
+def test_live_quota_fixture_2026_07_25(gate_env, monkeypatch, capsys):
+    # ЖИВОЙ артефакт: во время самой проверки quota-деградации у Codex реально кончилась
+    # квота (2026-07-25). Реальная форма = B+C сразу: codex.status=1 И parseError с текстом
+    # лимита. Фикстура усечена из живого envelope (tests/fixtures/codex_quota_live.json).
+    import pathlib
+    live = (pathlib.Path(__file__).parent / "fixtures" / "codex_quota_live.json").read_text()
+    v = g.parse_review_output(live)
+    assert v.valid is False                                   # fail-closed
+    details = g.outage_details(live)
+    assert "usage limit" in details.lower() and "exit=1" in details
+    _stub_output(monkeypatch, live)
+    assert g.check_reviewed_cli() == 2
+    assert "usage limit" in capsys.readouterr().err.lower()   # оператор видит причину
+    assert _rounds() == 0                                     # раунды не сгорели
