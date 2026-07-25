@@ -314,3 +314,22 @@ def test_r4_test_command_change_message_redacted(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "NEWSECRETTOKEN1" not in err and "OLDSECRETTOKEN1" not in err
     assert "изменилась" in err                        # смысл блока сохранён
+
+
+def test_r5_dsn_without_username_redacted():
+    # R5-F1: правило требовало ≥1 символ имени пользователя
+    out = g.redact_secrets("redis://:supersecret@cache.internal/0")
+    assert "supersecret" not in out and out == "redis://:«скрыто»@cache.internal/0"
+
+
+def test_r5_exception_text_with_argv_redacted(gate_env, monkeypatch, capsys):
+    # R5-F2: TimeoutExpired.__str__ включает весь argv — секрет в аргументе утекал
+    monkeypatch.setenv("CODEX_COMPANION_CMD", "sleep 5 --api-key=SUPERSECRETVALUE1")
+    monkeypatch.setattr(g, "_REVIEW_TIMEOUT_S", 1)
+    assert g.run_companion_review(base="HEAD~1", scope="branch") is None
+    assert "SUPERSECRETVALUE1" not in capsys.readouterr().err
+
+
+def test_r5_empirical_exception_text_redacted(tmp_path):
+    result, tail = g._run_empirical("no-such-cmd-xyz --token=SUPERSECRETVALUE2", 5, tmp_path)
+    assert result == "error" and "SUPERSECRETVALUE2" not in tail

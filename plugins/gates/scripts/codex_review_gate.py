@@ -159,7 +159,8 @@ _REDACT_RULES = (
     (re.compile(r"(?i)([?&](?:sig|signature|x-amz-signature|x-amz-credential|access_token|"
                 r"token|key)=)[^&\s]+"), r"\1" + _REDACTED),
     # DSN с паролем: scheme://user:pass@host — сохраняем пользователя
-    (re.compile(r"://([^\s:/@]+):[^\s@]{3,}@"), r"://\1:" + _REDACTED + "@"),
+    # имя пользователя МОЖЕТ отсутствовать: `redis://:secret@host` (R5-F1)
+    (re.compile(r"://([^\s:/@]*):[^\s@]{3,}@"), r"://\1:" + _REDACTED + "@"),
     # длинный неразрывный токен (без точек/слэшей — URL и фразы не задеваются)
     (re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"), _REDACTED),
 )
@@ -174,7 +175,8 @@ _REDACT_RULES = (
 #      команда `findings` + промпт следующего раунда;
 #   5. *_SKIP_REASON (LADDER/EMPIRICAL) и detail тривиального маркера → audit;
 #   6. эхо `empirical.test_command` в сообщении прогона;
-#   7. хвост stdout/stderr тест-команды → _run_empirical().
+#   7. хвост stdout/stderr тест-команды → _run_empirical();
+#   8. ТЕКСТ ИСКЛЮЧЕНИЯ (TimeoutExpired/OSError/ValueError) — включает весь argv команды.
 # Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей.
 def redact_secrets(text: str) -> str:
     """Замена секрето-образных подстрок на «скрыто». Сохраняет читаемую причину отказа
@@ -416,7 +418,10 @@ def run_companion_review(base: str | None, scope: str) -> str | None:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=_REVIEW_TIMEOUT_S)
     except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"[codex-gate] review не удался: {type(e).__name__}: {e}", file=sys.stderr)
+        # источник #8 (R5-F2): TimeoutExpired.__str__ включает ВЕСЬ argv — если в команде есть
+        # `--api-key=…`, он попал бы оператору целиком; редактируем текст исключения
+        print(f"[codex-gate] review не удался: {type(e).__name__}: "
+              f"{redact_secrets(str(e))}", file=sys.stderr)
         return None
     if r.returncode != 0:
         print(f"[codex-gate] review exit={r.returncode}: "
@@ -856,7 +861,7 @@ def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
     try:
         argv = shlex.split(cmd)
     except ValueError as e:
-        return ("error", f"не разобрать test_command: {e}")   # незакрытая кавычка и т.п.
+        return ("error", redact_secrets(f"не разобрать test_command: {e}"))
     if not argv:
         return ("error", "пустая test_command")
     try:
@@ -864,7 +869,8 @@ def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
     except subprocess.TimeoutExpired:
         return ("timeout", "")
     except OSError as e:
-        return ("error", f"{type(e).__name__}: {e}")   # команда не найдена и т.п.
+        # источник #8: текст исключения может содержать argv с секретом (R5-F2)
+        return ("error", redact_secrets(f"{type(e).__name__}: {e}"))
     # редакция того же класса: вывод тестов может содержать дамп env/DSN (ревью 25.07)
     tail = redact_secrets(r.stdout + r.stderr)[-800:]
     return ("pass" if r.returncode == 0 else "fail", tail)
