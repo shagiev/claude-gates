@@ -312,3 +312,11 @@ def test_r2_prose_appended_to_clean_marker_rejected():
     assert g.normalize_reviewer_text(
         "Verdict: approve\n\nNo material findings. I could not inspect the diff.") is None
     assert g.normalize_reviewer_text("Verdict: approve\n\nNo material findings.") is not None
+
+
+def test_r3_markdown_heading_escape_removed():
+    # ревью R3: `#+\s` принимал ЛЮБОЙ текст под видом заголовка
+    assert g.normalize_reviewer_text(
+        "Verdict: approve\n\nNo material findings.\n# I could not inspect the diff.") is None
+    assert g.normalize_reviewer_text(
+        "Verdict: needs-attention\n\nFindings:\n- [high] x (a:1)\n") is not None   # контракт цел

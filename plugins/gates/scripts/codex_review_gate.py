@@ -1242,7 +1242,10 @@ def normalize_reviewer_text(text: str) -> "str | None":
             continue
         if re.match(r"^-\s*\[[^\]]+\]", t):       # строка находки
             continue
-        if re.match(r"^(Findings:|#+\s)", t):        # допустимый заголовок секции находок
+        # ТОЛЬКО литеральный «Findings:». Поблажка для markdown-заголовков (`#+\s`) была дырой
+        # (ревью R3): под видом заголовка проходил любой текст, включая отказ ревьюера
+        # «# I could not inspect the diff» — и вердикт оставался валидным чистым approve.
+        if re.fullmatch(r"findings:", t, re.IGNORECASE):
             continue
         return None                                  # любая прочая строка (проза, ```) → отказ
     return block
