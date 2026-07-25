@@ -1183,7 +1183,9 @@ def codex_model() -> str:
     """Фактическая модель Codex-ревью — из `~/.codex/config.toml` (companion не принимает
     --model для review, берётся дефолт CLI). F3: раньше в кэш/вердикт писалось «codex», и смена
     модели не инвалидировала кэш, а вердикт не подтверждал, КТО судил. Нечитаемо → 'unknown'."""
-    cfg = Path.home() / ".codex" / "config.toml"
+    # companion уважает CODEX_HOME — читать надо ЭФФЕКТИВНЫЙ конфиг, иначе ревью шло бы под
+    # одной моделью, а кэш/вердикт записывали другую (ревью R5)
+    cfg = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "config.toml"
     try:
         for line in cfg.read_text().splitlines():
             t = line.strip()

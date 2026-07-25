@@ -338,3 +338,13 @@ def test_r4_legitimate_narration_still_accepted():
                "No material findings.",
                "Reviewed all files.Verdict: needs-attention\n\n- [high] x (a:1)\n"):
         assert g.normalize_reviewer_text(ok) is not None, ok
+
+
+def test_r5_codex_model_honors_codex_home(tmp_path, monkeypatch):
+    # ревью R5: модель читалась из ~/.codex/config.toml, а companion уважает CODEX_HOME —
+    # ревью шло бы под одной моделью, а кэш/вердикт фиксировали другую
+    (tmp_path / "config.toml").write_text('model = "gpt-5.4-high"\nmodel_reasoning_effort = "high"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert g.codex_model() == "gpt-5.4-high"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "нет-такого"))
+    assert g.codex_model() == "unknown"                  # нечитаемо → явный маркер
