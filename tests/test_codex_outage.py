@@ -333,3 +333,21 @@ def test_r5_exception_text_with_argv_redacted(gate_env, monkeypatch, capsys):
 def test_r5_empirical_exception_text_redacted(tmp_path):
     result, tail = g._run_empirical("no-such-cmd-xyz --token=SUPERSECRETVALUE2", 5, tmp_path)
     assert result == "error" and "SUPERSECRETVALUE2" not in tail
+
+
+def test_r6_env_style_identifiers_redacted():
+    # R6-F1: ключ как ЧАСТЬ идентификатора (`AWS_SECRET_ACCESS_KEY=…`) обходил правило,
+    # т.к. `_` — word-символ и `\b` не срабатывал, а значение с `/` не ловилось длинным токеном
+    for text, secret in [
+        ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI"),
+        ("GITHUB_TOKEN=ghp_abcdefghij1234", "ghp_abcdefghij1234"),
+        ('MY_API_KEY: "abc123def"', "abc123def"),
+        ("DB_PASSWORD=hunter2hunter2", "hunter2hunter2"),
+    ]:
+        assert secret not in g.redact_secrets(text), text
+
+
+def test_r6_diagnostics_still_intact():
+    for keep in ("auth failed: retry in 30s", "set timeout = 30",
+                 "usage limit resets at 8:06 PM", "exit=1: connection reset by peer"):
+        assert g.redact_secrets(keep) == keep, keep

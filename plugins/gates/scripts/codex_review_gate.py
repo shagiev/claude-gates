@@ -146,8 +146,12 @@ _REDACTED = "«скрыто»"
 # групп путал три правила с разной семантикой и уродовал signed URL в DSN-форму).
 _REDACT_RULES = (
     # помеченные пары ключ=значение; кавычки вокруг ключа и значения допускаются
-    (re.compile(r"(?i)\b(api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
-                r"passwd|pwd|authorization|private[-_]?key)"
+    # Ключ может быть ЧАСТЬЮ большего идентификатора: `AWS_SECRET_ACCESS_KEY=…` (R5/R6-F1 —
+    # `\b` не срабатывал, т.к. `_` считается word-символом, и значение с `/` не ловилось
+    # правилом длинного токена). Поэтому ключ = целый идентификатор, содержащий ключевое слово.
+    (re.compile(r"(?i)((?<![A-Za-z0-9])[A-Za-z0-9_]*"
+                r"(?:api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
+                r"passwd|pwd|authorization|private[-_]?key)[A-Za-z0-9_]*)"
                 r"[\"']?(\s*[:=]\s*)[\"']?(?:bearer\s+)?[^\s,;\"']{4,}[\"']?"),
      r"\1\2" + _REDACTED),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=]{16,}"), _REDACTED),
