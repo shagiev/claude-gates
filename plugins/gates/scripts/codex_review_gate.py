@@ -130,6 +130,52 @@ def _verdict_from_json(text: str) -> "ReviewVerdict | None":
     )
 
 
+# ═══ Редактирование секретов в operator-facing выводе (ревью 25.07, security-класс
+# конституции: «секрет в логе/сообщении об ошибке/аудите» = blocking) ═══
+# Вывод зависимостей (companion-stderr/stdout, хвост тест-команды) — НЕдоверенный текст: там
+# могут оказаться Authorization-заголовки, API-ключи, signed URL, DSN с паролем, секреты,
+# повторённые из ревьюируемого кода. Усечение НЕ защищает — нужна редакция по образцам.
+_REDACT_RULES = (
+    # помеченные пары ключ=значение. Разделитель ОБЯЗАТЕЛЬНО `:`/`=` (не пробел): иначе
+    # правило съедало обычные слова — «auth failed» превращалось в «auth «скрыто»» и
+    # диагностика терялась (поймано собственным тестом 25.07). Значение может начинаться
+    # с `Bearer `, чтобы «Authorization: Bearer <tok>» скрывался целиком.
+    re.compile(r"(?i)\b(api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|"
+               r"passwd|pwd|authorization|private[-_]?key)"
+               r"(\s*[:=]\s*)((?:bearer\s+)?[^\s,;'\"]{6,})"),
+    re.compile(r"(?i)\bbearer\s+([A-Za-z0-9_\-\.=]{16,})"),   # Bearer <token> без метки
+    # известные префиксы провайдеров
+    re.compile(r"\b(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{8,}|gho_[A-Za-z0-9]{8,}|"
+               r"github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9\-]{8,}|"
+               r"AKIA[0-9A-Z]{8,}|ASIA[0-9A-Z]{8,})"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}"),  # JWT
+    # подписи/токены в URL
+    re.compile(r"(?i)([?&](?:sig|signature|x-amz-signature|x-amz-credential|access_token|"
+               r"token|key)=)([^&\s]+)"),
+    # DSN с паролем: scheme://user:pass@host
+    re.compile(r"://([^\s:/@]+):([^\s@]{3,})@"),
+    # длинный неразрывный токен (без точек/слэшей — URL и фразы не задеваются)
+    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
+)
+_REDACTED = "«скрыто»"
+
+
+def redact_secrets(text: str) -> str:
+    """Замена секрето-образных подстрок на «скрыто». Сохраняет читаемую причину отказа
+    (напр. «You have hit your usage limit… try again at 8:06 PM» не задевается)."""
+    out = text
+    for rx in _REDACT_RULES:
+        if rx.groups >= 3:                       # помеченная пара: сохраняем имя ключа
+            out = rx.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", out)
+        elif rx.groups == 2:                     # URL-параметр / DSN: сохраняем префикс
+            out = rx.sub(lambda m: f"{m.group(1)}{_REDACTED}"
+                         if m.group(0).startswith(("?", "&", "?", "&")) or "=" in m.group(1)
+                         else f"://{m.group(1)}:{_REDACTED}@", out)
+        else:
+            out = rx.sub(_REDACTED, out)
+    return out
+
+
 def outage_details(text: "str | None") -> str:
     """Диагностический хвост для невалидного вывода ревью (проверка quota-деградации,
     2026-07-25): реальная причина (напр. «You have hit your usage limit … resets at 15:00»)
@@ -138,7 +184,7 @@ def outage_details(text: "str | None") -> str:
     извлекаем текст причины для сообщения."""
     if not text:
         return ""
-    clean = strip_ansi(text).strip()
+    clean = redact_secrets(strip_ansi(text).strip())   # редакция ДО усечения (ревью 25.07)
     try:
         obj = json.loads(clean)
     except (json.JSONDecodeError, ValueError):
@@ -803,7 +849,8 @@ def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
         return ("timeout", "")
     except OSError as e:
         return ("error", f"{type(e).__name__}: {e}")   # команда не найдена и т.п.
-    tail = (r.stdout + r.stderr)[-800:]
+    # редакция того же класса: вывод тестов может содержать дамп env/DSN (ревью 25.07)
+    tail = redact_secrets(r.stdout + r.stderr)[-800:]
     return ("pass" if r.returncode == 0 else "fail", tail)
 
 

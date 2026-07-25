@@ -122,3 +122,55 @@ def test_live_quota_fixture_2026_07_25(gate_env, monkeypatch, capsys):
     assert g.check_reviewed_cli() == 2
     assert "usage limit" in capsys.readouterr().err.lower()   # оператор видит причину
     assert _rounds() == 0                                     # раунды не сгорели
+
+
+# ═══ Редакция секретов в operator-facing выводе (ревью 25.07: security-класс конституции) ═══
+
+def test_redact_secret_classes():
+    cases = {
+        "Authorization: Bearer sk-abc123def456ghi789jkl": "sk-abc123",
+        "api_key=AKIAIOSFODNN7EXAMPLE tail": "AKIAIOSFODNN7EXAMPLE",
+        "postgres://user:supersecret@db:5432/x": "supersecret",
+        "https://s3/x?X-Amz-Signature=deadbeefcafe1234&y=1": "deadbeefcafe1234",
+        "t eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdefghijk": "eyJhbGci",
+        "ghp_1234567890abcdefghij": "ghp_1234567890",
+        "password: hunter2hunter2": "hunter2hunter2",
+        "raw " + "A" * 45: "A" * 45,                       # длинный неразрывный токен
+    }
+    for text, secret in cases.items():
+        out = g.redact_secrets(text)
+        assert secret not in out, f"секрет утёк: {text[:40]}"
+        assert "скрыто" in out, text[:40]
+
+
+def test_redact_preserves_failure_reason():
+    # диагностическая ценность не должна страдать: причина квоты сохраняется дословно
+    live = ("You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+            "visit https://chatgpt.com/codex/settings/usage to purchase more credits or try "
+            "again at Jul 28th, 2026 8:06 PM.")
+    assert g.redact_secrets(live) == live
+    assert g.redact_secrets("stream error: rate limited, retry in 30s") \
+        == "stream error: rate limited, retry in 30s"
+
+
+def test_outage_details_redacts_all_sources():
+    envelope = json.dumps({"codex": {"status": 1, "stderr": "auth failed: api_key=SECRETVALUE123"},
+                           "parseError": "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig12345",
+                           "rawOutput": "Bearer ghp_abcdefghij1234567890"})
+    out = g.outage_details(envelope)
+    for secret in ("SECRETVALUE123", "eyJhbGciOiJIUzI1NiJ9", "ghp_abcdefghij"):
+        assert secret not in out, secret
+    assert "auth failed" in out                              # смысл причины сохранён
+
+
+def test_outage_details_redacts_raw_text():
+    assert "sk-live-abcdef123456" not in g.outage_details("fatal: key sk-live-abcdef123456 bad")
+
+
+def test_empirical_tail_redacted(tmp_path):
+    # тот же класс у ДРУГОГО продюсера: хвост тест-команды (инвариант у всех продюсеров)
+    result, tail = g._run_empirical(f"printenv", 10, tmp_path)   # реальный дамп окружения
+    assert "скрыто" in tail or all(
+        marker not in tail for marker in ("api_key=", "TOKEN=", "SECRET=")), tail[:200]
+    out2 = g.redact_secrets("DATABASE_URL=postgres://u:pass1234@h/db")
+    assert "pass1234" not in out2
