@@ -560,8 +560,13 @@ def test_sec2_missing_security_blocks_precommit(repo, capsys):
     (repo / "app" / "x.py").write_text("x = 2  # reviewed\n")
     lg.mark_pass(repo, "code-review")                          # security НЕ пройден
     _git(repo, "add", "app/x.py")
+    capsys.readouterr()                                        # выбросить begin-баннеры: иначе
+    # проверка ниже могла бы пройти по слову «security» из ЧУЖОГО вывода и перестать сторожить
+    # третье звено (ревью 2026-07-26)
     assert lg.check_precommit(repo) == 2                       # SEC2
-    assert "security" in capsys.readouterr().err               # инструкция включает третий шаг
+    err = capsys.readouterr().err
+    assert "security" in err                                   # инструкция включает третий шаг
+    assert lg._chain_instructions(repo) in err                 # именно блок-сообщение, не эхо
 
 
 def test_sec3_begin_security_validates_chain_start(repo):
@@ -662,3 +667,82 @@ def test_required_for_record_provenance():
     assert lg._required_for_record({}) == lg.LEGACY_REQUIRED_PASSES          # легаси
     for junk in ({"ladder_schema": True}, {"ladder_schema": "2"}, {"ladder_schema": 1}):
         assert lg._required_for_record(junk) == lg.LEGACY_REQUIRED_PASSES, junk  # fail-safe
+
+
+# ═══ Текст протокола: реестр проходов и баннер begin (ревью B2, 2026-07-26) ═══
+
+def test_pass_runner_covers_all_passes():
+    """Реестр обязан покрывать канонические проходы: расхождение раньше печатало заглушку
+    оператору, а теперь роняет импорт — тест ловит его до релиза, а не у пользователя."""
+    assert set(lg._PASS_RUNNER) == set(lg.DEPLOY_REQUIRED_PASSES)
+    for p in lg.DEPLOY_REQUIRED_PASSES:
+        assert lg._PASS_RUNNER[p].strip(), p
+
+
+def test_chain_instructions_mention_every_pass_and_runner(repo):
+    """Мутация, выкинувшая звено из блок-сообщения, раньше оставляла тесты зелёными."""
+    shim = repo / ".githooks" / "gates-run"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text("#!/usr/bin/env bash\n")
+    msg = lg._chain_instructions(repo)
+    for p in lg.DEPLOY_REQUIRED_PASSES:
+        assert f"begin {p}" in msg, p
+        assert f"mark {p}" in msg, p
+        assert lg._PASS_RUNNER[p] in msg, p
+    assert lg._RUNNER_RULE in msg
+    # команды печатаются в исполнимой форме (через шим), иначе copy-paste даёт command not found
+    assert "bash .githooks/gates-run ladder_gate.py begin" in msg
+
+
+def test_chain_instructions_do_not_invent_shim_path(repo):
+    """Тот же инвариант, что у баннера begin: сообщение блокировки копируют чаще всего,
+    поэтому неисполнимый путь в нём вреднее всего (ревью 2026-07-26)."""
+    assert not (repo / ".githooks" / "gates-run").exists()
+    msg = lg._chain_instructions(repo)
+    assert ".githooks/gates-run" not in msg
+    assert lg._RUN_UNKNOWN in msg
+
+
+def test_begin_prints_runner_banner_in_runnable_form(repo, capsys):
+    """Новый code path: баннер begin. Содержание, исполнимость команды и чистый stdout —
+    в одном тесте: фикстура repo поднимает git-репо, дробить её по одному ассерту дорого."""
+    shim = repo / ".githooks" / "gates-run"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text("#!/usr/bin/env bash\n")
+    lg.begin_pass(repo, "simplify")
+    captured = capsys.readouterr()
+    assert "begin simplify" in captured.err
+    assert lg._PASS_RUNNER["simplify"] in captured.err
+    assert "bash .githooks/gates-run ladder_gate.py mark simplify" in captured.err
+    assert captured.out == ""          # на пустом stdout держится машиночитаемость CLI
+
+
+def test_begin_banner_does_not_invent_shim_path(repo, capsys):
+    """Проект мог поставить хуки мимо .githooks/ (gates-init это поддерживает). Печатать туда
+    путь — выдать строку, дающую command not found, то есть ровно тот провал, ради которого
+    подсказка и существует."""
+    assert not (repo / ".githooks" / "gates-run").exists()
+    lg.begin_pass(repo, "simplify")
+    err = capsys.readouterr().err
+    assert ".githooks/gates-run" not in err
+    assert lg._RUN_UNKNOWN in err and "mark simplify" in err
+
+
+def test_repo_root_used_instead_of_cwd(repo, monkeypatch):
+    """Ревью 2026-07-26: все точки входа CLI брали Path.cwd(), поэтому begin/mark из
+    подкаталога писали бухгалтерию в <subdir>/.claude/, а git запускает pre-commit из корня
+    и там её не находил — коммит блокировался «цепочка не подтверждена», хотя проходы были
+    выполнены, и оператор шёл за LADDER_SKIP."""
+    sub = repo / "services" / "api"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    assert lg._repo_root() == repo.resolve()
+    assert lg.main(["begin", "simplify"]) == 0
+    assert (repo / ".claude" / ".ladder-pending-simplify").is_file()      # в КОРНЕ
+    assert not (sub / ".claude").exists()                                 # не в подкаталоге
+
+
+def test_repo_root_falls_back_to_cwd_outside_git(tmp_path, monkeypatch):
+    """Вне git-репо поведение прежнее — гейт не обязан падать там, где его просто нет."""
+    monkeypatch.chdir(tmp_path)
+    assert lg._repo_root() == Path.cwd()

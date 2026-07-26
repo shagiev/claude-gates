@@ -10,8 +10,11 @@ Codex-ревью, протокол сходимости довёл деплой 
      дизайна ПОСЛЕ ревью → следующая правка кода блокируется до ре-ревью.
    - **Структурная валидация BSAC**: стаб без секции сценариев/BSAC/EARS нельзя пометить
      как отревьюенный (escape — `--trivial`).
-2. **Enforced-лесенка** — перед каждым код-коммитом доказанные проходы `/simplify` →
-   `/code-review` (begin/mark-протокол с tree-chain, pre/post-commit git-хуки, ledger).
+2. **Enforced-лесенка** — перед каждым код-коммитом проходы `simplify` → `code-review` →
+   `security` (begin/mark-протокол с tree-chain, pre/post-commit git-хуки, ledger). Гейт
+   доказывает ПОРЯДОК и неизменность дерева между begin и mark, но не факт прохода; часть
+   ревью-команд (`/code-review`) помечена платформой `disable-model-invocation` и их набирает
+   оператор — `begin` печатает, кто запускает каждый проход.
 3. **Эмпирический гейт** — тест-команда проекта (`empirical.test_command`) как условие
    деплоя, ДО трат на Codex; «не запустилось/зависло» ≠ «прошло» (fail-closed); снятие/
    подмена команды после включения — только через аудируемый `EMPIRICAL_SKIP`.
@@ -53,8 +56,9 @@ Codex-ревью, протокол сходимости довёл деплой 
 
 ```
 /design-review (маркер --file c reviewed-hash) → правки кода
-→ bash .githooks/gates-run ladder_gate.py begin simplify → /simplify → … mark simplify
-→ … begin code-review → /code-review → … mark code-review
+→ bash .githooks/gates-run ladder_gate.py begin simplify → проход simplify → … mark simplify
+→ … begin code-review → /code-review (набирает ОПЕРАТОР) → … mark code-review
+→ … begin security → проход security → … mark security
 → git commit                        # pre-commit проверяет цепочку
 → make deploy                       # check-reviewed: ladder → empirical → Codex
 ```

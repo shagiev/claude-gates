@@ -191,8 +191,14 @@ _REDACT_RULES = (
 #   6. эхо `empirical.test_command` в сообщении прогона;
 #   7. хвост stdout/stderr тест-команды → _run_empirical();
 #   8. ТЕКСТ ИСКЛЮЧЕНИЯ (TimeoutExpired/OSError/ValueError) — включает весь argv команды;
-#   9. stdout/stderr `cursor-agent` (провайдер cursor) → run_cursor_review().
-# Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей.
+#   9. stdout/stderr `cursor-agent` (провайдер cursor) → run_cursor_review();
+#  10. тело дизайн-ревью → CLI `companion-review`. ОСОЗНАННОЕ ИСКЛЮЧЕНИЕ: печатается ДОСЛОВНО.
+#      Это не диагностика, а предмет чтения; редакция по шаблонам порезала бы находку,
+#      цитирующую sha256, `token=`-строку или любой длинный идентификатор, и ревью стало бы
+#      нечитаемым. Компенсация: сам вывод не попадает в маркер (detail маркера редактируется),
+#      а деградировавший конверт до печати отсекает companion_outage_reason().
+# Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей; сознательное
+# исключение — записывать сюда же с обоснованием, чтобы реестр оставался полным.
 def redact_secrets(text: str) -> str:
     """Замена секрето-образных подстрок на «скрыто». Сохраняет читаемую причину отказа
     (напр. «You have hit your usage limit… try again at 8:06 PM» не задевается)."""
@@ -417,26 +423,65 @@ _REVIEW_FOCUS = (
     "Return a structured Verdict and findings with severity; critical/high block the deploy.")
 
 
-def run_companion_review(base: str | None, scope: str) -> str | None:
-    # adversarial-review --json даёт СТРУКТУРНЫЙ result{verdict,findings[severity]} (схема),
-    # в отличие от нативного `review`, чей вывод — текст P1/P2/P3 без Verdict: (инцидент:
-    # нативный формат ломал парсер → make deploy всегда блокировался).
+def _exec_companion(args: list[str]) -> subprocess.CompletedProcess | None:
+    """Единственное место, где companion запускается: резолв, таймаут и редакция argv в
+    диагностике. Вынесено, чтобы у внешних потребителей (скилл design-review) НЕ было повода
+    собирать вызов самим — самосборка теряла CODEX_COMPANION_CMD и печатала argv мимо редакции.
+    None = отказ (плагин не найден / таймаут / OSError); решение по отказу — за вызывающим."""
     try:
         cmd = resolve_companion_cmd()   # Codex P2: отсутствие плагина = outage (None), не traceback
     except FileNotFoundError as e:
         print(f"[codex-gate] плагин codex-companion не найден: {e}", file=sys.stderr)
         return None
-    cmd += ["adversarial-review", "--wait", "--json", "--scope", scope]
-    if base:
-        cmd += ["--base", base]
-    cmd.append(_REVIEW_FOCUS + _adjudication_prompt_block())   # переговорная память серии
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=_REVIEW_TIMEOUT_S)
+        return subprocess.run(cmd + args, capture_output=True, text=True,
+                              timeout=_REVIEW_TIMEOUT_S)
     except (subprocess.TimeoutExpired, OSError) as e:
         # источник #8 (R5-F2): TimeoutExpired.__str__ включает ВЕСЬ argv — если в команде есть
         # `--api-key=…`, он попал бы оператору целиком; редактируем текст исключения
-        print(f"[codex-gate] review не удался: {type(e).__name__}: "
+        print(f"[codex-gate] companion не отработал: {type(e).__name__}: "
               f"{redact_secrets(str(e))}", file=sys.stderr)
+        return None
+
+
+def companion_outage_reason(out: str) -> str | None:
+    """Причина, по которой вывод companion НЕ является ревью (пусто либо деградировавший
+    конверт: quota, ошибка модели, отсутствующий result), иначе None.
+
+    Нужна отдельно от parse_review_output: дизайн-ревью возвращает ПРОЗУ без `Verdict:`,
+    поэтому требовать валидный вердикт здесь нельзя, а пропускать outage — нельзя тем более
+    (инцидент с квотой 2026-07-25: companion отдаёт exit 0 и конверт, который без этой
+    проверки читается как «замечаний нет»)."""
+    if not out.strip():
+        return "companion вернул пустой вывод"
+    raw = strip_ansi(out).strip()
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None                              # обычный текст ревью — это норма
+    if not isinstance(obj, dict):
+        return None
+    codex = obj.get("codex")
+    degraded = (
+        (isinstance(codex, dict) and codex.get("status") not in (0, None))
+        or bool(str(obj.get("parseError") or "").strip())
+        or obj.get("result") is None
+    )
+    if not degraded:
+        return None
+    return outage_details(raw) or "деградировавший конверт companion (result отсутствует)"
+
+
+def run_companion_review(base: str | None, scope: str) -> str | None:
+    # adversarial-review --json даёт СТРУКТУРНЫЙ result{verdict,findings[severity]} (схема),
+    # в отличие от нативного `review`, чей вывод — текст P1/P2/P3 без Verdict: (инцидент:
+    # нативный формат ломал парсер → make deploy всегда блокировался).
+    args = ["adversarial-review", "--wait", "--json", "--scope", scope]
+    if base:
+        args += ["--base", base]
+    args.append(_REVIEW_FOCUS + _adjudication_prompt_block())   # переговорная память серии
+    r = _exec_companion(args)
+    if r is None:
         return None
     if r.returncode != 0:
         print(f"[codex-gate] review exit={r.returncode}: "
@@ -2017,6 +2062,35 @@ def main(argv: list[str]) -> int:
         if not _hooks_active():   # SessionStart в любом проекте: молча no-op вне онбординга
             return 0
         clear_marker()
+        return 0
+    if cmd == "companion-review":
+        # Дизайн-ревью для скилла: подкоманда ВЫПОЛНЯЕТ ревью, а не печатает argv.
+        # Печать argv (прошлая companion-path) обходила редакцию — в argv может лежать
+        # `--api-key=…` (тот же класс, что R5-F2), и вдобавок вынуждала скилл пересобирать
+        # команду шеллом. Здесь остаётся тестируемый путь: таймаут, редакция, fail-closed.
+        passthrough = argv[1:]
+        if not passthrough:
+            print("usage: companion-review [--base <ref>] [--scope <scope>] \"<фокус-текст>\"",
+                  file=sys.stderr)
+            return 1
+        r = _exec_companion(["adversarial-review", "--wait", *passthrough])
+        if r is None:
+            return 2                     # отказ уже объяснён в stderr, дальше — fail-closed
+        if r.returncode != 0:
+            # Причина отказа рендерится в stdout (конверт), а не в stderr (шум прогресса) —
+            # выбрасывать stdout здесь значило бы вернуть регрессию «причина outage невидима».
+            reason = outage_details(r.stdout) or redact_secrets(r.stderr.strip())[:400]
+            print(f"[codex-gate] companion exit={r.returncode}: {reason}", file=sys.stderr)
+            return 2
+        outage = companion_outage_reason(r.stdout)
+        if outage is not None:
+            # Код 0 ≠ ревью состоялось: при исчерпанной квоте companion выходит нулём и отдаёт
+            # деградировавший конверт. Без этой ветки он читался бы как «замечаний нет».
+            print(f"[codex-gate] ревью НЕ выполнено: {outage}", file=sys.stderr)
+            return 2
+        # Тело ревью печатается дословно: это вход для читателя-агента, а не диагностика,
+        # и порча текста редакцией исказила бы находки (источник #10 реестра ниже).
+        print(r.stdout, end="")
         return 0
     print(f"codex_review_gate: неизвестная команда {cmd!r}", file=sys.stderr)
     return 1

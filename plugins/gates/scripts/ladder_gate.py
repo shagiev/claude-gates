@@ -38,6 +38,51 @@ LEGACY_REQUIRED_PASSES = ("simplify", "code-review")
 LADDER_SCHEMA = 2                     # текущая схема ledger-записи (пишется новым кодом)
 GATE_CONFIG_NAME = ".codex-gate.yaml"
 
+# Чем выполняется проход. НАМЕРЕННО без утверждений о конкретной машине: доступность команды
+# и флаг `disable-model-invocation` — свойство окружения, а плагин едет в произвольные репо.
+# Ревью 2026-07-26: зашитое «агент вызвать НЕ может» врёт там, где /code-review резолвится в
+# вызываемую модель команду, и толкает агента к LADDER_SKIP; зашитое «иначе агент прогоняет
+# security-фокус прозой» вообще подменяло проход самоаттестацией.
+# Ключи обязаны покрывать DEPLOY_REQUIRED_PASSES: пропуск = KeyError на импорте (громко),
+# а не тихая заглушка в операторском тексте (тест test_pass_runner_covers_all_passes).
+# Остаётся текстом: подсказка ничего не энфорсит, машиночитаемое описание прохода
+# {class, command, source} проектируется в тикете B1.
+_PASS_RUNNER = {
+    "simplify": "/simplify либо субагент code-simplifier",
+    "code-review": "/code-review",
+    "security": "/security-review",
+}
+_RUN = "bash .githooks/gates-run ladder_gate.py"   # как гейт реально вызывается (см. README)
+_RUN_UNKNOWN = "<ваш шим gates-run> ladder_gate.py"
+
+
+def _run_cmd(root: Path) -> str:
+    """Команда гейта в copy-paste форме. gates-init кладёт шим в `.githooks/`, но проект мог
+    поставить хуки иначе (gates-init поддерживает чужой core.hooksPath) — там печатать
+    `.githooks/gates-run` значит выдать строку, дающую command not found, то есть ровно тот
+    провал, ради предотвращения которого подсказка и печатается."""
+    return _RUN if (root / ".githooks" / "gates-run").is_file() else _RUN_UNKNOWN
+
+
+def _repo_root() -> Path:
+    """Корень репозитория, а НЕ cwd. `begin`/`mark`, запущенные из подкаталога, писали
+    бухгалтерию в <subdir>/.claude/, а git запускает pre-commit из корня и там её не находил:
+    коммит блокировался «цепочка не подтверждена», хотя все проходы были выполнены и отмечены,
+    и оператор шёл за LADDER_SKIP. Вне git-репо поведение прежнее (cwd)."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return Path.cwd()
+    return Path(out) if out else Path.cwd()
+
+# Правило одно на все проходы, поэтому печатается один раз, а не копией в каждой строке.
+_RUNNER_RULE = (
+    "Проход запускает агент, ЕСЛИ платформа даёт ему эту команду. Если платформа отвечает\n"
+    "`disable-model-invocation` — агент обязан ПОПРОСИТЬ оператора набрать её и дождаться\n"
+    "результата, а НЕ подменять проход собственным вычитыванием и НЕ помечать непройденное."
+)
+
 # Точные пути ladder-бухгалтерии для исключения из tree-хэша (ревью Task 1: широкий glob
 # `.ladder-*` прятал бы от хэша и ПРОИЗВОЛЬНЫЙ файл/каталог под этим префиксом — сужено до
 # конкретных литералов, по два на каждый канонический проход; всё прочее под
@@ -200,6 +245,13 @@ def begin_pass(root: Path, pass_name: str) -> None:
         "tree_before": tree,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    # Роль печатаем в момент begin — это точка, где путают «агент запустит» и «оператор наберёт».
+    # Команда печатается в исполнимой форме (через шим): ladder_gate.py не лежит ни в PATH,
+    # ни в рабочем каталоге — скопированная «как есть» строка дала бы command not found.
+    print(f"[ladder-gate] begin {pass_name}: tree_before снят. "
+          f"Проход выполняется через {_PASS_RUNNER[pass_name]}. "
+          f"После РЕАЛЬНО выполненного прохода: {_run_cmd(root)} mark {pass_name}",
+          file=sys.stderr)
 
 
 def mark_pass(root: Path, pass_name: str) -> None:
@@ -230,16 +282,24 @@ def mark_pass(root: Path, pass_name: str) -> None:
 _AUDIT_LOG_RELPATH = Path("logs") / "codex_review_audit.log"
 _LEDGER_DIR_RELPATH = Path("logs") / "ladder_ledger"
 
-_CHAIN_INSTRUCTIONS = (
-    "[ladder-gate] цепочка /simplify → /code-review → security не подтверждена для этого коммита.\n"
-    "Прогони протокол: `ladder_gate.py begin simplify` → /simplify → "
-    "`ladder_gate.py mark simplify` → `ladder_gate.py begin code-review` → /code-review → "
-    "`ladder_gate.py mark code-review` → `ladder_gate.py begin security` → "
-    "security-проход (`/security-review` или security-фокус по AGENTS.md: внешний ввод в "
-    "опасный сток, секреты, авторизация, слабая криптография) → "
-    "`ladder_gate.py mark security`, затем закоммить снова.\n"
-    "Обход (осознанно, с аудитом): LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ..."
-)
+def _chain_instructions(root: Path) -> str:
+    """Сообщение заблокированного коммита. Функция, а не константа: команду надо печатать
+    в форме, исполнимой ИМЕННО В ЭТОМ репо (ревью 2026-07-26: begin печатал проверенный путь,
+    а это сообщение — жёстко зашитый, хотя копируют из него чаще)."""
+    run = _run_cmd(root)
+    return "\n".join([
+        f"[ladder-gate] цепочка {' → '.join(DEPLOY_REQUIRED_PASSES)} не подтверждена "
+        f"для коммита.",
+        "Протокол:",
+        *(f"  {i}. {run} begin {p} → проход {p} ({_PASS_RUNNER[p]}) → {run} mark {p}"
+          for i, p in enumerate(DEPLOY_REQUIRED_PASSES, 1)),
+        "Затем закоммить снова.",
+        _RUNNER_RULE,
+        "ВАЖНО: mark ставится только после РЕАЛЬНО выполненного прохода. Гейт проверяет\n"
+        "порядок и неизменность дерева между begin и mark, но НЕ доказывает, что проход\n"
+        "состоялся: пометка непройденного прохода делает гейт зелёным без ревью.",
+        "Обход (осознанно, с аудитом): LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ...",
+    ])
 
 
 def _audit_line(root: Path, msg: str) -> None:
@@ -312,7 +372,7 @@ def check_precommit(root: Path) -> int:
         return 0
     if _chain_valid_against(root, index_tree(root)):
         return 0
-    print(_CHAIN_INSTRUCTIONS, file=sys.stderr)
+    print(_chain_instructions(root), file=sys.stderr)
     return 2
 
 
@@ -509,21 +569,21 @@ def range_skips(root: Path, baseline: str) -> "list[str]":
 
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "check-precommit":
-        return check_precommit(Path.cwd())
+        return check_precommit(_repo_root())
     if argv and argv[0] == "record-commit":
-        record_commit(Path.cwd())
+        record_commit(_repo_root())
         return 0
     if argv and argv[0] == "check-range":
         if len(argv) < 2:
             print("usage: ladder_gate.py check-range <baseline>", file=sys.stderr)
             return 1
-        return check_range(Path.cwd(), argv[1])
+        return check_range(_repo_root(), argv[1])
     if len(argv) < 2 or argv[0] not in ("begin", "mark"):
         print("usage: ladder_gate.py begin|mark <pass> | check-precommit | record-commit | "
               "check-range <baseline>", file=sys.stderr)
         return 1
     cmd, pass_name = argv[0], argv[1]
-    root = Path.cwd()
+    root = _repo_root()
     try:
         if cmd == "begin":
             begin_pass(root, pass_name)

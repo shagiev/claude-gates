@@ -323,11 +323,17 @@ def test_r5_dsn_without_username_redacted():
 
 
 def test_r5_exception_text_with_argv_redacted(gate_env, monkeypatch, capsys):
-    # R5-F2: TimeoutExpired.__str__ включает весь argv — секрет в аргументе утекал
-    monkeypatch.setenv("CODEX_COMPANION_CMD", "sleep 5 --api-key=SUPERSECRETVALUE1")
+    # R5-F2: TimeoutExpired.__str__ включает весь argv — секрет в аргументе утекал.
+    # ВНИМАНИЕ: фейк обязан реально висеть. Прежняя команда `sleep 5 --api-key=…` падала
+    # мгновенно («sleep: invalid time interval»), поэтому ветка таймаута НЕ выполнялась и
+    # тест проходил впустую — снятие redact_secrets его не роняло (найдено мутационной
+    # проверкой 2026-07-26). Ассерт на имя исключения не даёт регрессу снова опустеть.
+    monkeypatch.setenv("CODEX_COMPANION_CMD", "bash -c 'sleep 5' --api-key=SUPERSECRETVALUE1")
     monkeypatch.setattr(g, "_REVIEW_TIMEOUT_S", 1)
     assert g.run_companion_review(base="HEAD~1", scope="branch") is None
-    assert "SUPERSECRETVALUE1" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "TimeoutExpired" in err                 # ветка таймаута реально пройдена
+    assert "SUPERSECRETVALUE1" not in err
 
 
 def test_r5_empirical_exception_text_redacted(tmp_path):
