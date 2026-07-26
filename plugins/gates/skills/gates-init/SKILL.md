@@ -38,6 +38,14 @@ python3 -c "import yaml" 2>&1
   тихо снять/ослабить — только аудируемый `EMPIRICAL_SKIP`.
 - `deploy.baseline_command` — authoritative-источник задеплоенного SHA (inframon/ssh);
   активация пинуется: первый деплой после включения — через явный `CODEX_DEPLOY_BASELINE`.
+- `integration.*` — pre-push гейт. **Обещает ровно одно: слияние с базой не конфликтует.**
+  Без секции работает на дефолтах (`base_ref: origin/main`). Для форка (пуш в `origin`, база в
+  `upstream`) `base_ref` ОБЯЗАТЕЛЕН, иначе гейт заблокирует пуш на неудачном fetch.
+  `merge_test_command` — опционально и только если команда исполняет код из ТЕКУЩЕГО каталога
+  (docker/tox/скрипт): при editable install зелёный результат не доказывает ничего, о чём гейт
+  сообщает каждый раз. Обходы (с обязательной причиной, пишутся в аудит): `INTEGRATION_SKIP`
+  (весь гейт), `INTEGRATION_TESTS_SKIP` (только тесты — конфликты всё равно проверяются),
+  `INTEGRATION_CONFIG_CHANGE` (осознанная смена секции). Подробности — в примере конфига.
 NB: `.codex-gate.yaml`, `Makefile`, `.githooks/` — всегда код-пути (жёстко в коде гейта),
 в конфиг их писать не нужно.
 
@@ -62,8 +70,9 @@ ls .githooks/ .git/hooks/ 2>/dev/null | grep -v sample
 - Конфликтов нет:
 ```bash
 mkdir -p .githooks
-cp "$T/githooks/gates-run" "$T/githooks/pre-commit" "$T/githooks/post-commit" .githooks/
-chmod +x .githooks/gates-run .githooks/pre-commit .githooks/post-commit
+cp "$T/githooks/gates-run" "$T/githooks/pre-commit" "$T/githooks/post-commit" \
+   "$T/githooks/pre-push" .githooks/
+chmod +x .githooks/gates-run .githooks/pre-commit .githooks/post-commit .githooks/pre-push
 git config core.hooksPath .githooks
 ```
 

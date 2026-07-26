@@ -44,7 +44,6 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # 7 соседних тестов). Инвариант «тесты не трогают боевые ledger'ы» — в ОБЩЕМ chokepoint.
     monkeypatch.setattr(g, "FINDINGS_DIR", tmp_path / "rf_conftest")
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path / "ledger_conftest")
-    # inframon-интерфейс: pin/вердикты — в tmp (не трогать боевые), range_skips детерминирован
     # Резолв companion не должен зависеть от машины. ВАЖНО: CODEX_COMPANION_CMD именно
     # ВЫСТАВЛЯЕТСЯ в инертное значение, а не удаляется. Удаление снимало бы последний барьер:
     # тест без своего мока провалился бы в глоб кэша, нашёл РЕАЛЬНЫЙ codex-companion.mjs и
@@ -53,6 +52,13 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     monkeypatch.setenv("CODEX_COMPANION_CMD", "bash -c 'exit 99'")
     for _root_var in ("CODEX_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
         monkeypatch.delenv(_root_var, raising=False)   # override выше их и так перебивает
+    # pre-push гейт: ambient INTEGRATION_* (напр. из ручного `INTEGRATION_SKIP=1 git push`)
+    # не должен контаминировать тесты — тот же класс, что EMPIRICAL_SKIP/LADDER_SKIP выше.
+    for _v in ("INTEGRATION_SKIP", "INTEGRATION_SKIP_REASON", "INTEGRATION_TESTS_SKIP",
+               "INTEGRATION_TESTS_SKIP_REASON", "INTEGRATION_CONFIG_CHANGE",
+               "INTEGRATION_CONFIG_CHANGE_REASON"):
+        monkeypatch.delenv(_v, raising=False)
+    # inframon-интерфейс: pin/вердикты — в tmp (не трогать боевые), range_skips детерминирован
     monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
     monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: [])

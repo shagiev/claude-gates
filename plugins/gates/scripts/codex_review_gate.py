@@ -944,9 +944,14 @@ def _empirical_config(root: Path, ref: str) -> "tuple[str, str | None, int]":
     return ("enabled", cmd.strip(), _valid_positive_int(sec.get("timeout_s", d), d))  # S9
 
 
-def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
+def _run_empirical(cmd: str, timeout_s: int, root: Path,
+                   cwd: "Path | None" = None, env: "dict | None" = None) -> "tuple[str, str]":
     """Прогон тест-команды. ('pass'|'fail'|'timeout'|'error', хвост вывода). Любой не-'pass' →
     блок (актуатор-урок: «не запустилось/зависло» ≠ «прошло»).
+
+    `cwd`/`env` — для pre-push гейта (прогон в worktree-пробе с отключёнными git-хуками).
+    Дефолты сохраняют поведение деплой-пути: cwd=root, окружение процесса. Вторая копия этой
+    функции в prepush_gate означала бы две копии актуатор-урока (ревью 2026-07-26).
 
     argv через `shlex.split` + БЕЗ shell (bounded authority, defense-in-depth): `test_command`
     исполняется как список аргументов, shell-метасимволы не интерпретируются. Покрывает обычные
@@ -959,7 +964,8 @@ def _run_empirical(cmd: str, timeout_s: int, root: Path) -> "tuple[str, str]":
     if not argv:
         return ("error", "пустая test_command")
     try:
-        r = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout_s)
+        r = subprocess.run(argv, cwd=(cwd or root), capture_output=True, text=True,
+                           timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired:
         return ("timeout", "")
     except OSError as e:

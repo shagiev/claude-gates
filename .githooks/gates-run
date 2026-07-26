@@ -28,10 +28,20 @@ EOF
 if [ "$P" = "FALLBACK" ]; then
   P=$(ls -d "$HOME"/.claude/plugins/cache/lenar-gates/gates/*/scripts 2>/dev/null | sort -V | tail -1)
 fi
-if [ -z "$P" ] || [ ! -f "$P/$SCRIPT" ]; then
-  echo "[gates] плагин gates@lenar-gates не установлен (или скрипт $SCRIPT не найден) — операция ПРЕРВАНА (fail-closed)." >&2
+if [ -z "$P" ]; then
+  echo "[gates] плагин gates@lenar-gates не установлен — операция ПРЕРВАНА (fail-closed)." >&2
   echo "[gates] Установи: /plugin marketplace add <путь-или-repo lenar-gates> ; /plugin install gates@lenar-gates" >&2
-  echo "[gates] Осознанный обход коммита: LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ... (аудит на деплой-гейте)" >&2
+  echo "[gates] Обход коммита (аудируется): LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ..." >&2
+  exit 1
+fi
+if [ ! -f "$P/$SCRIPT" ]; then
+  # Разные причины требуют разных действий: плагин МОЖЕТ быть установлен, но версия — старее
+  # скрипта, которого просит шим (реальный инцидент 2026-07-26: шим pre-push из рабочей копии
+  # заблокировал ВСЕ пуши, а сообщение говорило «не установлен» и предлагало обход коммита).
+  echo "[gates] плагин установлен ($P), но скрипт $SCRIPT в этой версии отсутствует —" >&2
+  echo "[gates] операция ПРЕРВАНА (fail-closed). Это рассинхрон версий: шим новее плагина." >&2
+  echo "[gates] Обнови плагин (pull маркетплейса → /plugin uninstall → /plugin install) либо" >&2
+  echo "[gates] удали хук, который просит $SCRIPT, если он попал сюда раньше времени." >&2
   exit 1
 fi
 exec python3 "$P/$SCRIPT" "$@"

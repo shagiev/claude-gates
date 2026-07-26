@@ -48,9 +48,13 @@ GATE_CONFIG_NAME = ".codex-gate.yaml"
 # Остаётся текстом: подсказка ничего не энфорсит, машиночитаемое описание прохода
 # {class, command, source} проектируется в тикете B1.
 _PASS_RUNNER = {
-    "simplify": "/simplify либо субагент code-simplifier",
-    "code-review": "/code-review",
-    "security": "/security-review",
+    "simplify": "/simplify либо субагенты очистки",
+    # Перечисляем ВЫЗЫВАЕМЫЕ АГЕНТОМ движки, а не только слэш-команду: платформа блокирует
+    # агенту имя команды, но не движок, который она оборачивает. Прежний текст «/code-review»
+    # толкал агента останавливаться и ждать человека там, где ждать не нужно (2026-07-26).
+    "code-review": "/code-review, либо тот же движок напрямую (workflow-ревью), либо "
+                   "независимый ревьюер: codex_review_gate.py companion-review / cursor",
+    "security": "/security-review либо security-фокус по конституции AGENTS.md",
 }
 _RUN = "bash .githooks/gates-run ladder_gate.py"   # как гейт реально вызывается (см. README)
 _RUN_UNKNOWN = "<ваш шим gates-run> ladder_gate.py"

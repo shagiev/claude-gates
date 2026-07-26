@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# gates pre-push интеграционный гейт (шим; спека docs/2026-07-26-prepush-integration-gate-design.md).
+# Обещание гейта одно: слияние с базой НЕ конфликтует. Тесты на пробе (integration.merge_test_command)
+# запускаются, красные блокируют, зелёные НИЧЕГО не доказывают — пометка печатается всегда.
+# Обходы (оба аудируются, причина обязательна):
+#   INTEGRATION_SKIP=1 INTEGRATION_SKIP_REASON="..."             — весь гейт
+#   INTEGRATION_TESTS_SKIP=1 INTEGRATION_TESTS_SKIP_REASON="..." — только тесты, конфликты проверяются
+# git передаёт хуку: $1=<remote name> $2=<remote url>, строки refs — на stdin.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -f "$HERE/gates-run" ]; then
+  echo "[gates] .githooks/gates-run отсутствует — пуш ПРЕРВАН (fail-closed). Перезапусти /gates-init." >&2
+  exit 1
+fi
+exec bash "$HERE/gates-run" prepush_gate.py "$@"
