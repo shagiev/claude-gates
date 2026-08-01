@@ -46,8 +46,12 @@ python3 -c "import yaml" 2>&1
   сообщает каждый раз. Обходы (с обязательной причиной, пишутся в аудит): `INTEGRATION_SKIP`
   (весь гейт), `INTEGRATION_TESTS_SKIP` (только тесты — конфликты всё равно проверяются),
   `INTEGRATION_CONFIG_CHANGE` (осознанная смена секции). Подробности — в примере конфига.
-NB: `.codex-gate.yaml`, `Makefile`, `.githooks/` — всегда код-пути (жёстко в коде гейта),
-в конфиг их писать не нужно.
+NB: control-plane всегда остаётся код-путём независимо от конфига: `.codex-gate.yaml`,
+`Makefile`, `.githooks/`, `.codex/hooks.json`, `.codex/config.toml`,
+`.claude/settings*.json`, `.codex-plugin/`, `.claude-plugin/`, `.agents/plugins/`,
+`hooks/hooks.json`, `reviewer_certifications.json`, `reviewer_corpus/` и служебные
+`.claude/.design-approved*` / `.review-disabled-*` / deploy SHA+pin. В конфиг их писать не нужно;
+актуальный машинный список — `HARD_CODE_PATH_*` в `codex_review_gate.py`.
 
 ## 3. `AGENTS.md` из скелета (если нет)
 

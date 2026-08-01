@@ -5,6 +5,9 @@
 #   check-decision ПРЯМО перед выкаткой (rsync/push)
 #   запись .claude/.last-deployed-sha ТОЛЬКО после успешной пост-деплой верификации
 # NB: в Makefile каждый '$' шелла пишется как '$$'.
+# REVIEW_PROVIDER отсутствует → fail-closed `portable` (certified Gemini + mandatory Claude).
+# Временный explicit legacy: `REVIEW_PROVIDER=cursor make deploy` — слабее portable:
+# Cursor не аттестует actual model, Claude supplemental не запускается.
 
 setup-hooks:
 	@git config core.hooksPath .githooks

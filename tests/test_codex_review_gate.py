@@ -309,7 +309,7 @@ def test_is_code_path_dot_prefix_not_stripped_as_charset():
     # ломая и новый .githooks/-префикс, и (случайно совпадавшую по итогу, но по неверной
     # причине) .claude/-экземпцию. os.path.normpath один справляется без lstrip.
     assert g.is_code_path(".githooks/post-commit") is True
-    assert g.is_code_path(".claude/settings.json") is False   # экземпция — по правильной причине
+    assert g.is_code_path(".claude/settings.json") is True    # hook-control path не экземптится
     assert g.is_code_path("./app/x.py") is True   # explicit './' по-прежнему схлопывается normpath'ом
 
 
@@ -332,7 +332,7 @@ def test_is_code_path():
     assert g.is_code_path("config.yaml") is True
     assert g.is_code_path("docs/foo.md") is False
     assert g.is_code_path("AGENTS.md") is False
-    assert g.is_code_path(".claude/settings.json") is False
+    assert g.is_code_path(".claude/settings.json") is True
 
 
 def test_marker_lifecycle(tmp_path, monkeypatch):
@@ -484,8 +484,8 @@ def test_gate_bash_allows_mutation_with_marker(tmp_path, monkeypatch):
     assert g.gate_bash_cli(hook) == 0
 
 
-def test_gates_malformed_json_allow():
-    assert g.gate_edit_cli("{not json") == 0
+def test_gates_malformed_json_blocks_when_onboarded():
+    assert g.gate_edit_cli("{not json") == 2
     assert g.gate_bash_cli("{not json") == 0
 
 
@@ -538,6 +538,22 @@ def test_gate_edit_notebook_path(tmp_path, monkeypatch):   # Codex P3: NotebookE
     monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".design-approved")
     hook = json.dumps({"session_id": "s1", "tool_input": {"notebook_path": "tests/nb.ipynb"}})
     assert g.gate_edit_cli(hook) == 2   # ноутбук под tests/ без маркера → deny
+
+
+def test_notebook_edit_real_payload_new_source_is_not_misclassified():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "s1",
+        "tool_name": "NotebookEdit",
+        "tool_input": {
+            "notebook_path": "docs/example.ipynb",
+            "cell_id": "cell-1",
+            "cell_type": "code",
+            "edit_mode": "replace",
+            "new_source": "print('hello')",
+        },
+    })
+    assert g.gate_edit_cli(hook) == 0
 
 
 def test_check_reviewed_non_ancestor_baseline_blocks(tmp_path, monkeypatch):   # Codex P2

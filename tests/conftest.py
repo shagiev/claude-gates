@@ -17,6 +17,11 @@ import codex_review_gate as g  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _gates_test_isolation(monkeypatch, tmp_path):
+    # Hook CLI — одноразовый процесс, но unit-тесты делят импортированный модуль. Codex payload.cwd
+    # теперь может переключить REPO_ROOT; снапшот через monkeypatch не даёт этому контексту утечь
+    # в следующий тест и направить его git-команды/аудит в чужой tmp-репозиторий.
+    monkeypatch.setattr(g, "REPO_ROOT", g.REPO_ROOT)
+    monkeypatch.setattr(g, "_GATE_CFG", g._GATE_CFG)
     # Детерминированный конфиг код-путей: тесты не должны зависеть от .codex-gate.yaml
     # репо-носителя (иначе правка конфига плагин-репо ломала бы тест-матрицу).
     monkeypatch.setattr(g, "CODE_PATH_PREFIXES",
@@ -38,6 +43,18 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # реальный CLAUDE_CODE_SESSION_ID не должен перебивать сессию, которую тест задаёт через
     # CLAUDE_SESSION_ID (иначе _env_session вернёт реальный id и маркер-тесты сломаются).
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    # Portable reviewer tests must never inherit real credentials and accidentally spend money.
+    # Each adapter test opts in with a synthetic key and a mocked transport.
+    for _secret_var in ("GOOGLE_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"):
+        monkeypatch.delenv(_secret_var, raising=False)
+    monkeypatch.delenv("GEMINI_REVIEW_MODEL", raising=False)
+    # Та же защита от случайного live-spend, что CODEX_COMPANION_CMD ниже: тест, забывший
+    # подменить Claude adapter, обязан получить deterministic unavailable, а не запустить CLI.
+    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: None)
+    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
+    # Большинство исторических unit-тестов проверяют explicit legacy Codex-контур. Продуктовый
+    # default теперь portable; тесты дефолта обязаны сами удалить эту переменную.
+    monkeypatch.setenv("REVIEW_PROVIDER", "codex")
     # ИНЦИДЕНТ 2026-07-25: FINDINGS_DIR/LEDGER_DIR были изолированы только в фикстуре
     # ОДНОГО тест-файла — новый тест-файл без локального мока писал в БОЕВОЙ
     # logs/review_findings (создал мусорную серию с critical-находкой из фикстуры, уронил

@@ -1,0 +1,21 @@
+{
+  "name": "gates",
+  "version": "0.6.0+codex.20260801144425",
+  "description": "Cross-host review gates preview for Claude Code and Codex.",
+  "author": {
+    "name": "\u041b\u0435\u043d\u0430\u0440"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Gates",
+    "shortDescription": "Cross-host independent review gates preview.",
+    "longDescription": "Installable preview for Claude Code and Codex. Portable deploy review stays fail-closed until a certified independent non-Anthropic backend is configured; Cursor is optional legacy compatibility, not a dependency.",
+    "developerName": "\u041b\u0435\u043d\u0430\u0440",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": "Onboard this repository with gates and explain every enforced check."
+  }
+}

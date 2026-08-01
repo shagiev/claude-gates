@@ -244,8 +244,12 @@ Codex маржинально бесплатен по подписке), выиг
 
 ## EARS
 
-- **EARS-1:** WHERE `REVIEW_PROVIDER` не задан — SHALL использоваться `codex` (поведение как до
-  фичи). (P1)
+> Историческая спека legacy provider-switch. EARS-1 ниже superseded универсальным default
+> `portable` из `docs/2026-07-30-cross-host-reviewer-architecture.md`; `codex|cursor|both`
+> сохранены только как явно выбранные compatibility-профили.
+
+- **EARS-1 (superseded 30.07):** раньше отсутствие `REVIEW_PROVIDER` означало `codex`;
+  universal architecture теперь требует `portable`. (P1 — исторический тест legacy resolver)
 - **EARS-2:** WHEN `REVIEW_PROVIDER=cursor` — ревью SHALL выполняться `cursor-agent` с
   `-p --output-format json --mode ask --trust`, пиньованной моделью и собственным таймаутом;
   `.result` SHALL парситься существующим `parse_review_output`. (P2)

@@ -3,7 +3,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|NotebookEdit",
+        "matcher": "^(?:(?:Multi)?Edit.*|Write.*|NotebookEdit.*|apply_patch.*|mcp__.*__.*(?:Edit|edit|Write|write|Patch|patch|Replace|replace|Truncate|truncate).*|mcp__.*__.*(?:Create|create|Update|update|Save|save|Delete|delete|Remove|remove|Move|move|Rename|rename|Append|append|Copy|copy).*(?:File|file|Path|path|Folder|folder|Directory|directory).*|mcp__.*__.*(?:File|file|Path|path|Folder|folder|Directory|directory).*(?:Create|create|Update|update|Save|save|Delete|delete|Remove|remove|Move|move|Rename|rename|Append|append|Copy|copy).*)$",
         "hooks": [
           {
             "type": "command",

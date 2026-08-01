@@ -37,6 +37,28 @@ def test_hard_paths_survive_empty_config(monkeypatch):
     assert g.is_code_path("Makefile") is True
     assert g.is_code_path(".githooks/pre-commit") is True
     assert g.is_code_path(".githooks/gates-run") is True
+    assert g.is_code_path(".codex/hooks.json") is True
+    assert g.is_code_path(".codex/config.toml") is True
+    assert g.is_code_path(".claude/settings.json") is True
+    assert g.is_code_path(".claude/settings.local.json") is True
+    assert g.is_code_path(".claude/.design-approved-s1") is True
+    assert g.is_code_path(".claude/.review-disabled-s1") is True
+    assert g.is_code_path(".claude/.last-reviewed-sha") is True
+    assert g.is_code_path(".claude/.last-deployed-sha") is True
+    assert g.is_code_path(".claude/.deploy-section-pin") is True
+    assert g.is_code_path(".codex-plugin/plugin.json") is True
+    assert g.is_code_path(".claude-plugin/plugin.json") is True
+    assert g.is_code_path(".agents/plugins/marketplace.json") is True
+    assert g.is_code_path("hooks/hooks.json") is True
+    assert g.is_code_path("plugins/gates/.codex-plugin/plugin.json") is True
+    assert g.is_code_path("plugins/gates/.claude-plugin/plugin.json") is True
+    assert g.is_code_path("plugins/gates/hooks/hooks.json") is True
+    assert g.is_code_path("vendor/tool/.agents/plugins/marketplace.json") is True
+    assert g.is_code_path("plugins/gates/reviewer_certifications.json") is True
+    assert g.is_code_path("plugins/gates/reviewer_corpus/cases.json") is True
+    assert g.is_code_path("makefile") is True
+    assert g.is_code_path(".CODEX-GATE.YAML") is True
+    assert g.is_code_path(".GitHooks/pre-commit") is True
     assert g.is_code_path("app/x.py") is False            # а обычный код конфиг убрал
 
 
@@ -147,6 +169,591 @@ def test_gate_edit_active_when_onboarded_broken_config(monkeypatch, tmp_path):
     monkeypatch.setattr(g, "CODE_PATH_EXACT", set())
     hook = json.dumps({"session_id": "s1", "tool_input": {"file_path": "docs/x.md"}})
     assert g.gate_edit_cli(hook) == 2                     # даже docs гейтится в строгом режиме
+
+
+@pytest.mark.parametrize("payload", ("{not-json", "[]"))
+def test_gate_edit_malformed_top_level_payload_blocks_when_active(payload, capsys):
+    assert g.gate_edit_cli(payload) == 2
+    assert "fail-closed" in capsys.readouterr().err
+
+
+def test_gate_edit_non_dict_tool_input_blocks_when_active(capsys):
+    hook = json.dumps({"tool_name": "apply_patch", "tool_input": ["schema", "drift"]})
+    assert g.gate_edit_cli(hook) == 2
+    assert "tool_input изменил схему" in capsys.readouterr().err
+
+
+def test_gate_edit_cannot_write_design_unlock_marker_directly(capsys):
+    hook = json.dumps({
+        "session_id": "s1",
+        "tool_name": "Write",
+        "tool_input": {"file_path": ".claude/.design-approved-s1"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "Дизайн-ревью не пройдено" in capsys.readouterr().err
+
+
+def test_gate_edit_payload_cwd_non_onboarded_repo_is_noop(repo):
+    hook = json.dumps({
+        "cwd": str(repo),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: app/x.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 0
+
+
+def test_gate_edit_nested_non_onboarded_repo_cannot_escape_active_parent(
+        repo, monkeypatch, capsys):
+    (repo / ".codex-gate.yaml").write_text("code_paths:\n  prefixes: [app/]\n")
+    (repo / "app").mkdir()
+    nested = repo / "vendor" / "lib"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-b", "main")
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    monkeypatch.setattr(g, "ONBOARDED", True)
+    monkeypatch.setattr(g, "CODE_PATH_PREFIXES", ("app/",))
+    hook = json.dumps({
+        "cwd": str(nested),
+        "session_id": "codex-nested-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: ../../app/x.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "Дизайн-ревью не пройдено" in capsys.readouterr().err
+
+
+def test_gate_edit_nested_non_onboarded_repo_stays_opted_out(repo, monkeypatch):
+    (repo / ".codex-gate.yaml").write_text("code_paths:\n  prefixes: [app/]\n")
+    nested = repo / "vendor" / "lib"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-b", "main")
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    monkeypatch.setattr(g, "ONBOARDED", True)
+    hook = json.dumps({
+        "cwd": str(nested),
+        "session_id": "codex-nested-s2",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: local.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 0
+
+
+@pytest.mark.parametrize("header", ("Add File", "Update File", "Delete File"))
+def test_gate_edit_codex_apply_patch_code_path_blocked(header):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                f"*** {header}: app/x.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_gate_edit_codex_apply_patch_move_and_mixed_paths_blocked():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Update File: docs/notes.md\n"
+                "*** Move to: app/notes.py\n"
+                "@@\n"
+                "-old\n"
+                "+new\n"
+                "*** Add File: README-extra.md\n"
+                "+text\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_gate_edit_codex_apply_patch_noncode_only_passes():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Update File: docs/notes.md\n"
+                "@@\n"
+                "-old\n"
+                "+new\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 0
+
+
+def test_gate_edit_codex_apply_patch_malformed_blocks(capsys):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {"command": "*** Begin Patch\n*** End Patch\n"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "apply_patch" in capsys.readouterr().err
+
+
+def test_gate_edit_codex_apply_patch_unknown_control_header_blocks(capsys):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Update File: docs/known.md\n"
+                "*** Rename File: app/hidden.py\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "apply_patch" in capsys.readouterr().err
+
+
+def test_gate_edit_codex_apply_patch_paths_are_relative_to_payload_cwd(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / "subdir").mkdir(parents=True)
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    hook = json.dumps({
+        "cwd": str(repo / "subdir"),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: ../app/x.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_gate_edit_codex_apply_patch_cwd_outside_repo_blocks(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    hook = json.dumps({
+        "cwd": str(outside),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Update File: docs/looks-safe.md\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "нельзя доказуемо привязать" in capsys.readouterr().err
+
+
+def test_gate_edit_codex_apply_patch_absolute_outside_repo_blocks(
+        tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    hook = json.dumps({
+        "cwd": str(repo),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                f"*** Update File: {outside / 'looks-safe.md'}\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "patch path вне repo root" in capsys.readouterr().err
+
+
+def test_gate_edit_codex_apply_patch_resolves_symlinked_checkout(
+        tmp_path, monkeypatch, capsys):
+    physical = tmp_path / "physical"
+    logical = tmp_path / "logical"
+    (physical / "app").mkdir(parents=True)
+    logical.symlink_to(physical, target_is_directory=True)
+    monkeypatch.setattr(g, "REPO_ROOT", physical)
+    docs_hook = json.dumps({
+        "cwd": str(logical),
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                f"*** Update File: {logical / 'docs' / 'notes.md'}\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(docs_hook) == 0
+    code_hook = json.loads(docs_hook)
+    code_hook["tool_input"]["command"] = (
+        "*** Begin Patch\n"
+        f"*** Update File: {logical / 'app' / 'x.py'}\n"
+        "*** End Patch\n"
+    )
+    assert g.gate_edit_cli(json.dumps(code_hook)) == 2
+    assert "Дизайн-ревью не пройдено" in capsys.readouterr().err
+
+
+def test_gate_edit_codex_apply_patch_missing_cwd_blocks(capsys):
+    hook = json.dumps({
+        "session_id": "codex-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Update File: docs/notes.md\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "cwd отсутствует" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tool_name", ("apply_patch_v2", "mcp__x__apply_patch", None))
+def test_gate_edit_codex_apply_patch_tool_name_drift_blocks(tool_name):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": tool_name,
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: app/x.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_gate_edit_unrecognized_payload_blocks(capsys):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "WriteV2",
+        "tool_input": {"new_schema_path": "app/x.py"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "заблокирована" in capsys.readouterr().err
+
+
+def test_gate_edit_non_file_tool_accidentally_sent_to_hook_is_noop():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "TodoWrite",
+        "tool_input": {"todos": []},
+    })
+    assert g.gate_edit_cli(hook) == 0
+
+
+@pytest.mark.parametrize("tool_name", (
+    "mcp__calendar__create_event",
+    "mcp__database__update_record",
+    "mcp__memory__save_checkpoint",
+))
+def test_non_file_mcp_mutator_names_are_noop_if_sent_accidentally(tool_name):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": tool_name,
+        "tool_input": {"title": "not a file mutation"},
+    })
+    assert g.gate_edit_cli(hook) == 0
+
+
+def test_gate_bash_schema_drift_is_explicit_best_effort_noop():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "codex-s1",
+        "tool_name": "Bash",
+        "tool_input": ["schema", "drift"],
+    })
+    assert g.gate_bash_cli(hook) == 0
+
+
+def test_codex_apply_patch_hook_matcher_registered_and_anchored():
+    hooks_path = Path(__file__).resolve().parent.parent / "plugins" / "gates" / "hooks" / "hooks.json"
+    config = json.loads(hooks_path.read_text())
+    matchers = [entry.get("matcher", "") for entry in config["hooks"]["PreToolUse"]]
+    matcher = next(matcher for matcher in matchers if "apply" in matcher)
+    assert "(?i" not in matcher   # hook consumers are not guaranteed modern V8 regex modifiers
+    import re
+    compiled = re.compile(matcher)
+    for tool_name in ("Edit", "MultiEdit", "EditV2", "Write", "WriteV2", "NotebookEdit",
+                      "apply_patch", "apply_patch_v2", "mcp__x__apply_patch",
+                      "mcp__filesystem__EditFile", "mcp__filesystem__WriteFile",
+                      "mcp__filesystem__edit_file", "mcp__filesystem__write_file",
+                      "mcp__filesystem__create_file", "mcp__filesystem__update_file",
+                      "mcp__filesystem__patch_file", "mcp__editor__str_replace_editor",
+                      "mcp__editor__str_replace_based_edit_tool",
+                      "mcp__filesystem__replace_in_file", "mcp__filesystem__save_file",
+                      "mcp__filesystem__delete_file", "mcp__filesystem__remove_file",
+                      "mcp__filesystem__move_file", "mcp__filesystem__rename_file",
+                      "mcp__filesystem__append_file", "mcp__filesystem__copy_file",
+                      "mcp__filesystem__truncate_file"):
+        assert compiled.fullmatch(tool_name), tool_name
+    assert compiled.fullmatch("TodoWrite") is None
+    assert compiled.fullmatch("mcp__calendar__create_event") is None
+    assert compiled.fullmatch("mcp__database__update_record") is None
+    assert compiled.fullmatch("mcp__memory__save_checkpoint") is None
+
+
+@pytest.mark.parametrize("tool_name", (
+    "mcp__filesystem__write_file",
+    "mcp__filesystem__edit_file",
+    "mcp__filesystem__WriteFile",
+    "mcp__filesystem__create_file",
+    "mcp__filesystem__update_file",
+    "mcp__editor__str_replace_editor",
+    "mcp__editor__str_replace_based_edit_tool",
+    "mcp__filesystem__replace_in_file",
+    "mcp__filesystem__save_file",
+))
+def test_mcp_file_path_payload_enters_real_edit_gate(tool_name):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "mcp-s1",
+        "tool_name": tool_name,
+        "tool_input": {"path": "app/x.py", "content": "x = 1"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_mcp_file_tool_unknown_payload_fails_closed(capsys):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__write_file",
+        "tool_input": {"filepath_v2": "app/x.py"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "заблокирована" in capsys.readouterr().err
+
+
+def test_routed_file_symlink_outside_repo_blocks(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    (repo / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    hook = json.dumps({
+        "cwd": str(repo),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__write_file",
+        "tool_input": {"path": "escape/x.py", "content": "x = 1"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_explicit_external_file_target_remains_opt_in_noop(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "scratch.py"
+    repo.mkdir()
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    hook = json.dumps({
+        "cwd": str(repo),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__write_file",
+        "tool_input": {"path": str(outside), "content": "x = 1"},
+    })
+    assert g.gate_edit_cli(hook) == 0
+
+
+def test_mcp_move_checks_source_and_destination():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__move_file",
+        "tool_input": {"source": "docs/safe.md", "destination": "app/hidden.py"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_mcp_unknown_camelcase_destination_key_fails_closed(capsys):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__move_file",
+        "tool_input": {"path": "docs/safe.md", "futureDestinationPath": "app/hidden.py"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+    assert "path-like key" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("unknown_key", (
+    "destpath", "filepath", "newpath", "paths", "outputDir", "output_dir",
+    "directory", "folder", "URIPath", "newDestination", "move_destination",
+    "new_target", "copy_dst",
+))
+def test_mcp_unrecognized_pathlike_aliases_fail_closed(unknown_key):
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__move_file",
+        "tool_input": {"path": "docs/safe.md", unknown_key: "app/hidden.py"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_mcp_delete_code_path_enters_gate():
+    hook = json.dumps({
+        "cwd": str(g.REPO_ROOT),
+        "session_id": "mcp-s1",
+        "tool_name": "mcp__filesystem__delete_file",
+        "tool_input": {"path": "app/x.py"},
+    })
+    assert g.gate_edit_cli(hook) == 2
+
+
+def test_codex_plugin_manifest_and_marketplace_point_to_same_plugin():
+    root = Path(__file__).resolve().parent.parent
+    manifest = json.loads(
+        (root / "plugins" / "gates" / ".codex-plugin" / "plugin.json").read_text())
+    marketplace = json.loads(
+        (root / ".agents" / "plugins" / "marketplace.json").read_text())
+    assert marketplace["plugins"]
+    assert all(entry["policy"]["installation"] == "AVAILABLE"
+               for entry in marketplace["plugins"])
+    entry = marketplace["plugins"][0]
+    assert manifest["name"] == "gates"
+    assert entry["name"] == manifest["name"]
+    assert entry["source"] == {"source": "local", "path": "./plugins/gates"}
+    assert entry["policy"] == {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL",
+    }
+    plugin_root = root / entry["source"]["path"]
+    assert "hooks" not in manifest  # validator текущего Codex отвергает это поле
+    assert (plugin_root / "hooks" / "hooks.json").is_file()
+
+
+def test_gate_edit_codex_apply_patch_subprocess_enters_real_cli(repo):
+    (repo / ".codex-gate.yaml").write_text("code_paths:\n  prefixes: [app/]\n")
+    (repo / "app").mkdir()
+    script = (Path(__file__).resolve().parent.parent / "plugins" / "gates" / "scripts"
+              / "codex_review_gate.py")
+    hook = json.dumps({
+        "cwd": str(repo),
+        "session_id": "codex-live-s1",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: app/live.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    result = subprocess.run(
+        ["python3", str(script), "gate-edit"],
+        cwd=repo,
+        input=hook,
+        text=True,
+        capture_output=True,
+        env={"PATH": os.environ["PATH"]},
+    )
+    assert result.returncode == 2
+    assert "Дизайн-ревью не пройдено" in result.stderr
+
+
+def test_gate_edit_codex_payload_cwd_selects_repo_when_process_cwd_is_outside(repo, tmp_path):
+    (repo / ".codex-gate.yaml").write_text("code_paths:\n  prefixes: [app/]\n")
+    (repo / "app").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    script = (Path(__file__).resolve().parent.parent / "plugins" / "gates" / "scripts"
+              / "codex_review_gate.py")
+    hook = json.dumps({
+        "cwd": str(repo),
+        "session_id": "codex-live-s2",
+        "tool_name": "apply_patch",
+        "tool_input": {
+            "command": (
+                "*** Begin Patch\n"
+                "*** Add File: app/live.py\n"
+                "+x = 1\n"
+                "*** End Patch\n"
+            ),
+        },
+    })
+    result = subprocess.run(
+        ["python3", str(script), "gate-edit"],
+        cwd=outside,
+        input=hook,
+        text=True,
+        capture_output=True,
+        env={"PATH": os.environ["PATH"]},
+    )
+    assert result.returncode == 2
+    assert "Дизайн-ревью не пройдено" in result.stderr
+
+
+def test_set_hook_repo_context_updates_all_repo_derived_paths(repo):
+    (repo / ".codex-gate.yaml").write_text("code_paths:\n  prefixes: [app/]\n")
+    g._set_hook_repo_context(repo)
+    assert g.REPO_ROOT == repo.resolve()
+    assert g.AUDIT_LOG == repo / "logs" / "codex_review_audit.log"
+    assert g.DESIGN_MARKER == repo / ".claude" / ".design-approved"
+    assert g.LEDGER_DIR == repo / "logs" / "review_ledger"
+    assert g.LAST_DEPLOYED == repo / ".claude" / ".last-deployed-sha"
+    assert g.LAST_REVIEWED == repo / ".claude" / ".last-reviewed-sha"
+    assert g.DEPLOY_PIN == repo / ".claude" / ".deploy-section-pin"
+    assert g.FINDINGS_DIR == repo / "logs" / "review_findings"
+    assert g.VERDICT_DIR == repo / "logs" / "review_verdicts"
 
 
 def test_explicit_gate_requires_repo(monkeypatch):
