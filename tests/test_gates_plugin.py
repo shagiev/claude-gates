@@ -662,6 +662,10 @@ def test_codex_plugin_manifest_and_marketplace_point_to_same_plugin():
     root = Path(__file__).resolve().parent.parent
     manifest = json.loads(
         (root / "plugins" / "gates" / ".codex-plugin" / "plugin.json").read_text())
+    claude_manifest = json.loads(
+        (root / "plugins" / "gates" / ".claude-plugin" / "plugin.json").read_text())
+    claude_marketplace = json.loads(
+        (root / ".claude-plugin" / "marketplace.json").read_text())
     marketplace = json.loads(
         (root / ".agents" / "plugins" / "marketplace.json").read_text())
     assert marketplace["plugins"]
@@ -670,6 +674,11 @@ def test_codex_plugin_manifest_and_marketplace_point_to_same_plugin():
     entry = marketplace["plugins"][0]
     assert manifest["name"] == "gates"
     assert entry["name"] == manifest["name"]
+    assert claude_manifest["name"] == manifest["name"]
+    assert claude_marketplace["plugins"][0]["name"] == manifest["name"]
+    assert claude_marketplace["metadata"]["version"] == claude_manifest["version"]
+    assert claude_marketplace["plugins"][0]["version"] == claude_manifest["version"]
+    assert manifest["version"].split("+", 1)[0] == claude_manifest["version"]
     assert entry["source"] == {"source": "local", "path": "./plugins/gates"}
     assert entry["policy"] == {
         "installation": "AVAILABLE",

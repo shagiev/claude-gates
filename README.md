@@ -35,7 +35,9 @@ Codex-ревью, протокол сходимости довёл деплой 
 /plugin install gates@lenar-gates
 ```
 
-(с локального клона: `/plugin marketplace add <путь-к-клону>`; обновление: `/plugin update gates@lenar-gates`)
+(с локального клона: `/plugin marketplace add <путь-к-клону>`; надёжное обновление:
+`/plugin uninstall gates@lenar-gates` → `/plugin install gates@lenar-gates`; встроенный
+`/plugin update` для этого marketplace ранее молча не обновлял клон)
 
 Требуется Codex-плагин (ревью-движок): `/plugin marketplace add openai/codex-plugin-cc` →
 `/plugin install codex@openai-codex` (логин ChatGPT). Для чтения конфига — PyYAML
