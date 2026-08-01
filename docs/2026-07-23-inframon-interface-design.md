@@ -60,11 +60,19 @@ Pin локален и правится руками — это осознанн�
 При КАЖДОМ allow-выходе `check_reviewed_cli` пишется машиночитаемый вердикт
 `logs/review_verdicts/<head_sha>.json` (env-override `CODEX_VERDICT_DIR` — тесты):
 ```json
-{"schema": 1, "head_sha": "...", "baseline_sha": "...", "diff_sha256": "...",
+{"schema": 2, "run_id": "<milliseconds>-<pid>",
+ "head_sha": "...", "baseline_sha": "...", "diff_sha256": "...",
  "gates": {"ladder": "covered|skipped", "empirical": "pass|skipped|not-configured",
            "codex": "allow|cached|skipped"},
+ "providers": [{"role": "blocking|supplemental", "provider": "...",
+                "requested_model": "...", "model": "...", "actual_models": ["..."],
+                "family": "...", "certification_id": "...", "policy_id": "..."}],
+ "supplemental_findings": [{"severity": "...", "title": "...", "provider": "claude"}],
  "ts": "..."}
 ```
+`providers` пуст для исторических skip/legacy-выходов. `supplemental_findings` — advisory:
+они видимы consumer'у, но не меняют blocking union; непустой список запрещает clean-cache,
+чтобы следующий allow-run не потерял обязательный Claude artifact.
 Скипы НЕ прячутся — вердикт прямо говорит и о ТЕКУЩИХ скипах, и об ИСТОРИЧЕСКИХ обходах
 диапазона (R1-F3): `gates.ladder ∈ {covered, covered-with-skips, skipped}` — `covered-with-skips`,
 когда в `baseline..HEAD` есть ledger-записи `skipped=true` (новая `range_skips()` в
@@ -154,7 +162,8 @@ UNLINK при существующем старом файле → **БЛОК** 
   Сравнение с baseline-секцией ЗАПРЕЩЕНО как якорь (baseline из самой команды —
   самореференция). (B9, B9b, B10)
 - **EARS-5:** WHEN `check_reviewed_cli` возвращает allow — THEN SHALL быть записан вердикт
-  (schema 1) с фактическими статусами гейтов, включая текущие скипы И исторические
+  (schema 2) с фактическими статусами гейтов, reviewer role/model/certification policy,
+  supplemental advisory, включая текущие скипы И исторические
   (`covered-with-skips` при skipped-записях диапазона, через `range_skips()`). (V1–V3, V7)
 - **EARS-6:** Перед записью SHALL удаляться старый вердикт этого head (delete-then-write);
   IF unlink упал при существующем файле — THEN БЛОК; IF запись упала после unlink — THEN
@@ -195,4 +204,4 @@ UNLINK при существующем старом файле → **БЛОК** 
 sleep / мусор); V1–V8 через `check_reviewed_cli` (fresh/кэш/скипы; monkeypatch OSError записи И unlink;
 исторические skipped-записи диапазона → covered-with-skips).
 Generic-refactor читателя секций: существующие empirical-тесты остаются зелёными (регресс).
-Реальный маршрут: вердикт-файл существует и валиден как JSON со schema=1 после allow.
+Реальный маршрут: вердикт-файл существует и валиден как JSON со schema=2 после allow.

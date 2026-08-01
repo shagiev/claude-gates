@@ -13,6 +13,8 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +64,32 @@ class ReviewVerdict:
         if self.verdict == "approve" and not self.findings and not self.no_findings_marker:
             return False   # approve без явного "No material findings" и без находок = дрейф
         return True
+
+
+@dataclass(frozen=True)
+class ReviewerCertification:
+    provider: str
+    adapter: str
+    requested_model: str
+    actual_models: tuple[str, ...]
+    family: str
+    roles: tuple[str, ...]
+    certification_id: str
+    status: str
+
+
+@dataclass
+class ReviewerRun:
+    role: str
+    provider: str
+    requested_model: str
+    actual_models: tuple[str, ...]
+    family: str
+    certification_id: str
+    status: str
+    verdict: ReviewVerdict | None = None
+    detail: str = ""
+    usage: dict = field(default_factory=dict)
 
 
 def _nonempty_str(v: object) -> bool:
@@ -197,6 +225,9 @@ _REDACT_RULES = (
 #      цитирующую sha256, `token=`-строку или любой длинный идентификатор, и ревью стало бы
 #      нечитаемым. Компенсация: сам вывод не попадает в маркер (detail маркера редактируется),
 #      а деградировавший конверт до печати отсекает companion_outage_reason().
+#  11. Gemini HTTP/body/transport diagnostics → run_gemini_review_text(); известный API key
+#      удаляется по точному значению ДО общей pattern-based редакции.
+#  12. Claude CLI stdout/stderr/исключение → run_claude_supplemental().
 # Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей; сознательное
 # исключение — записывать сюда же с обоснованием, чтобы реестр оставался полным.
 def redact_secrets(text: str) -> str:
@@ -274,22 +305,49 @@ def decide_exit(verdict: ReviewVerdict | None, fail_closed: bool) -> int:
 GATE_CONFIG_NAME = ".codex-gate.yaml"
 # Жёсткие код-пути (НЕ отключаемы конфигом, ML-P1): правка конфига/хуков/деплой-рецепта
 # сама гейтится лесенкой и видна Codex-ревью диффа — иначе конфиг мог бы ослабить сам себя.
-HARD_CODE_PATH_EXACT = {GATE_CONFIG_NAME, "Makefile"}
-HARD_CODE_PATH_PREFIXES = (".githooks/",)
+HARD_CODE_PATH_EXACT = {
+    GATE_CONFIG_NAME,
+    "Makefile",
+    ".codex/hooks.json",
+    ".codex/config.toml",
+    ".claude/settings.json",
+    ".claude/settings.local.json",
+}
+HARD_CODE_PATH_PREFIXES = (
+    ".githooks/",
+    ".codex-plugin/",
+    ".claude-plugin/",
+    ".agents/plugins/",
+    ".claude/.design-approved",
+    ".claude/.review-disabled-",
+    ".claude/.last-reviewed-sha",
+    ".claude/.last-deployed-sha",
+    ".claude/.deploy-section-pin",
+)
+HARD_CODE_PATH_COMPONENTS = (
+    "/.codex-plugin/",
+    "/.claude-plugin/",
+    "/.agents/plugins/",
+    "/reviewer_corpus/",
+)
 _DEFAULT_HARD_CAP = 8
 
 
-def _detect_repo_root() -> "Path | None":
+def _detect_repo_root(cwd: "Path | None" = None) -> "Path | None":
     """git rev-parse --show-toplevel от cwd (скрипт живёт в кэше плагина — __file__ бесполезен).
     None = не git-репо/сбой git: хуки → exit 0, явные гейты → явная ошибка (fail-closed)."""
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+        cmd = ["git"]
+        if cwd is not None:
+            cmd.extend(["-C", str(cwd)])
+        cmd.extend(["rev-parse", "--show-toplevel"])
+        r = subprocess.run(cmd,
                            capture_output=True, text=True)
     except OSError:
         return None
     if r.returncode != 0 or not r.stdout.strip():
         return None
-    return Path(r.stdout.strip())
+    return Path(os.path.realpath(r.stdout.strip()))
 
 
 def _onboarded(root: Path) -> bool:
@@ -378,6 +436,58 @@ def _hooks_active() -> bool:
     """Opt-in автосрабатывающих хуков (BS-P1): вне git-репо или в не-онбордженном проекте
     (нет конфига ни в worktree, ни в HEAD) плагин не вмешивается."""
     return REPO_ROOT is not None and ONBOARDED
+
+
+def _set_hook_repo_context(root: Path) -> None:
+    """Переключить одноразовый hook-процесс на repo из payload.cwd.
+
+    Codex может быть запущен с ``--cd`` из другого каталога; import-time cwd тогда не является
+    целевым repo. Все repo-derived глобалы меняются вместе, чтобы нельзя было смешать root одного
+    репо с config/state/ledger/audit другого.
+    """
+    global REPO_ROOT, ONBOARDED, _GATE_CFG, CODE_PATH_PREFIXES, CODE_PATH_EXACT
+    global HARD_CAP_ROUNDS, AUDIT_LOG, DESIGN_MARKER
+    global LEDGER_DIR, LAST_DEPLOYED, LAST_REVIEWED, DEPLOY_PIN, FINDINGS_DIR, VERDICT_DIR
+    REPO_ROOT = Path(os.path.realpath(root))
+    ONBOARDED = _onboarded(REPO_ROOT)
+    _GATE_CFG = _read_gate_config(REPO_ROOT)
+    CODE_PATH_PREFIXES, CODE_PATH_EXACT = _code_paths_from_config(_GATE_CFG)
+    HARD_CAP_ROUNDS = _hard_cap_from_config(_GATE_CFG)
+    AUDIT_LOG = REPO_ROOT / "logs" / "codex_review_audit.log"
+    DESIGN_MARKER = REPO_ROOT / ".claude" / ".design-approved"
+    ledger_override = os.environ.get("CODEX_LEDGER_DIR")
+    LEDGER_DIR = Path(ledger_override) if ledger_override else REPO_ROOT / "logs" / "review_ledger"
+    LAST_DEPLOYED = REPO_ROOT / ".claude" / ".last-deployed-sha"
+    LAST_REVIEWED = REPO_ROOT / ".claude" / ".last-reviewed-sha"
+    DEPLOY_PIN = REPO_ROOT / ".claude" / ".deploy-section-pin"
+    findings_override = os.environ.get("CODEX_FINDINGS_DIR")
+    FINDINGS_DIR = (Path(findings_override) if findings_override
+                    else REPO_ROOT / "logs" / "review_findings")
+    verdict_override = os.environ.get("CODEX_VERDICT_DIR")
+    VERDICT_DIR = (Path(verdict_override) if verdict_override
+                   else REPO_ROOT / "logs" / "review_verdicts")
+
+
+def _refresh_hook_repo_context(data: dict) -> "Path | None":
+    """Payload cwd авторитетен для выбора repo; не-git cwd оставляет контекст для fail-closed
+    проверки рассогласования.
+
+    Возвращает non-onboarded event root, когда уже активный контекст нельзя сразу выключать:
+    path сначала должен быть доказуемо локальным этому opt-out repo. Escape обратно в активный
+    parent тогда остаётся под G1.
+    """
+    cwd = data.get("cwd")
+    if not (isinstance(cwd, str) and cwd and Path(cwd).is_absolute()):
+        return None
+    detected = _detect_repo_root(Path(cwd))
+    if detected is None:
+        return None
+    detected_onboarded = _onboarded(detected)
+    if not detected_onboarded and _hooks_active():
+        return detected
+    if REPO_ROOT is None or Path(os.path.realpath(REPO_ROOT)) != detected:
+        _set_hook_repo_context(detected)
+    return detected if not detected_onboarded else None
 
 
 def _require_repo() -> bool:
@@ -568,9 +678,25 @@ def write_ledger(head_sha: str, diff_sha: str, baseline: str, verdict: ReviewVer
     }, ensure_ascii=False, indent=2))
 
 
-def _reviewers_key(reviewers: "list[dict] | None") -> "list[tuple[str, str]]":
-    return sorted((str(r.get("provider", "")), str(r.get("model", "")))
-                  for r in (reviewers or []) if isinstance(r, dict))
+def _reviewers_key(reviewers: "list[dict] | None") -> "list[tuple] | None":
+    rows = []
+    for r in reviewers or []:
+        if not isinstance(r, dict):
+            return None
+        actual = r.get("actual_models", [])
+        if not isinstance(actual, list) or not all(isinstance(v, str) for v in actual):
+            return None
+        rows.append((
+            str(r.get("role", "")),
+            str(r.get("provider", "")),
+            str(r.get("requested_model", "")),
+            str(r.get("model", "")),
+            tuple(actual),
+            str(r.get("family", "")),
+            str(r.get("certification_id", "")),
+            str(r.get("policy_id", "")),
+        ))
+    return sorted(rows)
 
 
 def read_valid_ledger(head_sha: str, diff_sha: str,
@@ -591,14 +717,31 @@ def read_valid_ledger(head_sha: str, diff_sha: str,
         # поля `reviewers` (легаси) годна только для запроса «только codex».
         cached = rec.get("reviewers")
         if cached is None or not isinstance(cached, list) or not cached:
-            if [pr for pr, _m in _reviewers_key(reviewers)] != ["codex"]:
+            if [str(r.get("provider", "")) for r in (reviewers or [])] != ["codex"]:
                 return None            # легаси-запись годна только для запроса «только codex»
-        elif _reviewers_key(cached) != _reviewers_key(reviewers):
-            return None
         else:
+            cached_key = _reviewers_key(cached)
+            requested_key = _reviewers_key(reviewers)
+            if cached_key is None or requested_key is None or cached_key != requested_key:
+                return None
             for r in cached:                       # переоценка по ТЕКУЩЕМУ allow-list
                 if r.get("provider") == "cursor" and r.get("model") not in _CURSOR_MODEL_ALLOW:
                     return None
+                role = r.get("role")
+                cert_id = r.get("certification_id")
+                if role in {"blocking", "supplemental"} and cert_id:
+                    policy_id, _certs = load_reviewer_certifications()
+                    requested_model = r.get("requested_model")
+                    if (not policy_id or r.get("policy_id") != policy_id
+                            or not _nonempty_str(requested_model)):
+                        return None
+                    cert = reviewer_certification(
+                        str(r.get("provider", "")),
+                        str(requested_model),
+                        str(role),
+                    )
+                    if cert is None or cert.certification_id != cert_id:
+                        return None
     v = ReviewVerdict(verdict=rec.get("verdict"),
                       findings=[tuple(f) for f in rec.get("findings", [])],
                       no_findings_marker=rec.get("no_findings_marker", False),
@@ -1130,7 +1273,8 @@ def _verdict_lock():
 
 def _write_deploy_verdict(head: str, baseline: "str | None", diff_sha: str,
                           ladder_st: str, empirical_st: str, codex_st: str,
-                          reviewers: "list[dict] | None" = None) -> int:
+                          reviewers: "list[dict] | None" = None,
+                          supplemental_findings: "list[dict] | None" = None) -> int:
     """Ф2: машиночитаемый вердикт для inframon. Delete-then-write под локом (R1-F2/R2-F2).
     0 = ок/best-effort-warning; 2 = блок (unlink упал, старый вердикт остался бы маскировать)."""
     path = VERDICT_DIR / f"{head}.json"
@@ -1140,6 +1284,7 @@ def _write_deploy_verdict(head: str, baseline: "str | None", diff_sha: str,
         "head_sha": head, "baseline_sha": baseline or "", "diff_sha256": diff_sha,
         "gates": {"ladder": ladder_st, "empirical": empirical_st, "codex": codex_st},
         "providers": reviewers if reviewers is not None else [],   # Ф1: кто судил (схема 2)
+        "supplemental_findings": supplemental_findings or [],
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     with _verdict_lock():
@@ -1210,14 +1355,27 @@ def _empirical_gate(baseline: str, head: str) -> int:
     return 0
 
 
-# ═══════ Ф1/Ф3: провайдеры ревью (спека 2026-07-25-reviewer-provider-switch-design.md) ═══════
-# REVIEW_PROVIDER=codex|cursor|both. Неизвестное значение → БЛОК (тихий фолбэк скрыл бы опечатку
-# и создал ложное впечатление «ревьюил тот, кого просили»). Адаптер cursor — В КОДЕ, а не в
-# шаблоне: allow-list модели, --trust, --mode ask и таймаут обязаны быть неотключаемыми.
-_PROVIDERS = ("codex", "cursor", "both")
+# ═══════ Ф1/Ф3/G4: reviewer adapters + portable resolver ═══════
+# REVIEW_PROVIDER отсутствует → portable. Legacy codex|cursor|both доступен только явно.
+# Неизвестное/пустое значение → БЛОК (тихий фолбэк скрыл бы опечатку и создал ложное
+# впечатление «ревьюил тот, кого просили»). Адаптер cursor — В КОДЕ, а не в шаблоне:
+# allow-list модели, --trust, --mode ask и таймаут обязаны быть неотключаемыми.
+_LEGACY_PROVIDERS = ("codex", "cursor", "both")
+_PORTABLE_PROFILES = ("portable", "strong", "gemini")
+_PROVIDERS = _LEGACY_PROVIDERS + _PORTABLE_PROFILES
 _CURSOR_MODEL = "cursor-grok-4.5-high"     # другое СЕМЕЙСТВО, чем codex (gpt-5.6-sol) → разнообразие
 _CURSOR_TIMEOUT_S = 600
 _CURSOR_DIFF_LIMIT = 300_000
+_GEMINI_MODEL = "gemini-2.5-pro"
+_GEMINI_TIMEOUT_S = 600
+_GEMINI_DIFF_LIMIT = 600_000
+_GEMINI_THINKING_BUDGET = 16_384
+_GEMINI_MAX_OUTPUT_TOKENS = 65_536
+_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+_CLAUDE_REQUESTED_MODEL = "opus"
+_CLAUDE_TIMEOUT_S = 900
+_CERTIFICATION_REGISTRY = Path(__file__).resolve().parent.parent / "reviewer_certifications.json"
+_CONSERVATIVE_AUTHOR_FAMILIES = frozenset({"anthropic", "openai"})
 # Разрешены ТОЛЬКО не-Anthropic модели: Claude пишет код в этом контуре, Claude-ревьюер молча
 # превращает независимый гейт в самопроверку. `auto` запрещён — скрытая маршрутизация.
 _CURSOR_MODEL_ALLOW = frozenset({
@@ -1228,6 +1386,78 @@ _CURSOR_MODEL_ALLOW = frozenset({
 })
 _VERDICT_LINE_RE = re.compile(r"^\s*Verdict:\s*(?:approve|needs-attention)\s*$",
                               re.IGNORECASE | re.MULTILINE)
+
+
+def model_family(model: str) -> str:
+    low = (model or "").strip().casefold()
+    if low.startswith("claude-") or low == "opus":
+        return "anthropic"
+    if (low.startswith(("gpt-", "codex-", "o1", "o3"))
+            or low in {"codex", "openai"}):
+        return "openai"
+    if low.startswith(("grok-", "cursor-grok-")):
+        return "xai"
+    if low.startswith("gemini-"):
+        return "google"
+    return "unknown"
+
+
+def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertification, ...]]":
+    """Shipped plugin registry only; repo config/env cannot add certified models."""
+    try:
+        raw = json.loads(_CERTIFICATION_REGISTRY.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return (None, ())
+    if not isinstance(raw, dict) or raw.get("schema") != 1 or not _nonempty_str(
+            raw.get("policy_id")):
+        return (None, ())
+    items = raw.get("certifications")
+    if not isinstance(items, list):
+        return (None, ())
+    parsed: list[ReviewerCertification] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return (None, ())
+        scalar = ("provider", "adapter", "requested_model", "family",
+                  "certification_id", "status")
+        if not all(_nonempty_str(item.get(k)) for k in scalar):
+            return (None, ())
+        actual = item.get("actual_models")
+        roles = item.get("roles")
+        if (not isinstance(actual, list) or len(actual) != 1
+                or not all(_nonempty_str(v) for v in actual)
+                or not isinstance(roles, list) or len(roles) != 1
+                or not all(v in {"blocking", "supplemental"} for v in roles)):
+            return (None, ())
+        family = str(item["family"]).casefold()
+        if family not in {"anthropic", "openai", "xai", "google", "local"}:
+            return (None, ())
+        if item["status"] not in {"candidate", "certified"}:
+            return (None, ())
+        if any(model_family(str(v)) != family for v in actual):
+            return (None, ())
+        parsed.append(ReviewerCertification(
+            provider=str(item["provider"]),
+            adapter=str(item["adapter"]),
+            requested_model=str(item["requested_model"]),
+            actual_models=tuple(str(v) for v in actual),
+            family=family,
+            roles=tuple(str(v) for v in roles),
+            certification_id=str(item["certification_id"]),
+            status=str(item["status"]),
+        ))
+    return (str(raw["policy_id"]), tuple(parsed))
+
+
+def reviewer_certification(provider: str, requested_model: str, role: str,
+                           *, allow_candidate: bool = False) -> "ReviewerCertification | None":
+    _policy, certs = load_reviewer_certifications()
+    for cert in certs:
+        if (cert.provider == provider and cert.requested_model == requested_model
+                and role in cert.roles
+                and (cert.status == "certified" or (allow_candidate and cert.status == "candidate"))):
+            return cert
+    return None
 
 
 def codex_model() -> str:
@@ -1248,14 +1478,17 @@ def codex_model() -> str:
 
 
 def resolve_providers() -> "tuple[tuple[str, ...] | None, str]":
-    """(провайдеры, сообщение об ошибке). None = неизвестное значение → блок (EARS-3)."""
+    """Legacy resolver. Portable profiles are resolved only by the certified-plan path."""
     raw = os.environ.get("REVIEW_PROVIDER")
     if raw is None:
-        return (("codex",), "")
+        return (None, "[codex-gate] ✗ REVIEW_PROVIDER не задан: universal default `portable` "
+                      "должен резолвиться через certified reviewer plan")
     v = raw.strip().lower()
     if v not in _PROVIDERS:
         return (None, f"[codex-gate] \u2717 REVIEW_PROVIDER={raw!r} неизвестен (ожидается "
                       f"{'|'.join(_PROVIDERS)}) — деплой остановлен, тихого фолбэка на codex НЕТ.")
+    if v in _PORTABLE_PROFILES:
+        return (None, f"[codex-gate] ✗ профиль {v!r} нельзя исполнять через legacy resolver")
     return ((("codex", "cursor") if v == "both" else (v,)), "")
 
 
@@ -1318,15 +1551,21 @@ def normalize_reviewer_text(text: str) -> "str | None":
     return block
 
 
-def _build_cursor_prompt(diff_text: str) -> str:
+def _build_reviewer_prompt(diff_text: str, *, role: str = "blocking") -> str:
     agents = ""
     if REPO_ROOT is not None and (REPO_ROOT / "AGENTS.md").exists():
         try:
             agents = (REPO_ROOT / "AGENTS.md").read_text()[:20000]
         except OSError:
             agents = ""
+    role_text = (
+        "You are the independent non-Anthropic blocking adversarial reviewer."
+        if role == "blocking"
+        else "You are the mandatory Claude supplemental advisory reviewer. You are not the "
+             "blocking reviewer and cannot replace or overrule the independent non-Anthropic run."
+    )
     return (
-        "You are an independent adversarial code reviewer. Review the diff below.\n"
+        f"{role_text} Review the diff below.\n"
         "Reply in EXACTLY this format and NOTHING else — no preamble, no markdown fences, and "
         "do NOT write the word 'Verdict:' anywhere except the very first line:\n"
         "first line 'Verdict: approve' or 'Verdict: needs-attention'; then a blank line; then "
@@ -1335,6 +1574,10 @@ def _build_cursor_prompt(diff_text: str) -> str:
         + (f"\nProject review constitution (AGENTS.md):\n{agents}\n" if agents else "")
         + _REVIEW_FOCUS + _adjudication_prompt_block()
         + f"\n\nDiff to review:\n```\n{diff_text}\n```\n")
+
+
+def _build_cursor_prompt(diff_text: str) -> str:
+    return _build_reviewer_prompt(diff_text, role="blocking")
 
 
 def _resolve_cursor_bin() -> "str | None":
@@ -1388,6 +1631,318 @@ def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
         return (None, "ответ не в контракте (нет ровно одного 'Verdict:') — narration или "
                       "цитата-пример; ревью не засчитано")
     return (normalized, f"model={model}")
+
+
+def _gemini_api_key() -> "str | None":
+    # Официальный приоритет Google SDK: GOOGLE_API_KEY над GEMINI_API_KEY. Значение никогда
+    # не возвращается в diagnostics/audit и не помещается в URL/argv.
+    return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+
+
+def _redact_known_secret(text: str, secret: "str | None") -> str:
+    """Pattern redaction is defense-in-depth; a credential we already hold is exact-match."""
+    without_known = text.replace(secret, _REDACTED) if secret else text
+    return redact_secrets(without_known)
+
+
+def resolve_gemini_model(*, allow_candidate: bool = False) -> "tuple[str | None, str]":
+    model = (os.environ.get("GEMINI_REVIEW_MODEL") or _GEMINI_MODEL).strip()
+    cert = reviewer_certification("gemini", model, "blocking",
+                                  allow_candidate=allow_candidate)
+    if cert is None:
+        return (None, f"[codex-gate] ✗ Gemini model {model!r} отсутствует в shipped "
+                      "certification registry для blocking-роли")
+    if cert.family in _CONSERVATIVE_AUTHOR_FAMILIES or cert.family == "unknown":
+        return (None, f"[codex-gate] ✗ Gemini model {model!r} не независима от "
+                      "консервативного author set")
+    return (model, "")
+
+
+def _cert_cache_record(cert: ReviewerCertification, role: str) -> dict:
+    policy_id, _certs = load_reviewer_certifications()
+    return {
+        "role": role,
+        "provider": cert.provider,
+        "requested_model": cert.requested_model,
+        "model": cert.actual_models[0] if len(cert.actual_models) == 1
+        else cert.requested_model,
+        "actual_models": list(cert.actual_models),
+        "family": cert.family,
+        "certification_id": cert.certification_id,
+        "policy_id": policy_id or "",
+    }
+
+
+def resolve_portable_review_plan(profile: str
+                                 ) -> "tuple[tuple[ReviewerCertification, ...] | None, str]":
+    """Blocking certs + final Claude supplemental cert. No repo config/provider auto-routing."""
+    if profile not in {"portable", "strong", "gemini"}:
+        return (None, f"неизвестный portable profile {profile!r}")
+    if profile == "strong":
+        return (None, "[codex-gate] ✗ профиль `strong` ещё не реализован: нужен второй "
+                      "аттестующий actual model independent adapter (direct xAI/local)")
+    gemini_model = (os.environ.get("GEMINI_REVIEW_MODEL") or _GEMINI_MODEL).strip()
+    gemini = reviewer_certification("gemini", gemini_model, "blocking")
+    supplemental = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, "supplemental")
+    available: list[ReviewerCertification] = []
+    if gemini is not None and _gemini_api_key():
+        available.append(gemini)
+    if profile == "gemini":
+        blocking = [gemini] if gemini is not None and _gemini_api_key() else []
+    else:
+        blocking = available[:1]
+    if not blocking:
+        candidate_hint = ""
+        if reviewer_certification("gemini", gemini_model, "blocking",
+                                  allow_candidate=True) is not None and _gemini_api_key():
+            candidate_hint = " Gemini model пока candidate: сначала прогони certification suite."
+        return (None, "[codex-gate] ✗ нет доступного certified независимого blocking reviewer. "
+                      "Настрой GOOGLE_API_KEY/GEMINI_API_KEY для certified Gemini; Cursor CLI "
+                      f"остаётся legacy, пока не аттестует actual model.{candidate_hint}")
+    families = [cert.family for cert in blocking]
+    if (any(f in _CONSERVATIVE_AUTHOR_FAMILIES or f == "unknown" for f in families)
+            or len(set(families)) != len(families)):
+        return (None, "[codex-gate] ✗ blocking reviewer panel не независима по семействам")
+    if supplemental is None:
+        return (None, "[codex-gate] ✗ обязательный Claude supplemental отсутствует в shipped "
+                      "certification registry")
+    return (tuple(blocking + [supplemental]), "")
+
+
+def _gemini_response_text(payload: dict) -> "tuple[str | None, str]":
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        feedback = payload.get("promptFeedback")
+        reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+        suffix = f": blockReason={reason}" if isinstance(reason, str) and reason else ""
+        return (None, "Gemini response без candidates" + suffix)
+    if len(candidates) != 1:
+        feedback = payload.get("promptFeedback")
+        reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+        if len(candidates) == 0 and isinstance(reason, str) and reason:
+            return (None, f"Gemini response candidates=0: blockReason={reason}")
+        return (None, f"Gemini response содержит candidates={len(candidates)}, ожидался один")
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return (None, "Gemini candidate изменил схему")
+    finish_reason = candidate.get("finishReason")
+    if finish_reason not in (None, "STOP"):
+        return (None, f"Gemini finishReason={redact_secrets(str(finish_reason))[:80]}")
+    content = candidate.get("content")
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list) or not parts:
+        return (None, "Gemini candidate не содержит непустой parts")
+    texts = [p.get("text") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)]
+    if not texts or len(texts) != len(parts):
+        return (None, "Gemini parts содержат неполный/нетекстовый ответ")
+    return ("".join(texts), "")
+
+
+def run_gemini_review_text(diff_text: str, *, allow_candidate: bool = False
+                           ) -> "tuple[str | None, str, str, dict]":
+    """Direct Gemini HTTPS adapter. Возвращает normalized text, actual model, detail, usage."""
+    model, err = resolve_gemini_model(allow_candidate=allow_candidate)
+    if model is None:
+        return (None, "", err, {})
+    cert = reviewer_certification("gemini", model, "blocking",
+                                  allow_candidate=allow_candidate)
+    key = _gemini_api_key()
+    if not key:
+        return (None, "", "нет GOOGLE_API_KEY/GEMINI_API_KEY", {})
+    if len(diff_text) > _GEMINI_DIFF_LIMIT:
+        return (None, "", f"дифф {len(diff_text)} символов > лимита {_GEMINI_DIFF_LIMIT}", {})
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": [
+            {"text": _build_reviewer_prompt(diff_text, role="blocking")},
+        ]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            # Gemini 2.5 Pro cannot disable thinking. Bound it explicitly and leave enough of
+            # the model's 65k output window for the strict verdict after thought tokens.
+            "thinkingConfig": {"thinkingBudget": _GEMINI_THINKING_BUDGET},
+            "maxOutputTokens": _GEMINI_MAX_OUTPUT_TOKENS,
+            "responseMimeType": "text/plain",
+        },
+    }).encode()
+    url = _GEMINI_ENDPOINT.format(model=model)
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_GEMINI_TIMEOUT_S) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode(errors="replace")
+        except OSError:
+            detail = str(exc.reason)
+        return (None, "", _redact_known_secret(detail, key)[:300], {})
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        detail = _redact_known_secret(f"{type(exc).__name__}: {exc}", key)
+        return (None, "", detail[:300], {})
+    try:
+        envelope = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError, TypeError):
+        return (None, "", "Gemini response не JSON", {})
+    actual = envelope.get("modelVersion")
+    if not isinstance(actual, str) or cert is None or actual not in cert.actual_models:
+        return (None, str(actual or ""), "Gemini modelVersion не совпал с certification registry",
+                {})
+    text, envelope_detail = _gemini_response_text(envelope)
+    if text is None:
+        return (None, actual, envelope_detail, {})
+    normalized = normalize_reviewer_text(text or "")
+    if normalized is None:
+        return (None, actual, "Gemini ответ не прошёл строгий verdict-контракт", {})
+    usage = envelope.get("usageMetadata")
+    return (normalized, actual, "", usage if isinstance(usage, dict) else {})
+
+
+def run_gemini_review(base: str, head: str) -> "ReviewerRun":
+    requested = (os.environ.get("GEMINI_REVIEW_MODEL") or _GEMINI_MODEL).strip()
+    cert = reviewer_certification("gemini", requested, "blocking")
+    if cert is None:
+        return ReviewerRun("blocking", "gemini", requested, (), "google", "",
+                           "unavailable", detail="нет certified Gemini model")
+    try:
+        diff_text = subprocess.run(
+            ["git", "diff", f"{base}..{head}"], cwd=REPO_ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        return ReviewerRun("blocking", "gemini", requested, (), cert.family,
+                           cert.certification_id, "invalid",
+                           detail=f"не получить дифф: {type(exc).__name__}")
+    text, actual, detail, usage = run_gemini_review_text(diff_text)
+    if text is None:
+        return ReviewerRun("blocking", "gemini", requested,
+                           (actual,) if actual else (), cert.family, cert.certification_id,
+                           "invalid", detail=detail, usage=usage)
+    verdict = parse_review_output(text)
+    return ReviewerRun("blocking", "gemini", requested, (actual,), cert.family,
+                       cert.certification_id, "ok" if verdict.valid else "invalid",
+                       verdict=verdict if verdict.valid else None,
+                       detail="" if verdict.valid else "невалидный verdict", usage=usage)
+
+
+def _resolve_claude_bin() -> "str | None":
+    # Mandatory artifact must not be satisfiable by an arbitrary PATH shim. These are the
+    # supported native/Homebrew/system install locations; absence is fail-closed with setup
+    # guidance. The exact server-side model is independently checked in modelUsage below.
+    home = Path.home()
+    fixed = (
+        home / ".local" / "bin" / "claude",
+        home / ".claude" / "local" / "claude",
+        home / ".volta" / "bin" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    )
+    # npm under nvm has no stable version component. Enumerate only the known nvm install root,
+    # never arbitrary PATH; newest lexical version wins and the resolved binary is audited.
+    nvm = sorted((home / ".nvm" / "versions" / "node").glob("*/bin/claude"), reverse=True)
+    for cand in (*fixed, *nvm):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def run_claude_supplemental(base: str, head: str) -> "ReviewerRun":
+    cert = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, "supplemental")
+    if cert is None:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           "anthropic", "", "unavailable",
+                           detail="нет certified Claude supplemental model")
+    binary = _resolve_claude_bin()
+    if binary is None:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "unavailable",
+                           detail="claude CLI не найден")
+    try:
+        resolved_binary = str(Path(binary).resolve(strict=True))
+    except OSError:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "unavailable",
+                           detail="claude CLI path не резолвится")
+    audit(f"claude-supplemental bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
+    try:
+        diff_text = subprocess.run(
+            ["git", "diff", f"{base}..{head}"], cwd=REPO_ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError) as exc:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "invalid",
+                           detail=f"не получить дифф: {type(exc).__name__}")
+    cmd = [
+        binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
+        "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, cwd=REPO_ROOT, input=_build_reviewer_prompt(
+                diff_text, role="supplemental"),
+            capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "timeout",
+                           detail=f"таймаут {_CLAUDE_TIMEOUT_S}s")
+    except OSError as exc:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "unavailable",
+                           detail=redact_secrets(f"{type(exc).__name__}: {exc}")[:300])
+    if result.returncode != 0:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "invalid",
+                           detail=redact_secrets((result.stderr or result.stdout or "").strip())[:300])
+    try:
+        envelope = json.loads((result.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
+                           cert.family, cert.certification_id, "invalid",
+                           detail="Claude output не JSON")
+    model_usage = envelope.get("modelUsage")
+    actual_models = tuple(sorted(model_usage)) if isinstance(model_usage, dict) else ()
+    allowed_actual_sets = {(model,) for model in cert.actual_models}
+    if envelope.get("is_error") is not False or actual_models not in allowed_actual_sets:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, actual_models,
+                           cert.family, cert.certification_id, "invalid",
+                           detail="Claude actual model/error не совпал с certification registry")
+    normalized = normalize_reviewer_text(envelope.get("result") or "")
+    verdict = parse_review_output(normalized or "")
+    if normalized is None or not verdict.valid:
+        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, actual_models,
+                           cert.family, cert.certification_id, "invalid",
+                           detail="Claude ответ не прошёл строгий verdict-контракт")
+    usage = envelope.get("usage")
+    return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, actual_models,
+                       cert.family, cert.certification_id, "ok", verdict=verdict,
+                       usage=usage if isinstance(usage, dict) else {})
+
+
+def run_certified_reviewer(cert: ReviewerCertification, base: str, head: str) -> ReviewerRun:
+    if cert.roles == ("blocking",):
+        role = "blocking"
+    elif cert.roles == ("supplemental",):
+        role = "supplemental"
+    else:
+        return ReviewerRun("blocking", cert.provider, cert.requested_model, (), cert.family,
+                           cert.certification_id, "invalid",
+                           detail="certification должна иметь ровно одну однозначную role")
+    if cert.provider == "gemini":
+        return run_gemini_review(base, head)
+    if cert.provider == "claude" and role == "supplemental":
+        return run_claude_supplemental(base, head)
+    if cert.provider == "cursor":
+        return ReviewerRun(role, cert.provider, cert.requested_model, (), cert.family,
+                           cert.certification_id, "unavailable",
+                           detail="Cursor CLI не аттестует actual model; только legacy adapter")
+    return ReviewerRun(role, cert.provider, cert.requested_model, (), cert.family,
+                       cert.certification_id, "unavailable",
+                       detail=f"adapter {cert.adapter!r} не реализован")
 
 
 def review_with_provider(provider: str, base: str,
@@ -1502,17 +2057,33 @@ def check_reviewed_cli() -> int:
         return 0
     head = head_before                        # R2-F2: биндим ledger/reviewed к захваченному SHA
     diff_sha = diff_sha256(baseline, head_before)
-    providers, perr = resolve_providers()     # Ф1: неизвестное значение → блок (EARS-3)
-    if providers is None:
-        print(perr, file=sys.stderr)
-        return 2
-    cursor_model, merr = (resolve_cursor_model() if "cursor" in providers else ("codex", ""))
-    if "cursor" in providers and cursor_model is None:
-        print(merr, file=sys.stderr)          # EARS-4: allow-list моделей в коде
-        return 2
-    requested_reviewers = [{"provider": p,
-                            "model": (cursor_model if p == "cursor" else codex_model())}
-                           for p in providers]
+    raw_provider = os.environ.get("REVIEW_PROVIDER")
+    raw_profile = "portable" if raw_provider is None else raw_provider.strip().casefold()
+    portable_profile = raw_profile in _PORTABLE_PROFILES
+    portable_certs: tuple[ReviewerCertification, ...] = ()
+    if portable_profile:
+        plan, perr = resolve_portable_review_plan(raw_profile)
+        if plan is None:
+            print(perr, file=sys.stderr)
+            return 2
+        portable_certs = plan
+        requested_reviewers = [
+            _cert_cache_record(cert, "supplemental" if "supplemental" in cert.roles else "blocking")
+            for cert in portable_certs
+        ]
+        providers = tuple(cert.provider for cert in portable_certs)
+    else:
+        providers, perr = resolve_providers()     # legacy Ф1: неизвестное → блок (EARS-3)
+        if providers is None:
+            print(perr, file=sys.stderr)
+            return 2
+        cursor_model, merr = (resolve_cursor_model() if "cursor" in providers else ("codex", ""))
+        if "cursor" in providers and cursor_model is None:
+            print(merr, file=sys.stderr)          # EARS-4: allow-list моделей в коде
+            return 2
+        requested_reviewers = [{"provider": p,
+                                "model": (cursor_model if p == "cursor" else codex_model())}
+                               for p in providers]
     audit("review-providers запрошены: "                   # EARS-5: кто судил — в аудит
           + ", ".join(f"{r['provider']}({r['model']})" for r in requested_reviewers))
     if read_valid_ledger(head, diff_sha, requested_reviewers) is not None:
@@ -1553,22 +2124,44 @@ def check_reviewed_cli() -> int:
     review_started_ts = _time.time()   # для ts-guard needs_review_round (спор F3-3)
     # Ф3: КАЖДЫЙ запрошенный провайдер ревьюит один и тот же дифф в ОДНОМ прогоне; второй проход
     # выполняется ДАЖЕ при blocking у первого (union за один раунд — адъюдикация разом, EARS-14b).
-    results, failures, advisory = [], [], []
-    for prov in providers:
-        v, model, detail = review_with_provider(prov, baseline, head)
-        if v is None:
-            failures.append((prov, model, detail))
-            print(f"[codex-gate] ✗ ревьюер {prov} ({model}) не дал валидный вердикт: {detail}",
+    results, failures, supplemental_advisory = [], [], []
+    if portable_profile:
+        for cert in portable_certs:
+            run = run_certified_reviewer(cert, baseline, head)
+            actual = ",".join(run.actual_models) or run.requested_model
+            audit(f"review-run role={run.role} provider={run.provider} actual={actual} "
+                  f"family={run.family} certification={run.certification_id} status={run.status}")
+            if run.status != "ok" or run.verdict is None:
+                failures.append((run.provider, actual, run.detail))
+                print(f"[codex-gate] ✗ {run.role} ревьюер {run.provider} ({actual}) "
+                      f"не дал валидный artifact: {run.detail}", file=sys.stderr)
+                continue
+            if run.role == "blocking":
+                results.append((run.provider, actual, run.verdict))
+            else:
+                for sev, title in run.verdict.findings:
+                    supplemental_advisory.append((sev, title, run.provider))
+                    audit(f"supplemental-finding provider={run.provider} severity={sev} "
+                          f"title={redact_secrets(title)!r}")
+            print(f"[codex-gate] {run.role} ревьюер {run.provider} ({actual}): "
+                  f"{run.verdict.verdict}, находок {len(run.verdict.findings)}", file=sys.stderr)
+    else:
+        for prov in providers:
+            v, model, detail = review_with_provider(prov, baseline, head)
+            if v is None:
+                failures.append((prov, model, detail))
+                print(f"[codex-gate] ✗ ревьюер {prov} ({model}) не дал валидный вердикт: {detail}",
+                      file=sys.stderr)
+                continue
+            results.append((prov, model, v))
+            print(f"[codex-gate] ревьюер {prov} ({model}): {v.verdict}, находок {len(v.findings)}",
                   file=sys.stderr)
-            continue
-        results.append((prov, model, v))
-        print(f"[codex-gate] ревьюер {prov} ({model}): {v.verdict}, находок {len(v.findings)}",
-              file=sys.stderr)
     # union находок с пометкой провайдера (EARS-12/15)
     blocking = [(sev, title, prov) for prov, _m, v in results for sev, title in v.findings
                 if sev in SEVERITY_BLOCKING or sev not in KNOWN_SEVERITIES]
-    advisory = [(sev, title, prov) for prov, _m, v in results for sev, title in v.findings
-                if sev in KNOWN_SEVERITIES and sev not in SEVERITY_BLOCKING]
+    advisory = ([(sev, title, prov) for prov, _m, v in results for sev, title in v.findings
+                 if sev in KNOWN_SEVERITIES and sev not in SEVERITY_BLOCKING]
+                + supplemental_advisory)
     if failures:
         # EARS-14: отказ ЛЮБОГО → блок без деградации; EARS-14c: находки успешного ВЛИВАЕМ
         # (partial: rounds не инкрементим, needs_review_round не сбрасываем)
@@ -1581,13 +2174,19 @@ def check_reviewed_cli() -> int:
             print("[codex-gate] находки успевшего ревьюера сохранены в серию (частичный раунд: "
                   "счётчик раундов НЕ увеличен)", file=sys.stderr)
         names = ", ".join(f"{p}" for p, _m, _d in failures)
+        downgrade = ("Portable review не деградирует до Codex/Claude; настрой certified backend."
+                     if portable_profile else
+                     "Осознанное legacy-понижение: REVIEW_PROVIDER=codex (или cursor).")
         print(f"[codex-gate] ✗ не все запрошенные ревьюеры отработали ({names}) — деплой "
-              "остановлен без деградации до одного. Осознанное понижение: REVIEW_PROVIDER=codex "
-              "(или cursor).\n"
+              f"остановлен без деградации до одного. {downgrade}\n"
               "ML6 (аварийный контур, если СЕЙЧАС идёт инцидент актуатора): СНАЧАЛА kill-switch "
               "проекта (freeze — останавливает актуатор без ревьюера); ЗАТЕМ при необходимости "
               "rollback (пока заморожено). Rollback БЕЗ freeze актуатор НЕ останавливает. "
               "Ремонт — через гейт.", file=sys.stderr)
+        return 2
+    if not results:
+        print("[codex-gate] ✗ review plan не содержит успешного blocking reviewer — деплой "
+              "остановлен (fail-closed)", file=sys.stderr)
         return 2
     verdict = results[0][2]      # для кэша достаточно любого валидного (union решает ниже)
     with findings_lock():        # догфуд F3: RE-LOAD под локом — ревью шло минуты, конкурентная
@@ -1600,14 +2199,20 @@ def check_reviewed_cli() -> int:
         save_findings_ledger(led)
         decision, msg = convergence_decision(led)
     if decision == "allow":
-        if not blocking:      # кэшируем ТОЛЬКО чистый UNION всех провайдеров (не первого)
+        if not blocking and not supplemental_advisory:
+            # Кэшируем только полностью чистый run. Иначе следующий deploy обязан заново
+            # получить supplemental artifact, чтобы advisory не исчезла из audit/verdict.
             write_ledger(head, diff_sha, baseline, verdict, requested_reviewers)   # кэш
         _record_reviewed(head)
         for sev, title, prov in advisory:      # совещательные — с пометкой провайдера
             print(f"    [{sev}] ({prov}) {title}", file=sys.stderr)
         l_st, e_st, c_st = _verdict_statuses("allow")
+        supplemental_records = [
+            {"severity": sev, "title": title, "provider": prov}
+            for sev, title, prov in supplemental_advisory
+        ]
         if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st,
-                                 requested_reviewers):
+                                 requested_reviewers, supplemental_records):
             return 2
         print(msg)
         print("[codex-gate] ✓ деплой разрешён (протокол сходимости)")
@@ -1639,8 +2244,10 @@ def is_code_path(path: str) -> bool:
     if pp.is_absolute():
         if REPO_ROOT is None:
             return False
+        root = Path(os.path.realpath(REPO_ROOT))
+        candidate = Path(os.path.realpath(pp))
         try:
-            p = str(pp.relative_to(REPO_ROOT))
+            p = str(candidate.relative_to(root))
         except ValueError:
             return False   # абсолютный путь вне репозитория — не наш код-путь
     # схлопнуть ../ (docs/../app/x.py → app/x.py; Codex P2). normpath делает это сам — БЕЗ
@@ -1649,7 +2256,17 @@ def is_code_path(path: str) -> bool:
     # (регресс проекта-источника, покрыт тестом).
     p = os.path.normpath(p)
     # Жёсткие пути — ДО конфига и экземпций (ML-P1: конфиг не может вывести их из-под гейта)
-    if p in HARD_CODE_PATH_EXACT or any(p.startswith(pre) for pre in HARD_CODE_PATH_PREFIXES):
+    framed = "/" + p.lstrip("/")
+    hard_p = p.casefold()
+    hard_framed = framed.casefold()
+    if (hard_p in {item.casefold() for item in HARD_CODE_PATH_EXACT}
+            or any(hard_p.startswith(pre.casefold()) for pre in HARD_CODE_PATH_PREFIXES)
+            or any(component.casefold() in hard_framed
+                   for component in HARD_CODE_PATH_COMPONENTS)
+            or hard_p == "hooks/hooks.json"
+            or hard_p.endswith("/hooks/hooks.json")
+            or hard_p == "reviewer_certifications.json"
+            or hard_p.endswith("/reviewer_certifications.json")):
         return True
     if CODE_PATH_PREFIXES is None:
         return True   # строгий режим (нет/битый конфиг): ВСЁ код, экземпций нет (решение 1)
@@ -1847,6 +2464,149 @@ def _deny(msg: str) -> int:
     return 2
 
 
+class PatchEnvelopeError(ValueError):
+    """Codex apply_patch payload не соответствует измеренному wire-контракту."""
+
+
+_PATCH_PATH_RE = re.compile(
+    r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (?P<path>.+)$")
+_PATCH_PATH_PREFIXES = (
+    "*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:")
+_HOOK_PATH_KEYS = (
+    "file_path", "notebook_path", "path",
+    "source_path", "destination_path", "old_path", "new_path", "from_path", "to_path",
+    "sourcePath", "destinationPath", "oldPath", "newPath", "fromPath", "toPath",
+    "source", "destination", "src", "dst", "dest", "target", "target_path", "targetPath",
+)
+
+
+def _is_file_mutator_tool(tool_name_low: str) -> bool:
+    if not tool_name_low:
+        return True
+    if re.match(r"^(?:(?:multi_?)?edit|write|notebook_?edit|apply_?patch)", tool_name_low):
+        return True
+    if not tool_name_low.startswith("mcp__") or "__" not in tool_name_low:
+        return False
+    suffix = tool_name_low.rsplit("__", 1)[-1]
+    if any(verb in suffix for verb in ("edit", "write", "patch", "replace", "truncate")):
+        return True
+    mutates = any(verb in suffix for verb in (
+        "create", "update", "save", "delete", "remove", "move", "rename", "append", "copy"))
+    resource = any(noun in suffix for noun in ("file", "path", "folder", "directory"))
+    return mutates and resource
+
+
+def _apply_patch_paths(command: object) -> list[str]:
+    """Извлечь ВСЕ исходные/целевые пути из Codex apply_patch envelope.
+
+    Известный apply_patch с битым/дрейфнувшим envelope не может означать «не-кодовый патч»:
+    вызывающий блокирует его fail-closed. Строки содержимого, включая `+*** ...`, заголовками
+    не являются; проверяются только точные control-lines без diff-префикса.
+    """
+    if not isinstance(command, str):
+        raise PatchEnvelopeError("command не строка")
+    lines = command.splitlines()
+    if len(lines) < 3 or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
+        raise PatchEnvelopeError("нет полного Begin/End envelope")
+    paths: list[str] = []
+    for line in lines[1:-1]:
+        match = _PATCH_PATH_RE.fullmatch(line)
+        if match:
+            path = match.group("path").strip()
+            if not path or "\x00" in path:
+                raise PatchEnvelopeError("пустой/невалидный путь")
+            paths.append(path)
+        elif line.startswith(_PATCH_PATH_PREFIXES):
+            # Похожий на control-line заголовок с пустым путём/дрейфом грамматики.
+            raise PatchEnvelopeError("невалидный path header")
+        elif line.startswith("*** ") and line != "*** End of File":
+            # Новый control-header нельзя игнорировать рядом с известным docs-путём: иначе
+            # schema drift мог бы спрятать кодовый путь и превратить патч в «не-кодовый».
+            raise PatchEnvelopeError("неизвестный control header")
+    if not paths:
+        raise PatchEnvelopeError("в envelope нет путей")
+    return paths
+
+
+def _hook_path_is_code(path: str, data: dict, *, require_cwd: bool = False) -> bool:
+    """Классифицировать hook path относительно фактического cwd события.
+
+    apply_patch передаёт относительные пути. Сначала превращаем их в абсолютные от payload.cwd,
+    затем существующий is_code_path безопасно нормализует до REPO_ROOT и отвергает выход наружу.
+    """
+    root = Path(os.path.realpath(REPO_ROOT)) if REPO_ROOT is not None else None
+    if root is None and require_cwd:
+        raise PatchEnvelopeError("repo root отсутствует")
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and cwd and Path(cwd).is_absolute():
+        normalized_cwd = Path(os.path.realpath(cwd))
+        if root is None:
+            return is_code_path(path)
+        try:
+            normalized_cwd.relative_to(root)
+        except ValueError:
+            if require_cwd:
+                raise PatchEnvelopeError("cwd вне repo root")
+            return is_code_path(path)
+        lexical_candidate = (Path(os.path.abspath(path)) if Path(path).is_absolute()
+                             else Path(os.path.abspath(normalized_cwd / path)))
+        candidate = Path(os.path.realpath(lexical_candidate))
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            if require_cwd:
+                raise PatchEnvelopeError("patch path вне repo root")
+            try:
+                lexical_candidate.relative_to(root)
+            except ValueError:
+                return False   # явная внешняя цель: opt-in isolation, не наш проект
+            return True        # лексически внутри repo, но symlink ушёл наружу → блок
+        return is_code_path(str(candidate))
+    if Path(path).is_absolute():
+        lexical_candidate = Path(os.path.abspath(path))
+        candidate = Path(os.path.realpath(path))
+        if root is not None:
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                if require_cwd:
+                    raise PatchEnvelopeError("patch path вне repo root")
+                try:
+                    lexical_candidate.relative_to(root)
+                except ValueError:
+                    return False   # явная внешняя цель: плагин не вмешивается
+                return True        # symlink из repo наружу
+        return is_code_path(str(candidate))
+    if require_cwd:
+        raise PatchEnvelopeError("cwd отсутствует/не абсолютный")
+    return is_code_path(path)  # Claude legacy payload: сохраняем прежнее поведение
+
+
+def _hook_candidate_path(path: str, data: dict) -> "Path | None":
+    """Абсолютная realpath-цель hook path; None, если относительный путь не к чему привязать."""
+    pp = Path(path)
+    if pp.is_absolute():
+        return Path(os.path.realpath(pp))
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and cwd and Path(cwd).is_absolute():
+        return Path(os.path.realpath(Path(cwd) / pp))
+    return None
+
+
+def _hook_paths_stay_inside(paths: "list[str]", data: dict, root: Path) -> bool:
+    """True только когда каждую цель можно доказуемо оставить внутри opt-out event repo."""
+    resolved_root = Path(os.path.realpath(root))
+    for path in paths:
+        candidate = _hook_candidate_path(path, data)
+        if candidate is None:
+            return False
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError:
+            return False
+    return True
+
+
 def _hook_session(data: dict) -> str:
     return data.get("session_id") or _env_session()
 
@@ -1894,16 +2654,88 @@ def _design_gate(session: str, drift_msg: str, unreviewed_msg: str) -> int:
 
 
 def gate_edit_cli(hook_json: str) -> int:
-    if not _hooks_active():   # BS-P1: не-онбордженный проект / не git-репо → плагин молчит
-        return 0
     try:
         data = json.loads(hook_json or "{}")
     except json.JSONDecodeError:
+        return (_deny("[codex-gate] edit-hook payload не JSON — правка заблокирована "
+                      "(fail-closed)") if _hooks_active() else 0)
+    if not isinstance(data, dict):
+        return (_deny("[codex-gate] edit-hook payload изменил схему — правка заблокирована "
+                      "(fail-closed)") if _hooks_active() else 0)
+    non_onboarded_event_root = _refresh_hook_repo_context(data)
+    if not _hooks_active():   # BS-P1: не-онбордженный проект / не git-репо → плагин молчит
         return 0
     ti = data.get("tool_input") or {}
-    path = ti.get("file_path") or ti.get("notebook_path", "")   # NotebookEdit шлёт notebook_path
-    if not (path and is_code_path(path)):
-        return 0
+    if not isinstance(ti, dict):
+        return _deny("[codex-gate] edit-hook tool_input изменил схему — правка заблокирована "
+                     "(fail-closed)")
+    tool_name = data.get("tool_name")
+    tool_name_low = tool_name.casefold() if isinstance(tool_name, str) else ""
+    file_tool = _is_file_mutator_tool(tool_name_low)
+    # Claude-native tools use file_path/notebook_path; MCP move/rename tools commonly expose
+    # source+destination. Preserve every known path so a docs→code move cannot hide its target.
+    paths = []
+    known_path_keys = set(_HOOK_PATH_KEYS)
+    for key in _HOOK_PATH_KEYS:
+        if key not in ti:
+            continue
+        value = ti.get(key)
+        if not isinstance(value, str) or not value:
+            return _deny(f"[codex-gate] edit-hook payload path {key!r} изменил схему — "
+                         "правка заблокирована (fail-closed)")
+        if value not in paths:
+            paths.append(value)
+    for key in ti:
+        if key in known_path_keys or not isinstance(key, str):
+            continue
+        snake_key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).casefold()
+        words = set(filter(None, re.split(r"[^a-z0-9]+", snake_key)))
+        compact = re.sub(r"[^a-z0-9]", "", snake_key)
+        pathlike = (
+            bool(words & {"path", "paths", "file", "files", "folder",
+                          "directory", "dir", "uri", "uris", "output",
+                          "destination", "destinations", "dest", "dst",
+                          "target", "targets"})
+            or "path" in compact
+            or compact.startswith(("dest", "source", "src", "dst", "target", "output"))
+            or (compact.endswith(("file", "files", "folder", "directory", "dir", "uri"))
+                and compact != "profile")
+        )
+        if pathlike:
+            return _deny(f"[codex-gate] edit-hook payload содержит неизвестный path-like key "
+                         f"{key!r} — правка заблокирована (fail-closed)")
+    command = ti.get("command")
+    is_patch = (bool(re.search(r"(?:^|__)apply_?patch", tool_name_low))
+                or (isinstance(command, str) and bool(command)
+                    and not paths))
+    if is_patch:
+        try:
+            paths = _apply_patch_paths(command)
+            if (non_onboarded_event_root is not None
+                    and _hook_paths_stay_inside(paths, data, non_onboarded_event_root)):
+                return 0
+            touches_code = any(_hook_path_is_code(path, data, require_cwd=True)
+                               for path in paths)
+        except PatchEnvelopeError as exc:
+            reason = str(exc)
+            if "cwd" in reason or "repo root" in reason or "path вне" in reason:
+                return _deny("[codex-gate] apply_patch cwd/path нельзя доказуемо привязать к "
+                             f"целевому repo ({reason}) — правка заблокирована (fail-closed)")
+            return _deny("[codex-gate] apply_patch envelope повреждён или изменил схему "
+                         f"({reason}) — правка заблокирована (fail-closed)")
+        if not touches_code:
+            return 0
+    else:
+        if not paths:
+            if not file_tool:
+                return 0
+            return _deny("[codex-gate] edit-hook payload не распознан: нет patch command или "
+                         "file/notebook path — правка заблокирована (fail-closed)")
+        if (non_onboarded_event_root is not None
+                and _hook_paths_stay_inside(paths, data, non_onboarded_event_root)):
+            return 0
+        if not any(_hook_path_is_code(path, data) for path in paths):
+            return 0
     session = _hook_session(data)
     if not session:   # сессию не определить → fail-open (design-гейт), не блокируем всю работу
         print("[codex-gate] сессия неизвестна — дизайн-гейт пропускает (fail-open)", file=sys.stderr)
@@ -1917,13 +2749,19 @@ def gate_edit_cli(hook_json: str) -> int:
 
 
 def gate_bash_cli(hook_json: str) -> int:
-    if not _hooks_active():   # BS-P1
-        return 0
     try:
         data = json.loads(hook_json or "{}")
     except json.JSONDecodeError:
         return 0
-    command = (data.get("tool_input") or {}).get("command", "")
+    if not isinstance(data, dict):
+        return 0
+    _refresh_hook_repo_context(data)
+    if not _hooks_active():   # BS-P1
+        return 0
+    ti = data.get("tool_input")
+    # G1 Bash — документированный best-effort/fail-open путь: schema drift не должен падать
+    # traceback'ом и превращать hook-runtime error в неясный блок.
+    command = ti.get("command", "") if isinstance(ti, dict) else ""
     if not (command and bash_touches_code(command)):
         return 0
     session = _hook_session(data)

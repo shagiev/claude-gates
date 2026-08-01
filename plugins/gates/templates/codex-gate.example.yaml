@@ -17,8 +17,11 @@ code_paths:
     - "config.yaml"
     - "requirements.txt"
     - "pyproject.toml"
-  # NB: .codex-gate.yaml, Makefile, .githooks/ — ВСЕГДА код (жёстко в коде гейта,
-  # отключить конфигом нельзя). docs/**, *.md, .claude/** — не код (кроме строгого режима).
+  # NB: control-plane ВСЕГДА код (отключить конфигом нельзя): .codex-gate.yaml, Makefile,
+  # .githooks/, .codex/{hooks.json,config.toml}, .claude/settings*.json, plugin/marketplace
+  # manifests, hooks/hooks.json, reviewer_certifications.json, reviewer_corpus/ и служебные
+  # review/deploy markers. Актуальный список — HARD_CODE_PATH_* в codex_review_gate.py.
+  # docs/**, *.md, прочие .claude/** — не код (кроме строгого режима).
 
 ladder:
   # false гасит ТОЛЬКО pre-commit проверку (удобство разработчика);

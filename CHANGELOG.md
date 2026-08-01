@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0 — 2026-08-01
+
+- **Один cross-host plugin для Claude Code и Codex:** добавлены Codex manifest/marketplace,
+  разбор настоящего `apply_patch` и проверенный install/activation smoke доставленного
+  PreToolUse hook на Codex CLI 0.146.0. Claude manifest и marketplace синхронно подняты до
+  `0.7.0`.
+- **Portable reviewer protocol:** обязательный независимый non-Anthropic blocking run плюс
+  отдельный Claude supplemental run; Claude не может заменить blocking reviewer. Нет
+  сертифицированного независимого backend — deploy-review блокируется, а не считается чистым.
+- Прямой Gemini HTTPS adapter и certification corpus/runner добавлены, но Gemini остаётся
+  `candidate` до живой сертификации с реальным ключом. Cursor не требуется для установки и
+  остаётся только явным legacy-режимом; portable resolver его не выбирает.
+- Универсальный default — `portable`; для существующих проектов это намеренная fail-closed
+  миграция. Все новые control-plane пути включены в жёсткие code paths, добавлены тесты схем,
+  resolver/adapter отказов, редакции секретов и Codex hook envelope.
+- Проверка релиза: 556 тестов, validator Codex plugin, живой Codex install/activation smoke,
+  независимый Grok review и дополнительный Claude Opus review функционального среза.
+
 ## 0.6.0 — 2026-07-26
 
 - **Pre-push интеграционный гейт** (`prepush_gate.py` + шим `.githooks/pre-push`). Обещание

@@ -43,9 +43,11 @@ def _verdict():
 
 # ═══ P1/P7 + M1-M4: резолюция провайдера и allow-list модели ═══
 
-def test_p1_default_is_codex(monkeypatch):
+def test_p1_unset_provider_is_not_legacy_codex(monkeypatch):
     monkeypatch.delenv("REVIEW_PROVIDER", raising=False)
-    assert g.resolve_providers()[0] == ("codex",)
+    providers, err = g.resolve_providers()
+    assert providers is None
+    assert "universal default `portable`" in err
 
 
 def test_p7_unknown_provider_blocks(gate, monkeypatch):
@@ -216,6 +218,7 @@ def test_p18_tightened_allow_list_invalidates_cache(gate, monkeypatch):
 
 def _fake_cursor(monkeypatch, *, rc=0, stdout=None, raises=None):
     """Подменяет subprocess.run ТОЛЬКО для cursor-agent — тело run_cursor_review исполняется."""
+    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: "/opt/cursor-agent")
     real = g.subprocess.run
     def fake(cmd, **kw):
         # сопоставляем по БАЗОВОМУ имени: адаптер вызывает абсолютный путь (F2), и проверка

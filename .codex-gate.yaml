@@ -4,10 +4,14 @@ code_paths:
     - "plugins/gates/scripts/"
     - "plugins/gates/hooks/"
     - "plugins/gates/templates/"
+    - "plugins/gates/reviewer_corpus/"
     - "tests/"
   exact:
     - "plugins/gates/.claude-plugin/plugin.json"
+    - "plugins/gates/.codex-plugin/plugin.json"
+    - "plugins/gates/reviewer_certifications.json"
     - ".claude-plugin/marketplace.json"
+    - ".agents/plugins/marketplace.json"
 
 ladder:
   enabled: true
