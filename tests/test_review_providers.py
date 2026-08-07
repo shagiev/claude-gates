@@ -97,121 +97,29 @@ def test_n3_n4_no_verdict_or_invalid():
 
 # ═══ P2/P3: cursor как единственный провайдер ═══
 
-def test_p2_cursor_clean_allows(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "cursor")
-    _providers(monkeypatch, cursor=_CLEAN)
-    assert g.check_reviewed_cli() == 0
-    v = _verdict()
-    assert v["providers"] == [{"provider": "cursor", "model": "cursor-grok-4.5-high"}]
-    assert v["schema"] == 2
+# ═══ §4: легаси-значения REVIEW_PROVIDER больше НЕ понижают панель ═══
+# Раньше эти значения выбирали панель МЕНЬШЕ обязательной пары, то есть агент, запускающий
+# деплой, отключал независимость той же переменной, которую сам и выставляет (ревью ред. 2 №1).
+# Семантика union/частичного раунда/кэша теперь проверяется на обязательной паре —
+# tests/test_portable_reviewers.py.
 
-
-def test_p3_cursor_invalid_blocks(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "cursor")
-    _providers(monkeypatch, cursor=None)                    # отказ адаптера
+@pytest.mark.parametrize("legacy", ["codex", "cursor", "both"])
+def test_b4_legacy_provider_values_block_deploy(gate, monkeypatch, legacy, capsys):
+    monkeypatch.setenv("REVIEW_PROVIDER", legacy)
     assert g.check_reviewed_cli() == 2
+    err = capsys.readouterr().err
+    assert "больше не поддерживается" in err
+    assert "CODEX_REVIEW_SKIP" in err          # аварийный выход назван явно, а не подразумевается
 
 
-# ═══ P9-P13, P19-P21: режим both ═══
-
-def test_p9_both_clean_one_round_and_providers_in_verdict(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    _providers(monkeypatch, codex=_CLEAN, cursor=_CLEAN)
-    assert g.check_reviewed_cli() == 0
-    led = g.load_findings_ledger("HEAD~1")
-    assert led["rounds"] == 1                               # ОДИН раунд, не два (EARS-13)
-    assert {p["provider"] for p in _verdict()["providers"]} == {"codex", "cursor"}
-
-
-def test_p10_both_one_blocks_union(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    _providers(monkeypatch, codex=_CLEAN, cursor=_BLOCK)
-    assert g.check_reviewed_cli() == 2                      # блок при blocking у ЛЮБОГО
-    led = g.load_findings_ledger("HEAD~1")
-    assert led["findings"]["F1"]["provider"] == "cursor"    # провайдер в находке (EARS-15)
-
-
-def test_p11_both_block_findings_tagged(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    _providers(monkeypatch, codex="Verdict: needs-attention\n\n- [high] от codex (a:1)\n",
-               cursor="Verdict: needs-attention\n\n- [high] от cursor (b:2)\n")
-    assert g.check_reviewed_cli() == 2
-    led = g.load_findings_ledger("HEAD~1")
-    provs = {f["provider"] for f in led["findings"].values()}
-    assert provs == {"codex", "cursor"} and led["rounds"] == 1
-
-
-def test_p12_p20b_one_fails_blocks_and_keeps_findings(gate, monkeypatch):
-    # ключевой R4-F1 спеки: отказ второго НЕ должен стирать уже найденный blocking первого
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    _providers(monkeypatch, codex=_BLOCK, cursor=None)
-    assert g.check_reviewed_cli() == 2
-    led = g.load_findings_ledger("HEAD~1")
-    assert led["findings"]["F1"]["from_partial_round"] is True
-    assert led["rounds"] == 0                               # раунд НЕ состоялся (EARS-14)
-    assert led.get("needs_review_round") is not False       # флаг не сброшен
-
-
-def test_p13_both_fail_blocks_no_ledger_change(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    _providers(monkeypatch, codex=None, cursor=None)
-    assert g.check_reviewed_cli() == 2
-    led = g.load_findings_ledger("HEAD~1")
-    assert led["rounds"] == 0 and led["findings"] == {}
-
-
-def test_p19_second_pass_runs_even_if_first_blocks(gate, monkeypatch):
-    calls = []
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    monkeypatch.setattr(g, "run_companion_review",
-                        lambda base, scope: (calls.append("codex"), _BLOCK)[1])
-    monkeypatch.setattr(g, "run_cursor_review",
-                        lambda base, head: (calls.append("cursor"),
-                                            (_CLEAN, "model=cursor-grok-4.5-high"))[1])
-    assert g.check_reviewed_cli() == 2
-    assert calls == ["codex", "cursor"]                     # без short-circuit (EARS-14b)
-
-
-# ═══ P14-P18: кэш привязан к идентичностям ревьюеров ═══
-
-def test_p14_cache_from_one_does_not_satisfy_both(gate, monkeypatch):
+def test_b4_legacy_value_does_not_downgrade_panel(gate, monkeypatch):
+    """Ключевое: легаси-значение НЕ приводит к одиночной панели — оно вообще не строит план."""
     monkeypatch.setenv("REVIEW_PROVIDER", "codex")
-    _providers(monkeypatch, codex=_CLEAN)
-    assert g.check_reviewed_cli() == 0                      # кэш записан для codex
-    monkeypatch.setenv("REVIEW_PROVIDER", "both")
-    _providers(monkeypatch, codex=None, cursor=None)        # оба откажут
-    assert g.check_reviewed_cli() == 2                      # кэш НЕ подошёл → реальный прогон
-
-
-def test_p15_p17_cache_bound_to_model(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "cursor")
-    _providers(monkeypatch, cursor=_CLEAN)
-    assert g.check_reviewed_cli() == 0
-    monkeypatch.setenv("CURSOR_REVIEW_MODEL", "gpt-5.3-codex-high-fast")   # другая модель
-    _providers(monkeypatch, cursor=None)
-    assert g.check_reviewed_cli() == 2                      # кэш от Grok не годен для GPT
-
-
-def test_p16_legacy_cache_only_for_codex(gate, monkeypatch):
-    head, diff = g.git_head(), g.diff_sha256("HEAD~1", g.git_head())
-    g.write_ledger(head, diff, "HEAD~1", g.parse_review_output(_CLEAN))   # без reviewers
-    monkeypatch.setenv("REVIEW_PROVIDER", "codex")
-    _providers(monkeypatch, codex=None)
-    assert g.check_reviewed_cli() == 0                      # легаси-кэш годен для codex
-    monkeypatch.setenv("REVIEW_PROVIDER", "cursor")
-    _providers(monkeypatch, cursor=None)
-    assert g.check_reviewed_cli() == 2                      # но не для cursor
-
-
-def test_p18_tightened_allow_list_invalidates_cache(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "cursor")
-    _providers(monkeypatch, cursor=_CLEAN)
-    assert g.check_reviewed_cli() == 0
-    # ужесточили allow-list — кэш от теперь-запрещённой модели больше не годен
-    monkeypatch.setattr(g, "_CURSOR_MODEL_ALLOW", frozenset({"gpt-5.3-codex-high-fast"}))
-    monkeypatch.setenv("CURSOR_REVIEW_MODEL", "gpt-5.3-codex-high-fast")
-    _providers(monkeypatch, cursor=None)
+    called = []
+    monkeypatch.setattr(g, "run_certified_reviewer",
+                        lambda cert, base, head: called.append(cert.provider))
     assert g.check_reviewed_cli() == 2
+    assert called == [], "ни один ревьюер не должен быть запущен по легаси-значению"
 
 
 # ═══ Ревью cursor'ом собственной реализации: ветки адаптера входят по-настоящему ═══
@@ -302,12 +210,14 @@ def test_f1_real_contract_still_accepted():
     assert out is not None and g.parse_review_output(out).blocking
 
 
-def test_f3_codex_model_from_config_in_verdict(gate, monkeypatch):
-    monkeypatch.setenv("REVIEW_PROVIDER", "codex")
-    _providers(monkeypatch, codex=_CLEAN)
-    assert g.check_reviewed_cli() == 0
-    prov = _verdict()["providers"][0]
-    assert prov["provider"] == "codex" and prov["model"] not in ("", "codex")   # реальная модель
+def test_f3_codex_model_from_config_reaches_cache_record(gate, monkeypatch):
+    """F3: в кэш/вердикт идёт РЕАЛЬНАЯ модель, а не строка «codex» — иначе её смена не
+    инвалидировала бы кэш. Деплой-путь теперь строит пару, поэтому проверяем запись напрямую."""
+    cert = g.reviewer_certification("codex", g.codex_model(), "blocking", allow_candidate=True)
+    assert cert is not None, "в реестре должна быть запись codex под текущую модель"
+    rec = g._cert_cache_record(cert, "blocking")
+    assert rec["provider"] == "codex" and rec["model"] not in ("", "codex")
+    assert rec["attestation"] == "declared"        # §6: аттестации у companion нет
 
 
 def test_r2_prose_appended_to_clean_marker_rejected():

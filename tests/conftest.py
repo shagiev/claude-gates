@@ -52,9 +52,9 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # подменить Claude adapter, обязан получить deterministic unavailable, а не запустить CLI.
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: None)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
-    # Большинство исторических unit-тестов проверяют explicit legacy Codex-контур. Продуктовый
-    # default теперь portable; тесты дефолта обязаны сами удалить эту переменную.
-    monkeypatch.setenv("REVIEW_PROVIDER", "codex")
+    # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
+    # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
+    monkeypatch.setenv("REVIEW_PROVIDER", "portable")
     # ИНЦИДЕНТ 2026-07-25: FINDINGS_DIR/LEDGER_DIR были изолированы только в фикстуре
     # ОДНОГО тест-файла — новый тест-файл без локального мока писал в БОЕВОЙ
     # logs/review_findings (создал мусорную серию с critical-находкой из фикстуры, уронил
@@ -80,3 +80,21 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
     monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: [])
     monkeypatch.delenv("CODEX_DEPLOY_BASELINE", raising=False)
+
+
+@pytest.fixture()
+def clean_pair(monkeypatch):
+    """Обязательная blocking-пара (Codex+Claude) отрабатывает чисто.
+
+    Нужна тестам деплой-пути, которые проверяют НЕ ревью, а его последствия (вердикт, ledger,
+    reviewed-sha). Раньше им хватало одного shell-стаба companion; теперь панель обязательна,
+    поэтому «чисто» должны отработать ОБА — иначе гейт честно блокирует (§3)."""
+    clean = "Verdict: approve\n\nNo material findings.\n"
+
+    def _run(cert, _base, _head):
+        return g.ReviewerRun("blocking", cert.provider, cert.requested_model,
+                             cert.actual_models, cert.family, cert.certification_id,
+                             "ok", verdict=g.parse_review_output(clean))
+
+    monkeypatch.setattr(g, "run_certified_reviewer", _run)
+    return _run

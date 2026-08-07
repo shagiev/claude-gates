@@ -76,6 +76,9 @@ class ReviewerCertification:
     roles: tuple[str, ...]
     certification_id: str
     status: str
+    # §6: `verified` — провайдер вернул фактическую модель в ответе и она совпала с реестром;
+    # `declared` — провайдер лишь эхо-ит запрошенный slug (остаток M8 в AGENTS.md).
+    attestation: str = "declared"
 
 
 @dataclass
@@ -695,6 +698,7 @@ def _reviewers_key(reviewers: "list[dict] | None") -> "list[tuple] | None":
             str(r.get("family", "")),
             str(r.get("certification_id", "")),
             str(r.get("policy_id", "")),
+            str(r.get("attestation", "")),
         ))
     return sorted(rows)
 
@@ -837,15 +841,40 @@ def load_findings_ledger(baseline: "str | None") -> "dict | None":
         p.rename(arch / f"{ts}-{led['baseline'][:12]}.json")
         # Carry-over (реш. юзера 22.07): carried-находки прошлой серии стартуют НОВУЮ серию
         # ОТКРЫТЫМИ — «бэклог с зубами»: следующий деплой блокируется на них первым делом.
+        # §5b (ревью ред. 3/4): наследуется НЕ только `carried`. Раньше аварийный skip после
+        # частичного раунда терял известную critical: она лежала `open`, деплой сдвигал baseline,
+        # серия архивировалась — и находка исчезала. Наследуем всё НЕРАЗРЕШЁННОЕ:
+        #   • open с блокирующей severity — решения по ней нет вовсе;
+        #   • неподтверждённая адъюдикация (ревьюеры не видели решения — `needs_review_round`):
+        #     иначе Claude помечает чужую critical `fixed`, skip сдвигает baseline до раунда
+        #     Codex, и решение никто не проверил;
+        #   • carried (low/medium) — как и раньше.
+        # НЕ наследуются подтверждённые адъюдикации, resolved-by-user и duplicate: по ним есть
+        # решение, увиденное независимой стороной либо принятое человеком (иначе вечный блок).
+        pending_adj = bool(led.get("needs_review_round"))
         inherited = {}
         for k, f in (led.get("findings") or {}).items():
-            if f.get("status") == "carried":
-                inherited[f"F{len(inherited) + 1}"] = {
-                    "severity": f.get("severity"), "title": f.get("title"),
-                    "status": "open", "dup_of": None, "disputes": 0, "round": 0,
-                    "carried_from": led["baseline"],
-                    "carry_count": int(f.get("carry_count") or 0) + 1,
-                }
+            status = f.get("status")
+            unconfirmed = pending_adj and status in ("fixed", "refuted", "residual-failsafe")
+            if not (status == "carried"
+                    or (status == "open" and _is_blocking_severity(f.get("severity")))
+                    or unconfirmed):
+                continue
+            rec = {
+                "severity": f.get("severity"), "title": f.get("title"),
+                "status": "open", "dup_of": None, "disputes": 0, "round": 0,
+                "carried_from": led["baseline"],
+                "carry_count": int(f.get("carry_count") or 0) + 1,
+                "provider": f.get("provider"),   # происхождение блокирующей находки не теряем
+            }
+            if unconfirmed:
+                # причина адъюдикации переезжает вместе с находкой: следующий раунд обязан
+                # показать ревьюерам, ЧТО именно им предлагали принять
+                rec["unconfirmed_adjudication"] = True
+                rec["reason"] = f.get("reason")
+                audit(f"inherit-unconfirmed {k} [{f.get('severity')}] статус {status!r} не был "
+                      "показан ревьюерам — наследуется открытым (§5b)")
+            inherited[f"F{len(inherited) + 1}"] = rec
         return {"baseline": baseline, "rounds": 0, "findings": inherited}
     return led
 
@@ -860,6 +889,36 @@ def _atomic_write_json(path: Path, obj: object, indent: "int | None" = None) -> 
 
 def save_findings_ledger(led: dict) -> None:
     _atomic_write_json(FINDINGS_DIR / "current.json", led, indent=2)
+
+
+def _is_blocking_severity(sev: object) -> bool:
+    """Блокирующая severity: critical/high ЛИБО неизвестная (R1-1b: всё неизвестное = блок)."""
+    return sev in SEVERITY_BLOCKING or sev not in KNOWN_SEVERITIES
+
+
+def _dup_root(fnd: dict, fid: str) -> "str | None":
+    """Корень цепочки `dup_of`. None = невалидная ссылка (висячая, цикл, слишком длинная).
+
+    §6b (ревью ред. 4): правила статуса нельзя применять к НЕПОСРЕДСТВЕННОЙ цели ссылки — в
+    ledger есть записи `duplicate`, и `[DUP:F2]`, где F2 дублирует решённую F1, породил бы ещё
+    один неблокирующий дубликат, не пере-открыв ничего. Блокирующая находка тонула бы через
+    один уровень косвенности (в т.ч. под влиянием текста диффа)."""
+    seen: set[str] = set()
+    cur = fid
+    while True:
+        rec = fnd.get(cur)
+        if rec is None or cur in seen:      # висячая ссылка либо цикл → fail-closed
+            return None
+        if len(seen) > len(fnd):            # страховка от длинной цепочки
+            return None
+        seen.add(cur)
+        nxt = rec.get("dup_of")
+        if not nxt:
+            # `duplicate` без цели — битая запись, а не корень. Иначе критическая находка со
+            # ссылкой на неё оседала бы ещё одним неблокирующим дубликатом (fail-open при
+            # порче/ручной правке ledger).
+            return None if rec.get("status") == "duplicate" else cur
+        cur = nxt                           # self-loop (nxt == cur) поймает проверка `cur in seen`
 
 
 def merge_round(led: dict, blocking_findings: "list[tuple]",
@@ -886,7 +945,22 @@ def merge_round(led: dict, blocking_findings: "list[tuple]",
         sev, title = item[0], item[1]
         provider = item[2] if len(item) > 2 else None      # EARS-15: кто поднял находку
         kind, fid, rest = parse_finding_prefix(title)
+        # §6b: ссылка разрешается до КОРНЯ цепочки dup_of; невалидная (висячая/цикл) → None,
+        # и запись падает в ветку «новая open-находка» ниже (fail-closed, как для неизвестного id)
+        fid = _dup_root(fnd, fid) if (kind in ("dup", "dispute") and fid) else fid
         target = fnd.get(fid) if fid else None
+        # §6b: блокирующий спор/DUP по корню, закрытому ЧЕЛОВЕКОМ, не проглатывается в late_note —
+        # он несёт новую улику и обязан открыть отдельную находку с собственным разрешением.
+        # Вечной эскалации нет: у новой записи свой disputes=0, исходная остаётся терминальной.
+        if (kind in ("dup", "dispute") and target is not None
+                and target.get("status") == "resolved-by-user"
+                and _is_blocking_severity(sev)):
+            fnd[new_fid()] = {"severity": sev, "title": rest, "status": "open", "dup_of": None,
+                              "disputes": 0, "round": led["rounds"], "provider": provider,
+                              "reopened_from": fid}
+            audit(f"reopen-after-resolved {fid} → новая open-находка [{sev}] "
+                  f"«{redact_secrets(rest)[:80]}» (§6b: новая улика после решения человека)")
+            continue
         if kind in ("dup", "dispute") and target is not None:
             _SEV_RANK = {"critical": 3, "high": 2, "medium": 1, "low": 0}
             if _SEV_RANK.get(sev, 3) > _SEV_RANK.get(target.get("severity"), 3):   # unknown=critical с ОБЕИХ сторон (спор F4-2)
@@ -937,6 +1011,16 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
         raise AdjudicationError(
             "critical-находка не адъюдицируется в residual (ML-C1): только "
             "fixed/refuted, спорная → эскалация человеку")
+    # §6c (ревью ред. 5): адъюдицирует Claude — тот же агент, что пишет код и входит в
+    # blocking-панель. Разрешённый `critical → refuted` позволял закрыть находку ЧУЖОГО
+    # ревьюера, после чего один валидный ответ без находок (согласие ИЛИ стохастический
+    # промах) делал её терминальной. Молчание не должно закрывать блокирующую находку:
+    # для неё остаются `fixed` (+ состоявшийся раунд) и решение человека.
+    if status in ("refuted", "residual-failsafe") and _is_blocking_severity(f.get("severity")):
+        raise AdjudicationError(
+            f"{status!r} запрещён для severity {f.get('severity')!r}: блокирующую находку "
+            "закрывает только `fixed` с состоявшимся раундом обоих ревьюеров либо "
+            "`resolved-by-user` (§6c — молчание ревьюера не снимает находку)")
     f["status"] = status
     # источник #4: причина от оператора/автоматики может нести секрет-улику; редактируем ДО
     # сохранения — тогда ledger, audit, вывод `findings` и промпт следующего раунда чисты
@@ -955,9 +1039,12 @@ def apply_carry_over(led: dict) -> "list[str]":
         return []
     carried = []
     for k, f in (led.get("findings") or {}).items():
+        # §5 (ревью ред. 2): `high` входит в SEVERITY_BLOCKING, но раньше исключался только
+        # `critical` — новая high независимого ревьюера после hard-cap переставала блокировать.
+        # Шумом можно было догнать серию до cap и обесценить настоящую находку, не снимая её.
         if (f.get("status") == "open"
                 and int(f.get("round") or 0) == int(led.get("rounds") or 0)
-                and f.get("severity") in KNOWN_SEVERITIES and f.get("severity") != "critical"
+                and not _is_blocking_severity(f.get("severity"))
                 and int(f.get("disputes") or 0) == 0
                 and not f.get("carried_from")):
             f["status"] = "carried"
@@ -1369,13 +1456,20 @@ _CURSOR_DIFF_LIMIT = 300_000
 _GEMINI_MODEL = "gemini-2.5-pro"
 _GEMINI_TIMEOUT_S = 600
 _GEMINI_DIFF_LIMIT = 600_000
+_CODEX_DIFF_LIMIT = 600_000
 _GEMINI_THINKING_BUDGET = 16_384
 _GEMINI_MAX_OUTPUT_TOKENS = 65_536
 _GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 _CLAUDE_REQUESTED_MODEL = "opus"
 _CLAUDE_TIMEOUT_S = 900
 _CERTIFICATION_REGISTRY = Path(__file__).resolve().parent.parent / "reviewer_certifications.json"
-_CONSERVATIVE_AUTHOR_FAMILIES = frozenset({"anthropic", "openai"})
+_CORPUS_PATH = Path(__file__).resolve().parent.parent / "reviewer_corpus" / "cases.json"
+_REPORTS_DIR = Path(__file__).resolve().parent.parent / "reviewer_corpus" / "reports"
+_REQUIRED_CORPUS_CATEGORIES = frozenset({
+    "fail-open", "config-weakening", "command-security", "reviewer-independence", "benign",
+    "secret-handling", "outage", "schema-drift", "large-multifile", "prompt-injection",
+})
+_MIN_CERT_REPETITIONS = 2
 # Разрешены ТОЛЬКО не-Anthropic модели: Claude пишет код в этом контуре, Claude-ревьюер молча
 # превращает независимый гейт в самопроверку. `auto` запрещён — скрытая маршрутизация.
 _CURSOR_MODEL_ALLOW = frozenset({
@@ -1402,13 +1496,108 @@ def model_family(model: str) -> str:
     return "unknown"
 
 
+def _corpus_expectations() -> "tuple[str, frozenset, dict] | None":
+    """(sha256 корпуса, множество обязательных case id, {case_id: category}) либо None."""
+    try:
+        raw_bytes = _CORPUS_PATH.read_bytes()
+        data = json.loads(raw_bytes)
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    cases = data.get("cases") if isinstance(data, dict) else None
+    if not isinstance(cases, list) or not cases:
+        return None
+    by_id: dict[str, str] = {}
+    for case in cases:
+        if (not isinstance(case, dict) or not _nonempty_str(case.get("id"))
+                or not _nonempty_str(case.get("category"))):
+            return None
+        by_id[str(case["id"])] = str(case["category"])
+    if not _REQUIRED_CORPUS_CATEGORIES <= set(by_id.values()):
+        return None
+    return (hashlib.sha256(raw_bytes).hexdigest(), frozenset(by_id), by_id)
+
+
+def _report_binding_ok(item: dict, policy_id: str) -> bool:
+    """§7: certified blocking-запись обязана указывать на КОММИТНУТЫЙ отчёт корпусного прогона.
+
+    Без этой проверки правка одного поля `status` в реестре изготавливала бы сертификацию —
+    ровно обход, который не закрывала ред. 2 (money-case M12). Проверка НЕ доказывает
+    доверенное исполнение: подделка отчёта вместе с реестром в одном коммите остаётся
+    остатком R-CERT-PROVENANCE (Фаза 2), прикрытым тем, что реестр — гейтируемый код-путь.
+    """
+    report = item.get("report")
+    if not isinstance(report, dict):
+        return False
+    rel = report.get("path")
+    if not _nonempty_str(rel):
+        return False
+    # путь строго внутри поставляемого каталога: ни traversal, ни абсолютный, ни симлинк
+    if Path(str(rel)).is_absolute() or ".." in Path(str(rel)).parts:
+        return False
+    try:
+        resolved = (_REPORTS_DIR.parent / str(rel)).resolve(strict=True)
+        if not resolved.is_file() or resolved.parent != _REPORTS_DIR.resolve():
+            return False
+        raw_bytes = resolved.read_bytes()
+    except (OSError, RuntimeError):
+        return False
+    if hashlib.sha256(raw_bytes).hexdigest() != str(report.get("sha256") or ""):
+        return False
+    corpus = _corpus_expectations()
+    if corpus is None:
+        return False
+    corpus_sha, required_cases, _by_id = corpus
+    if str(report.get("corpus_sha256") or "") != corpus_sha:
+        return False   # корпус изменился → прошлый прогон больше не про него
+    reps = report.get("repetitions")
+    if (not isinstance(reps, int) or isinstance(reps, bool) or reps < _MIN_CERT_REPETITIONS
+            or reps != report.get("repetitions")):
+        return False
+    try:
+        body = json.loads(raw_bytes)
+    except (json.JSONDecodeError, UnicodeError):
+        return False
+    if not isinstance(body, dict) or body.get("pass") is not True:
+        return False
+    model = item["actual_models"][0]
+    for key, expected in (("policy_id", policy_id), ("provider", item["provider"]),
+                          ("adapter", item["adapter"]), ("role", "blocking"),
+                          ("requested_model", item["requested_model"]),
+                          ("certification_id", item["certification_id"]),
+                          ("family", item["family"]), ("attestation", item["attestation"])):
+        if body.get(key) != expected:
+            return False
+    if (body.get("actual_models") != [model] or body.get("repetitions") != reps
+            or body.get("corpus_sha256") != corpus_sha):
+        return False   # digest сверяется и в реестре, и ВНУТРИ отчёта
+    rows = body.get("results")
+    if not isinstance(rows, list) or not rows:
+        return False
+    seen: set[tuple] = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("pass") is not True:
+            return False     # ни одной проваленной строки
+        # §7/ред. 5: КАЖДАЯ строка снята той же единственной моделью. Иначе модель A проходит
+        # почти весь корпус, модель B — одну лёгкую строку, агрегат сходится, а в проде B
+        # принимается на money-loss кейсах, которых она не проходила.
+        if row.get("actual_model") != model:
+            return False
+        case, rep = row.get("case"), row.get("repetition")
+        if not isinstance(rep, int) or isinstance(rep, bool) or not (1 <= rep <= reps):
+            return False
+        seen.add((case, rep))
+    return seen == {(c, r) for c in required_cases for r in range(1, reps + 1)}
+
+
 def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertification, ...]]":
     """Shipped plugin registry only; repo config/env cannot add certified models."""
     try:
         raw = json.loads(_CERTIFICATION_REGISTRY.read_text())
     except (OSError, json.JSONDecodeError, UnicodeError):
         return (None, ())
-    if not isinstance(raw, dict) or raw.get("schema") != 1 or not _nonempty_str(
+    # schema 2 (§6/§7): добавлены `attestation` и связка `report`. Схема 1 больше не читается —
+    # fail-closed громче, чем тихая деградация до реестра без доказательств сертификации.
+    if not isinstance(raw, dict) or raw.get("schema") != 2 or not _nonempty_str(
             raw.get("policy_id")):
         return (None, ())
     items = raw.get("certifications")
@@ -1419,8 +1608,14 @@ def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertifica
         if not isinstance(item, dict):
             return (None, ())
         scalar = ("provider", "adapter", "requested_model", "family",
-                  "certification_id", "status")
+                  "certification_id", "status", "attestation")
         if not all(_nonempty_str(item.get(k)) for k in scalar):
+            return (None, ())
+        if item["attestation"] not in {"declared", "verified"}:
+            return (None, ())
+        # certification_id участвует в построении пути отчёта (раннер `--write-report`),
+        # поэтому формат узкий: разделители пути и `..` не должны туда попадать вовсе.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", str(item["certification_id"])):
             return (None, ())
         actual = item.get("actual_models")
         roles = item.get("roles")
@@ -1436,6 +1631,11 @@ def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertifica
             return (None, ())
         if any(model_family(str(v)) != family for v in actual):
             return (None, ())
+        # §7: certified blocking-слот выдаётся только против коммитнутого корпусного отчёта.
+        # `candidate` слота не даёт, поэтому отчёта не требует.
+        if item["status"] == "certified" and "blocking" in roles and not _report_binding_ok(
+                item, str(raw["policy_id"])):
+            return (None, ())
         parsed.append(ReviewerCertification(
             provider=str(item["provider"]),
             adapter=str(item["adapter"]),
@@ -1445,6 +1645,7 @@ def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertifica
             roles=tuple(str(v) for v in roles),
             certification_id=str(item["certification_id"]),
             status=str(item["status"]),
+            attestation=str(item["attestation"]),
         ))
     return (str(raw["policy_id"]), tuple(parsed))
 
@@ -1652,9 +1853,8 @@ def resolve_gemini_model(*, allow_candidate: bool = False) -> "tuple[str | None,
     if cert is None:
         return (None, f"[codex-gate] ✗ Gemini model {model!r} отсутствует в shipped "
                       "certification registry для blocking-роли")
-    if cert.family in _CONSERVATIVE_AUTHOR_FAMILIES or cert.family == "unknown":
-        return (None, f"[codex-gate] ✗ Gemini model {model!r} не независима от "
-                      "консервативного author set")
+    if cert.family == "unknown":     # фиксированный author set снят (§3 дизайна 2026-08-07):
+        return (None, f"[codex-gate] ✗ Gemini model {model!r} имеет unknown family")
     return (model, "")
 
 
@@ -1670,6 +1870,7 @@ def _cert_cache_record(cert: ReviewerCertification, role: str) -> dict:
         "family": cert.family,
         "certification_id": cert.certification_id,
         "policy_id": policy_id or "",
+        "attestation": cert.attestation,
     }
 
 
@@ -1681,32 +1882,35 @@ def resolve_portable_review_plan(profile: str
     if profile == "strong":
         return (None, "[codex-gate] ✗ профиль `strong` ещё не реализован: нужен второй "
                       "аттестующий actual model independent adapter (direct xAI/local)")
-    gemini_model = (os.environ.get("GEMINI_REVIEW_MODEL") or _GEMINI_MODEL).strip()
-    gemini = reviewer_certification("gemini", gemini_model, "blocking")
-    supplemental = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, "supplemental")
-    available: list[ReviewerCertification] = []
-    if gemini is not None and _gemini_api_key():
-        available.append(gemini)
+    # §3: обязательная ПАРА строится безусловно, ДО чтения любого окружения. Обе возможные
+    # авторские семьи представлены, поэтому каждый кусок диффа судит как минимум один
+    # независимый ревьюер — при любом и недоказуемом авторстве. Определения хоста нет нигде:
+    # хост сессии не доказывает авторство диапазона коммитов (возражение ревью ред. 1).
+    codex = reviewer_certification("codex", codex_model(), "blocking")
+    claude = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, "blocking")
+    if codex is None or claude is None:
+        missing = ", ".join(n for n, c in (("codex", codex), ("claude", claude)) if c is None)
+        return (None, f"[codex-gate] ✗ обязательная blocking-пара неполна: нет certified "
+                      f"записи для {missing}. Панель не понижается до одного ревьюера — это "
+                      "было бы саморевью на коде того же семейства. Прогони certification "
+                      "suite (`certify_reviewers.py --provider <name>`) и закоммить отчёт.")
+    panel = [codex, claude]
+    # §4: REVIEW_PROVIDER больше НЕ выбирает панель — только ДОБАВЛЯЕТ сертифицированного
+    # ревьюера. Раньше агент, запускающий деплой, отключал обязательность пары той же
+    # переменной, которую сам и выставляет (возражение ревью ред. 2).
     if profile == "gemini":
-        blocking = [gemini] if gemini is not None and _gemini_api_key() else []
-    else:
-        blocking = available[:1]
-    if not blocking:
-        candidate_hint = ""
-        if reviewer_certification("gemini", gemini_model, "blocking",
-                                  allow_candidate=True) is not None and _gemini_api_key():
-            candidate_hint = " Gemini model пока candidate: сначала прогони certification suite."
-        return (None, "[codex-gate] ✗ нет доступного certified независимого blocking reviewer. "
-                      "Настрой GOOGLE_API_KEY/GEMINI_API_KEY для certified Gemini; Cursor CLI "
-                      f"остаётся legacy, пока не аттестует actual model.{candidate_hint}")
-    families = [cert.family for cert in blocking]
-    if (any(f in _CONSERVATIVE_AUTHOR_FAMILIES or f == "unknown" for f in families)
-            or len(set(families)) != len(families)):
-        return (None, "[codex-gate] ✗ blocking reviewer panel не независима по семействам")
-    if supplemental is None:
-        return (None, "[codex-gate] ✗ обязательный Claude supplemental отсутствует в shipped "
-                      "certification registry")
-    return (tuple(blocking + [supplemental]), "")
+        gemini_model = (os.environ.get("GEMINI_REVIEW_MODEL") or _GEMINI_MODEL).strip()
+        gemini = reviewer_certification("gemini", gemini_model, "blocking")
+        if gemini is None or not _gemini_api_key():
+            hint = ("" if gemini is not None else
+                    " Gemini ещё не сертифицирован: прогони certification suite.")
+            return (None, "[codex-gate] ✗ профиль `gemini` просит ДОБАВИТЬ Gemini к обязательной "
+                          f"паре, но он недоступен: нужен GOOGLE_API_KEY/GEMINI_API_KEY.{hint}")
+        panel.append(gemini)
+    families = [cert.family for cert in panel]
+    if len(set(families)) != len(families) or "unknown" in families:
+        return (None, "[codex-gate] ✗ blocking-панель содержит повтор семейства или unknown")
+    return (tuple(panel), "")
 
 
 def _gemini_response_text(payload: dict) -> "tuple[str | None, str]":
@@ -1923,6 +2127,136 @@ def run_claude_supplemental(base: str, head: str) -> "ReviewerRun":
                        usage=usage if isinstance(usage, dict) else {})
 
 
+def _diff_text(base: str, head: str) -> "tuple[str | None, str]":
+    try:
+        return (subprocess.run(["git", "diff", f"{base}..{head}"], cwd=REPO_ROOT,
+                               capture_output=True, text=True, check=True).stdout, "")
+    except (subprocess.CalledProcessError, OSError) as exc:
+        return (None, f"не получить дифф: {type(exc).__name__}")
+
+
+def run_codex_review_text(diff_text: str, *, role: str = "blocking",
+                          allow_candidate: bool = False
+                          ) -> "tuple[str | None, str, str, dict, str]":
+    """(нормализованный текст|None, фактическая модель, диагностика, usage, статус).
+
+    §7: Codex ревьюит ТОТ ЖЕ контракт, что Gemini и Claude — вход текстом диффа, строгий
+    reviewer-промпт, `normalize_reviewer_text`. Иначе сертификация проверяла бы адаптер,
+    отличный от боевого (`adversarial-review` работает по git-диапазону и своей схеме),
+    и evidence ничего не доказывал бы про прод (money-case M7).
+
+    ⚠️ Аттестации фактической модели тут НЕТ: companion эхо-ит `request.model`, а
+    `codex_model()` читает локальный конфиг. Это `declared`-запись (остаток M8 в AGENTS.md).
+    """
+    requested = codex_model()
+    cert = reviewer_certification("codex", requested, role, allow_candidate=allow_candidate)
+    if cert is None:
+        return (None, requested, "нет certified Codex model для роли " + role, {}, "unavailable")
+    if len(diff_text) > _CODEX_DIFF_LIMIT:
+        return (None, requested, f"дифф больше {_CODEX_DIFF_LIMIT} символов: усечённое ревью "
+                                 "выглядело бы полным", {}, "invalid")
+    # `--json` ОБЯЗАТЕЛЕН. Без него companion печатает `execution.rendered`, который у `task`
+    # пуст (`runForegroundCommand`: `outputResult(json ? payload : rendered)`), и ревью
+    # выглядело бы «пустым выводом» — при сертификации так молча провалилась половина кейсов.
+    # `--sandbox` companion НЕ знает: флаг уезжал в positionals и склеивался с промптом.
+    # Без `--write` ход и так read-only; промпт обязан быть ЕДИНСТВЕННЫМ позиционным.
+    r = _exec_companion(["task", "--json", "--model", requested,
+                         _build_reviewer_prompt(diff_text, role=role)])
+    if r is None:
+        return (None, requested, "companion недоступен (плагин не найден/таймаут)", {}, "unavailable")
+    if r.returncode != 0:
+        detail = outage_details(r.stdout) or redact_secrets((r.stderr or "").strip())[:300]
+        return (None, requested, f"companion exit={r.returncode}: {detail}", {}, "unavailable")
+    try:
+        envelope = json.loads((r.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return (None, requested, "Codex task envelope не JSON", {}, "invalid")
+    env_status = envelope.get("status") if isinstance(envelope, dict) else None
+    if (not isinstance(env_status, int) or isinstance(env_status, bool)
+            or env_status != 0):
+        # код 0 ≠ ревью состоялось: деградировавший конверт (квота, ошибка модели) приходит нулём
+        return (None, requested,
+                f"Codex task status={redact_secrets(str(envelope.get('status')))[:60]}", {},
+                "unavailable")
+    normalized = normalize_reviewer_text(envelope.get("rawOutput") or "")
+    if normalized is None:
+        return (None, requested, "Codex ответ не прошёл строгий verdict-контракт", {}, "invalid")
+    return (normalized, requested, "", {}, "ok")
+
+
+def run_claude_review_text(diff_text: str, *, role: str = "blocking",
+                           allow_candidate: bool = False
+                           ) -> "tuple[str | None, str, str, dict, str]":
+    """Тот же контракт для Claude. `modelUsage` конверта — НАСТОЯЩАЯ аттестация (`verified`)."""
+    cert = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, role,
+                                  allow_candidate=allow_candidate)
+    if cert is None:
+        return (None, "", "нет certified Claude model для роли " + role, {}, "unavailable")
+    binary = _resolve_claude_bin()
+    if binary is None:
+        return (None, "", "claude CLI не найден", {}, "unavailable")
+    try:
+        resolved_binary = str(Path(binary).resolve(strict=True))
+    except OSError:
+        return (None, "", "claude CLI path не резолвится", {}, "unavailable")
+    audit(f"claude-{role} bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
+    cmd = [binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
+           "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence"]
+    try:
+        result = subprocess.run(cmd, cwd=REPO_ROOT,
+                                input=_build_reviewer_prompt(diff_text, role=role),
+                                capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return (None, "", f"таймаут {_CLAUDE_TIMEOUT_S}s", {}, "timeout")
+    except OSError as exc:
+        return (None, "", redact_secrets(f"{type(exc).__name__}: {exc}")[:300], {}, "unavailable")
+    if result.returncode != 0:
+        return (None, "", redact_secrets((result.stderr or result.stdout or "").strip())[:300], {},
+                "invalid")
+    try:
+        envelope = json.loads((result.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return (None, "", "Claude output не JSON", {}, "invalid")
+    model_usage = envelope.get("modelUsage")
+    # Ключи modelUsage приходят из ответа CLI, то есть недоверенны: при отбраковке они
+    # попадают в audit и operator output, и секретоподобное значение утекло бы наружу.
+    actual_models = (tuple(sorted(redact_secrets(str(m)) for m in model_usage))
+                     if isinstance(model_usage, dict) else ())
+    actual = ",".join(actual_models)
+    if envelope.get("is_error") is not False or actual_models not in {
+            (m,) for m in cert.actual_models}:
+        return (None, actual, "Claude actual model/error не совпал с certification registry",
+                {}, "invalid")
+    normalized = normalize_reviewer_text(envelope.get("result") or "")
+    if normalized is None:
+        return (None, actual, "Claude ответ не прошёл строгий verdict-контракт", {}, "invalid")
+    usage = envelope.get("usage")
+    return (normalized, actual, "", usage if isinstance(usage, dict) else {}, "ok")
+
+
+def _run_text_reviewer(cert: ReviewerCertification, role: str, base: str, head: str,
+                       runner) -> ReviewerRun:
+    """Общая обвязка текстовых адаптеров: дифф → runner → ReviewerRun (fail-closed на каждом шаге)."""
+    diff_text, derr = _diff_text(base, head)
+    if diff_text is None:
+        return ReviewerRun(role, cert.provider, cert.requested_model, (), cert.family,
+                           cert.certification_id, "invalid", detail=derr)
+    text, actual, detail, usage, status = runner(diff_text, role=role)
+    actuals = tuple(a for a in (actual,) if a)
+    if text is None:
+        # статус приходит ОТ адаптера. Выводить его обратно из русского текста диагностики
+        # значило бы, что переформулировка сообщения молча меняет класс отказа.
+        return ReviewerRun(role, cert.provider, cert.requested_model, actuals, cert.family,
+                           cert.certification_id, status, detail=detail)
+    verdict = parse_review_output(text)
+    if not verdict.valid:
+        return ReviewerRun(role, cert.provider, cert.requested_model, actuals, cert.family,
+                           cert.certification_id, "invalid",
+                           detail="ответ не прошёл строгий verdict-контракт")
+    return ReviewerRun(role, cert.provider, cert.requested_model, actuals, cert.family,
+                       cert.certification_id, "ok", verdict=verdict, usage=usage)
+
+
 def run_certified_reviewer(cert: ReviewerCertification, base: str, head: str) -> ReviewerRun:
     if cert.roles == ("blocking",):
         role = "blocking"
@@ -1934,8 +2268,10 @@ def run_certified_reviewer(cert: ReviewerCertification, base: str, head: str) ->
                            detail="certification должна иметь ровно одну однозначную role")
     if cert.provider == "gemini":
         return run_gemini_review(base, head)
-    if cert.provider == "claude" and role == "supplemental":
-        return run_claude_supplemental(base, head)
+    if cert.provider == "claude":
+        return _run_text_reviewer(cert, role, base, head, run_claude_review_text)
+    if cert.provider == "codex":
+        return _run_text_reviewer(cert, role, base, head, run_codex_review_text)
     if cert.provider == "cursor":
         return ReviewerRun(role, cert.provider, cert.requested_model, (), cert.family,
                            cert.certification_id, "unavailable",
@@ -2073,17 +2409,14 @@ def check_reviewed_cli() -> int:
         ]
         providers = tuple(cert.provider for cert in portable_certs)
     else:
-        providers, perr = resolve_providers()     # legacy Ф1: неизвестное → блок (EARS-3)
-        if providers is None:
-            print(perr, file=sys.stderr)
-            return 2
-        cursor_model, merr = (resolve_cursor_model() if "cursor" in providers else ("codex", ""))
-        if "cursor" in providers and cursor_model is None:
-            print(merr, file=sys.stderr)          # EARS-4: allow-list моделей в коде
-            return 2
-        requested_reviewers = [{"provider": p,
-                                "model": (cursor_model if p == "cursor" else codex_model())}
-                               for p in providers]
+        # §4: легаси-значения означали «панель МЕНЬШЕ обязательной пары», а такой панели больше
+        # нет. Тихо понижать нельзя — это и был env-обход обязательности (money-case M3).
+        print(f"[codex-gate] ✗ REVIEW_PROVIDER={raw_provider!r} больше не поддерживается на "
+              "деплой-пути: панель Codex+Claude обязательна, и переменной окружения её понизить "
+              "нельзя (это был обход независимости). Допустимы только профили, ДОБАВЛЯЮЩИЕ "
+              f"ревьюера: {'|'.join(_PORTABLE_PROFILES)}. Аварийный выход — CODEX_REVIEW_SKIP=1 "
+              "(громкий и аудируемый).", file=sys.stderr)
+        return 2
     audit("review-providers запрошены: "                   # EARS-5: кто судил — в аудит
           + ", ".join(f"{r['provider']}({r['model']})" for r in requested_reviewers))
     if read_valid_ledger(head, diff_sha, requested_reviewers) is not None:
@@ -2145,17 +2478,6 @@ def check_reviewed_cli() -> int:
                           f"title={redact_secrets(title)!r}")
             print(f"[codex-gate] {run.role} ревьюер {run.provider} ({actual}): "
                   f"{run.verdict.verdict}, находок {len(run.verdict.findings)}", file=sys.stderr)
-    else:
-        for prov in providers:
-            v, model, detail = review_with_provider(prov, baseline, head)
-            if v is None:
-                failures.append((prov, model, detail))
-                print(f"[codex-gate] ✗ ревьюер {prov} ({model}) не дал валидный вердикт: {detail}",
-                      file=sys.stderr)
-                continue
-            results.append((prov, model, v))
-            print(f"[codex-gate] ревьюер {prov} ({model}): {v.verdict}, находок {len(v.findings)}",
-                  file=sys.stderr)
     # union находок с пометкой провайдера (EARS-12/15)
     blocking = [(sev, title, prov) for prov, _m, v in results for sev, title in v.findings
                 if sev in SEVERITY_BLOCKING or sev not in KNOWN_SEVERITIES]

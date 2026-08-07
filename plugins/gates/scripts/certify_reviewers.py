@@ -7,6 +7,7 @@ reviewed code change after repeated runs and manual inspection of the report.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -74,15 +75,33 @@ def case_passes(case: dict, verdict: gate.ReviewVerdict | None, raw_output: str 
     return expected and no_forbidden_echo
 
 
-def run_gemini(repetitions: int) -> tuple[int, dict]:
+#: провайдер → (текстовый адаптер боевого пути, adapter-id реестра, requested model).
+# §7/M7: сертифицируется РОВНО тот адаптер, что работает в проде — иначе evidence ничего не
+# доказывает про боевые прогоны.
+_RUNNERS = {
+    "gemini": (lambda diff: gate.run_gemini_review_text(diff, allow_candidate=True),
+               "gemini-api",
+               lambda: gate.os.environ.get("GEMINI_REVIEW_MODEL") or gate._GEMINI_MODEL),
+    "codex": (lambda diff: gate.run_codex_review_text(diff, role="blocking",
+                                                      allow_candidate=True)[:4],
+              "codex-companion", gate.codex_model),
+    "claude": (lambda diff: gate.run_claude_review_text(diff, role="blocking",
+                                                        allow_candidate=True)[:4],
+               "claude-cli", lambda: gate._CLAUDE_REQUESTED_MODEL),
+}
+
+
+def run_provider(provider: str, repetitions: int) -> tuple[int, dict]:
     corpus = load_corpus()
+    runner, adapter, requested_of = _RUNNERS[provider]
+    requested = requested_of()
+    cert = gate.reviewer_certification(provider, requested, "blocking", allow_candidate=True)
     rows = []
     actual_models = set()
     all_pass = True
     for repetition in range(1, repetitions + 1):
         for case in corpus["cases"]:
-            text, actual, detail, usage = gate.run_gemini_review_text(
-                case["diff"], allow_candidate=True)
+            text, actual, detail, usage = runner(case["diff"])
             verdict = gate.parse_review_output(text or "") if text is not None else None
             passed = case_passes(case, verdict, (text or "") + "\n" + detail)
             all_pass = all_pass and passed
@@ -101,11 +120,16 @@ def run_gemini(repetitions: int) -> tuple[int, dict]:
     report = {
         "schema": 1,
         "policy_id": corpus["policy_id"],
-        "provider": "gemini",
-        "requested_model": (
-            gate.os.environ.get("GEMINI_REVIEW_MODEL") or gate._GEMINI_MODEL),
+        "provider": provider,
+        "adapter": adapter,
+        "role": "blocking",
+        "certification_id": cert.certification_id if cert else "",
+        "family": cert.family if cert else "",
+        "attestation": cert.attestation if cert else "",
+        "requested_model": requested,
         "actual_models": sorted(actual_models),
         "repetitions": repetitions,
+        "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
         "categories": sorted({case["category"] for case in corpus["cases"]}),
         "pass": all_pass,
         "results": rows,
@@ -115,16 +139,37 @@ def run_gemini(repetitions: int) -> tuple[int, dict]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", choices=("gemini",), default="gemini")
+    parser.add_argument("--provider", choices=tuple(_RUNNERS), default="gemini")
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--write-report", action="store_true",
+                        help="сохранить отчёт в reviewer_corpus/reports/<certification_id>.json")
     args = parser.parse_args(argv)
     if args.repetitions < 2 or args.repetitions > 10:
         parser.error("--repetitions must be between 2 and 10 for certification")
     try:
-        rc, report = run_gemini(args.repetitions)
+        rc, report = run_provider(args.provider, args.repetitions)
     except ValueError as exc:
         print(json.dumps({"schema": 1, "pass": False, "error": str(exc)}))
         return 2
+    if args.write_report:
+        # Раннер по-прежнему НЕ трогает реестр: повышение статуса — обычная ревьюируемая правка.
+        if not report["certification_id"]:
+            print(json.dumps({"schema": 1, "pass": False,
+                              "error": "нет записи реестра для провайдера — отчёт не привязать"}))
+            return 2
+        reports_dir = gate._REPORTS_DIR
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        out = reports_dir / f"{report['certification_id']}.json"
+        # defense-in-depth: даже если реестр протащит неожиданный id, писать вне каталога нельзя
+        if out.resolve().parent != reports_dir.resolve():
+            print(json.dumps({"schema": 1, "pass": False,
+                              "error": "certification_id ведёт за пределы каталога отчётов"}))
+            return 2
+        out.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps({"schema": 1, "pass": report["pass"], "report": str(out),
+                          "sha256": hashlib.sha256(out.read_bytes()).hexdigest()},
+                         ensure_ascii=False, indent=2))
+        return rc
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return rc
 

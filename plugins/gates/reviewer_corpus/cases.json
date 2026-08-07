@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "policy_id": "portable-review-v1",
+  "policy_id": "portable-review-v2",
   "cases": [
     {
       "id": "fail-open-return",

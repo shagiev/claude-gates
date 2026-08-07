@@ -3,6 +3,7 @@
 протокола сходимости НЕ сгорают на outage; (3) причина (usage limit) ВИДНА оператору,
 не маскируется «дрейфом схемы»; (4) кэш/вердикт не пишутся."""
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +34,10 @@ def gate_env(tmp_path, monkeypatch):
 
 
 def _stub_output(monkeypatch, payload):
-    monkeypatch.setattr(g, "run_companion_review", lambda base, scope: payload)
+    """Codex-ревьюер пары отдаёт outage-конверт. Адаптер переехал на `task --json`, поэтому
+    подменяем сам вызов companion, а не снятую легаси-обёртку."""
+    monkeypatch.setattr(g, "_exec_companion",
+                        lambda args: SimpleNamespace(returncode=1, stdout=payload, stderr=""))
 
 
 def _rounds():
@@ -235,7 +239,7 @@ def test_r3_adjudication_reason_redacted(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "FINDINGS_DIR", tmp_path / "rf")
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "issue")])
+    g.merge_round(L, [("medium", "issue")])
     g.adjudicate(L, "F1", "refuted", "проверено: token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig1")
     assert "eyJhbGciOiJIUzI1NiJ9" not in L["findings"]["F1"]["reason"]
     assert "eyJhbGciOiJIUzI1NiJ9" not in (tmp_path / "a.log").read_text()

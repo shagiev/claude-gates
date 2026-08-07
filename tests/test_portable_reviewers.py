@@ -1,4 +1,5 @@
-"""G4 portable reviewer resolver: direct Gemini + mandatory Claude supplemental."""
+"""Portable resolver v2: обязательная blocking-пара Codex+Claude (дизайн
+docs/2026-08-07-host-relative-reviewer-ladder-design.md, §3/§4, матрица B1..B14)."""
 import io
 import json
 import urllib.error
@@ -13,6 +14,7 @@ import certify_reviewers as cr
 _REAL_RESOLVE_PORTABLE = g.resolve_portable_review_plan
 _REAL_RUN_CERTIFIED = g.run_certified_reviewer
 _REAL_RESOLVE_CLAUDE = g._resolve_claude_bin
+_REAL_CERTIFICATION = g.reviewer_certification
 _CLEAN = "Verdict: approve\n\nNo material findings.\n"
 _BLOCK = "Verdict: needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
 
@@ -48,7 +50,7 @@ def test_model_family_is_closed_and_unknown_fails_closed():
 
 def test_shipped_registry_is_strict_and_gemini_stays_candidate():
     policy, certs = g.load_reviewer_certifications()
-    assert policy == "portable-review-v1"
+    assert policy == "portable-review-v2"
     assert certs
     assert g.reviewer_certification("gemini", "gemini-2.5-pro", "blocking") is None
     candidate = g.reviewer_certification(
@@ -58,7 +60,7 @@ def test_shipped_registry_is_strict_and_gemini_stays_candidate():
         "cursor", "cursor-grok-4.5-high", "blocking") is None
     assert _cert(
         "cursor", "cursor-grok-4.5-high", "blocking", candidate=True).family == "xai"
-    assert _cert("claude", "opus", "supplemental").roles == ("supplemental",)
+    assert _cert("claude", "opus", "blocking").roles == ("blocking",)
 
 
 @pytest.mark.parametrize("content", ("{broken", "{}", '{"schema":1,"policy_id":"x","certifications":[{}]}'))
@@ -88,55 +90,72 @@ def test_multi_actual_model_certification_is_rejected_by_loader(tmp_path, monkey
     assert g.load_reviewer_certifications() == (None, ())
 
 
-def test_portable_does_not_treat_unattested_cursor_as_certified(monkeypatch):
+def test_b14_portable_needs_neither_gemini_key_nor_cursor(monkeypatch):
+    """B14/§3: пара самодостаточна — ни ключ Gemini, ни Cursor CLI не требуются и не
+    упоминаются в отказах. Ровно та боль, из-за которой политика и переписывалась."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: "/opt/cursor-agent")
-    plan, err = g.resolve_portable_review_plan("portable")
-    assert plan is None
-    assert "нет доступного certified" in err
-
-
-def test_portable_without_certified_backend_blocks_with_candidate_hint(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "x" * 48)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
     plan, err = g.resolve_portable_review_plan("portable")
-    assert plan is None
-    assert "candidate" in err and "certification suite" in err
+    assert plan is not None and not err
+    assert [c.provider for c in plan] == ["codex", "claude"]
+    assert [c.family for c in plan] == ["openai", "anthropic"]
+
+
+def test_portable_does_not_treat_unattested_cursor_as_certified(monkeypatch):
+    """P12: Cursor не аттестует фактическую модель → в blocking-панель не входит никогда."""
+    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: "/opt/cursor-agent")
+    plan, err = g.resolve_portable_review_plan("portable")
+    assert plan is not None and "cursor" not in [c.provider for c in plan]
+
+
+def test_b5_gemini_profile_adds_to_pair_never_replaces_it(monkeypatch):
+    """§4: профиль может только ДОБАВИТЬ ревьюера — панель меньше пары недостижима."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    plan, err = g.resolve_portable_review_plan("gemini")
+    assert plan is None and "ДОБАВИТЬ" in err        # Gemini не настроен → профиль отклонён
+    plan2, err2 = g.resolve_portable_review_plan("portable")
+    assert plan2 is not None and not err2            # но пара при этом работает
 
 
 def test_portable_profiles_and_panel_guards(monkeypatch):
-    gemini = replace(
-        _cert("gemini", "gemini-2.5-pro", "blocking", candidate=True),
-        status="certified",
-    )
-    cursor = replace(
-        _cert("cursor", "cursor-grok-4.5-high", "blocking", candidate=True),
-        status="certified",
-    )
-    supplemental = _cert("claude", "opus", "supplemental")
+    codex = _cert("codex", g.codex_model(), "blocking")
+    claude = _cert("claude", "opus", "blocking")
+    gemini = replace(_cert("gemini", "gemini-2.5-pro", "blocking", candidate=True),
+                     status="certified")
     certs = {
+        ("codex", g.codex_model(), "blocking"): codex,
+        ("claude", "opus", "blocking"): claude,
         ("gemini", "gemini-2.5-pro", "blocking"): gemini,
-        ("cursor", "cursor-grok-4.5-high", "blocking"): cursor,
-        ("claude", "opus", "supplemental"): supplemental,
     }
     monkeypatch.setattr(
         g, "reviewer_certification",
         lambda provider, model, role, **_kwargs: certs.get((provider, model, role)),
     )
-    monkeypatch.setenv("GEMINI_API_KEY", "synthetic")
-    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: "/opt/cursor-agent")
     strong, err = g.resolve_portable_review_plan("strong")
     assert strong is None and "не реализован" in err
-    gemini_only, err = g.resolve_portable_review_plan("gemini")
-    assert not err and gemini_only == (gemini, supplemental)
 
-    certs[("gemini", "gemini-2.5-pro", "blocking")] = replace(
-        gemini, family="openai")
-    assert g.resolve_portable_review_plan("portable")[0] is None
+    monkeypatch.setenv("GEMINI_API_KEY", "synthetic")
+    with_gemini, err = g.resolve_portable_review_plan("gemini")
+    assert not err and with_gemini == (codex, claude, gemini)   # ДОБАВЛЕН к паре, не вместо
+
+    # B3: панель не зависит ни от одного значения окружения, которое агент может выставить
+    monkeypatch.setenv("GATES_HOST", "codex")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "spoofed")
+    assert g.resolve_portable_review_plan("portable")[0] == (codex, claude)
+
+    # повтор семейства в панели → блок (независимость по семействам)
+    certs[("gemini", "gemini-2.5-pro", "blocking")] = replace(gemini, family="openai")
+    assert g.resolve_portable_review_plan("gemini")[0] is None
+
+    # отсутствие ЛЮБОГО члена пары → блок, без понижения до одиночного ревьюера
     certs[("gemini", "gemini-2.5-pro", "blocking")] = gemini
-    del certs[("claude", "opus", "supplemental")]
-    assert g.resolve_portable_review_plan("portable")[0] is None
+    for missing in (("codex", g.codex_model(), "blocking"), ("claude", "opus", "blocking")):
+        saved = certs.pop(missing)
+        plan, err = g.resolve_portable_review_plan("portable")
+        assert plan is None and "не понижается" in err
+        certs[missing] = saved
 
 
 def test_gemini_direct_api_keeps_key_out_of_url_and_body(monkeypatch):
@@ -295,7 +314,7 @@ def test_certification_corpus_runner_requires_every_case_every_repetition(monkey
         return (text, "gemini-2.5-pro", "", {"totalTokenCount": 10})
 
     monkeypatch.setattr(g, "run_gemini_review_text", fake_review)
-    rc, report = cr.run_gemini(2)
+    rc, report = cr.run_provider("gemini", 2)
     assert rc == 0 and report["pass"] is True
     assert len(report["results"]) == len(corpus["cases"]) * 2
     assert all(row["pass"] for row in report["results"])
@@ -308,7 +327,7 @@ def test_certification_runner_fails_on_one_missed_required_case(monkeypatch):
         lambda _diff, *, allow_candidate: (
             _CLEAN, "gemini-2.5-pro", "", {}),
     )
-    rc, report = cr.run_gemini(1)
+    rc, report = cr.run_provider("gemini", 1)
     assert rc == 2 and report["pass"] is False
     assert any(not row["pass"] for row in report["results"])
 
@@ -338,7 +357,7 @@ def test_claude_supplemental_pins_actual_model_and_strict_contract(monkeypatch):
         assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "opus"
         assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep"
         assert "diff" not in cmd
-        assert "supplemental advisory reviewer" in _kwargs["input"]
+        assert "blocking adversarial reviewer" in _kwargs["input"]
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps({
@@ -351,9 +370,10 @@ def test_claude_supplemental_pins_actual_model_and_strict_contract(monkeypatch):
         )
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    run = g.run_claude_supplemental("HEAD~1", "HEAD")
+    run = g._run_text_reviewer(_cert("claude", "opus", "blocking"), "blocking",
+                            "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "ok"
-    assert run.role == "supplemental"
+    assert run.role == "blocking"
     assert run.actual_models == ("claude-opus-5",)
     assert run.verdict is not None and run.verdict.blocking
 
@@ -368,7 +388,8 @@ def test_claude_failure_diagnostic_is_redacted(monkeypatch):
         return SimpleNamespace(returncode=1, stdout="", stderr=f"token={secret}")
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    run = g.run_claude_supplemental("HEAD~1", "HEAD")
+    run = g._run_text_reviewer(_cert("claude", "opus", "blocking"), "blocking",
+                            "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "invalid"
     assert secret not in run.detail
     assert "скрыто" in run.detail
@@ -391,7 +412,8 @@ def test_claude_actual_model_mismatch_blocks(monkeypatch):
         )
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    run = g.run_claude_supplemental("HEAD~1", "HEAD")
+    run = g._run_text_reviewer(_cert("claude", "opus", "blocking"), "blocking",
+                            "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "invalid"
     assert run.actual_models == ("claude-fable-5",)
     assert "не совпал" in run.detail
@@ -426,7 +448,7 @@ def test_old_blocking_only_cache_cannot_satisfy_portable_panel(
         tmp_path, monkeypatch):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
     blocking = _cert("cursor", "cursor-grok-4.5-high", "blocking", candidate=True)
-    supplemental = _cert("claude", "opus", "supplemental")
+    supplemental = _cert("claude", "opus", "blocking")
     old_panel = [g._cert_cache_record(blocking, "blocking")]
     portable_panel = old_panel + [g._cert_cache_record(supplemental, "supplemental")]
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), old_panel)
@@ -435,7 +457,7 @@ def test_old_blocking_only_cache_cannot_satisfy_portable_panel(
 
 def test_policy_change_invalidates_portable_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
-    supplemental = _cert("claude", "opus", "supplemental")
+    supplemental = _cert("claude", "opus", "blocking")
     panel = [g._cert_cache_record(supplemental, "supplemental")]
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), panel)
     monkeypatch.setattr(
@@ -449,7 +471,7 @@ def test_policy_change_invalidates_portable_cache(tmp_path, monkeypatch):
 def test_malformed_actual_models_invalidates_cache_without_exception(
         tmp_path, monkeypatch, bad_actual):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
-    cert = _cert("claude", "opus", "supplemental")
+    cert = _cert("claude", "opus", "blocking")
     panel = [g._cert_cache_record(cert, "supplemental")]
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), panel)
     record = json.loads(g.ledger_path("a" * 40).read_text())
@@ -520,18 +542,18 @@ def portable_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "_empirical_gate", lambda baseline, head: 0)
     monkeypatch.setattr(g, "_empirical_config", lambda root, ref: ("absent", None, 600))
     monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: [])
-    blocking = _cert("cursor", "cursor-grok-4.5-high", "blocking", candidate=True)
-    supplemental = _cert("claude", "opus", "supplemental")
+    codex = _cert("codex", g.codex_model(), "blocking")
+    claude = _cert("claude", "opus", "blocking")
     monkeypatch.setattr(
         g, "resolve_portable_review_plan",
-        lambda profile: ((blocking, supplemental), ""),
+        lambda profile: ((codex, claude), ""),
     )
     monkeypatch.setenv("REVIEW_PROVIDER", "portable")
-    return tmp_path, blocking, supplemental
+    return tmp_path, codex, claude
 
 
 def _run(cert, text, *, status="ok"):
-    role = "supplemental" if "supplemental" in cert.roles else "blocking"
+    role = "blocking"
     actual = cert.actual_models
     verdict = g.parse_review_output(text) if status == "ok" else None
     return g.ReviewerRun(
@@ -546,26 +568,19 @@ def _deploy_verdict():
     return json.loads(files[0].read_text()) if files else None
 
 
-def test_claude_high_is_visible_but_not_blocking(portable_gate, monkeypatch, capsys):
-    _tmp, blocking, supplemental = portable_gate
+def test_claude_finding_is_blocking_not_advisory(portable_gate, monkeypatch):
+    """§3: роль supplemental упразднена — находка Claude участвует в union и блокирует.
+    Раньше она была advisory и деплой уезжал."""
+    _tmp, codex, claude = portable_gate
     monkeypatch.setattr(
         g, "run_certified_reviewer",
         lambda cert, _base, _head: (
-            _run(cert, _CLEAN) if cert == blocking else _run(cert, _BLOCK)),
+            _run(cert, _CLEAN) if cert.provider == "codex" else _run(cert, _BLOCK)),
     )
-    assert g.check_reviewed_cli() == 0
-    assert "[high] (claude)" in capsys.readouterr().err
-    verdict = _deploy_verdict()
-    assert {r["role"] for r in verdict["providers"]} == {"blocking", "supplemental"}
-    assert verdict["supplemental_findings"] == [{
-        "severity": "high",
-        "title": "реальная проблема (app/x.py:1)",
-        "provider": "claude",
-    }]
-    assert "supplemental-finding provider=claude severity=high" in g.AUDIT_LOG.read_text()
-    assert not list(g.LEDGER_DIR.glob("*.json"))   # advisory не исчезнет через clean cache
+    assert g.check_reviewed_cli() == 2, "находка Claude обязана блокировать, а не быть advisory"
     ledger = g.load_findings_ledger("HEAD~1")
-    assert ledger["findings"] == {}
+    assert [f["provider"] for f in ledger["findings"].values()] == ["claude"]
+    assert ledger["findings"]["F1"]["status"] == "open"      # в union, а не в advisory-списке
 
 
 def test_unset_provider_uses_portable_default(portable_gate, monkeypatch):
@@ -588,89 +603,102 @@ def test_unset_provider_uses_portable_default(portable_gate, monkeypatch):
 
 def test_default_portable_plan_miss_blocks_through_cli(
         portable_gate, monkeypatch, capsys):
+    """B6/B7 через CLI: неполная пара блокирует деплой и НЕ понижается до одиночного."""
     monkeypatch.delenv("REVIEW_PROVIDER", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setattr(g, "resolve_portable_review_plan", _REAL_RESOLVE_PORTABLE)
-    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
+    monkeypatch.setattr(
+        g, "reviewer_certification",
+        lambda provider, model, role, **_kw: (
+            _REAL_CERTIFICATION(provider, model, role, **_kw)
+            if provider != "codex" else None),
+    )
     assert g.check_reviewed_cli() == 2
-    assert "нет доступного certified" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "обязательная blocking-пара неполна" in err and "codex" in err
+    assert "GEMINI_API_KEY" not in err          # B14: ключ Gemini больше не требуется
 
 
 def test_default_portable_enters_real_dispatch_and_both_adapters(
         portable_gate, monkeypatch):
-    _tmp, _candidate_blocking, supplemental = portable_gate
-    gemini = replace(
-        _cert("gemini", "gemini-2.5-pro", "blocking", candidate=True),
-        status="certified",
-    )
-
-    def certification(provider, model, role, **_kwargs):
-        if (provider, model, role) == ("gemini", "gemini-2.5-pro", "blocking"):
-            return gemini
-        if (provider, model, role) == ("claude", "opus", "supplemental"):
-            return supplemental
-        return None
-
-    monkeypatch.setattr(g, "reviewer_certification", certification)
-    monkeypatch.setenv("GEMINI_API_KEY", "synthetic")
+    """B1: дефолтный портейбл реально доходит до ОБОИХ адаптеров пары (не до стабов плана)."""
     monkeypatch.delenv("REVIEW_PROVIDER", raising=False)
     monkeypatch.setattr(g, "resolve_portable_review_plan", _REAL_RESOLVE_PORTABLE)
     monkeypatch.setattr(g, "run_certified_reviewer", _REAL_RUN_CERTIFIED)
-    monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
-    monkeypatch.setattr(
-        g.urllib.request, "urlopen",
-        lambda *_args, **_kwargs: _HTTPResponse({
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {"parts": [{"text": _CLEAN}]},
-            }],
-            "modelVersion": "gemini-2.5-pro",
-        }),
-    )
-    calls = []
+    seen = []
+
+    def fake_companion(args):
+        seen.append("codex")
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+            "status": 0, "rawOutput": _CLEAN}))
 
     def fake_run(cmd, **_kwargs):
-        calls.append(tuple(cmd))
-        if cmd[0] == "/bin/sh":
-            return SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({
-                    "is_error": False,
-                    "result": _BLOCK,
-                    "modelUsage": {"claude-opus-5": {"inputTokens": 1}},
-                }),
-                stderr="",
-            )
+        if cmd and cmd[0] == "/bin/sh":
+            seen.append("claude")
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+                "is_error": False, "result": _CLEAN,
+                "modelUsage": {"claude-opus-5": {"inputTokens": 1}}}))
         return SimpleNamespace(returncode=0, stdout="diff", stderr="")
 
+    monkeypatch.setattr(g, "_exec_companion", fake_companion)
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     assert g.check_reviewed_cli() == 0
-    assert any(cmd and cmd[0] == "/bin/sh" for cmd in calls)
+    assert sorted(seen) == ["claude", "codex"], "оба члена пары обязаны отработать"
     audit_text = g.AUDIT_LOG.read_text()
-    assert "role=blocking provider=gemini" in audit_text
-    assert "role=supplemental provider=claude" in audit_text
+    assert "role=blocking provider=codex" in audit_text
+    assert "role=blocking provider=claude" in audit_text
 
 
-def test_missing_claude_supplemental_artifact_blocks(portable_gate, monkeypatch):
-    _tmp, blocking, supplemental = portable_gate
+def test_b7_missing_claude_artifact_blocks_without_downgrade(portable_gate, monkeypatch):
+    _tmp, _codex, _claude = portable_gate
     monkeypatch.setattr(
         g, "run_certified_reviewer",
         lambda cert, _base, _head: (
-            _run(cert, _CLEAN) if cert == blocking
+            _run(cert, _CLEAN) if cert.provider == "codex"
             else _run(cert, _CLEAN, status="invalid")),
     )
     assert g.check_reviewed_cli() == 2
 
 
 def test_independent_blocking_high_still_blocks(portable_gate, monkeypatch):
-    _tmp, blocking, supplemental = portable_gate
+    _tmp, _codex, _claude = portable_gate
     monkeypatch.setattr(
         g, "run_certified_reviewer",
         lambda cert, _base, _head: (
-            _run(cert, _BLOCK) if cert == blocking else _run(cert, _CLEAN)),
+            _run(cert, _BLOCK) if cert.provider == "codex" else _run(cert, _CLEAN)),
     )
     assert g.check_reviewed_cli() == 2
     ledger = g.load_findings_ledger("HEAD~1")
-    assert ledger["findings"]["F1"]["provider"] == "cursor"
+    assert ledger["findings"]["F1"]["provider"] == "codex"
+
+
+# ═══ Code-review находки (Codex, 07.08.2026): адаптеры ═══
+
+@pytest.mark.parametrize("bad_status", [False, 0.0, "0", None])
+def test_codex_task_status_must_be_real_zero_int(monkeypatch, bad_status):
+    """`status != 0` пропускал False и 0.0 — деградировавший конверт считался успешным
+    прогоном, и обязательная пара молча вырождалась в одного Claude."""
+    monkeypatch.setattr(g, "_exec_companion", lambda args: SimpleNamespace(
+        returncode=0, stderr="",
+        stdout=json.dumps({"status": bad_status, "rawOutput": _CLEAN})))
+    text, _actual, detail, _usage, status = g.run_codex_review_text(
+        "diff", role="blocking", allow_candidate=True)
+    assert text is None and status != "ok", f"status={bad_status!r} принят как успех"
+    assert "status" in detail
+
+
+def test_claude_model_mismatch_redacts_secret_in_model_key(monkeypatch, tmp_path):
+    """Ключи modelUsage — недоверенный вход. При отбраковке они уходили в audit и stderr
+    без редакции, вынося наружу токен из битого ответа."""
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
+    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
+    secret = "sk-ant-LEAKEDSECRET0123456789ABCDEF"
+    monkeypatch.setattr(g.subprocess, "run", lambda cmd, **kw: SimpleNamespace(
+        returncode=0, stderr="", stdout=json.dumps({
+            "is_error": False, "result": _CLEAN, "modelUsage": {secret: {"inputTokens": 1}}})))
+    cert = _cert("claude", "opus", "blocking")
+    run = g._run_text_reviewer(cert, "blocking", "HEAD~1", "HEAD", g.run_claude_review_text)
+    assert run.status != "ok"
+    assert secret not in "".join(run.actual_models)
+    assert secret not in run.detail
+    assert secret not in (tmp_path / "a.log").read_text()
