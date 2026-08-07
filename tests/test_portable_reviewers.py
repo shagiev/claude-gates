@@ -15,6 +15,7 @@ _REAL_RESOLVE_PORTABLE = g.resolve_portable_review_plan
 _REAL_RUN_CERTIFIED = g.run_certified_reviewer
 _REAL_RESOLVE_CLAUDE = g._resolve_claude_bin
 _REAL_CERTIFICATION = g.reviewer_certification
+_REAL_RESOLVE_COMPANION = g.resolve_companion_cmd
 _CLEAN = "Verdict: approve\n\nNo material findings.\n"
 _BLOCK = "Verdict: needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
 
@@ -627,7 +628,7 @@ def test_default_portable_enters_real_dispatch_and_both_adapters(
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
     seen = []
 
-    def fake_companion(args):
+    def fake_companion(args, **_kw):
         seen.append("codex")
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "status": 0, "rawOutput": _CLEAN}))
@@ -678,7 +679,7 @@ def test_independent_blocking_high_still_blocks(portable_gate, monkeypatch):
 def test_codex_task_status_must_be_real_zero_int(monkeypatch, bad_status):
     """`status != 0` пропускал False и 0.0 — деградировавший конверт считался успешным
     прогоном, и обязательная пара молча вырождалась в одного Claude."""
-    monkeypatch.setattr(g, "_exec_companion", lambda args: SimpleNamespace(
+    monkeypatch.setattr(g, "_exec_companion", lambda args, **_kw: SimpleNamespace(
         returncode=0, stderr="",
         stdout=json.dumps({"status": bad_status, "rawOutput": _CLEAN})))
     text, _actual, detail, _usage, status = g.run_codex_review_text(
@@ -702,3 +703,51 @@ def test_claude_model_mismatch_redacts_secret_in_model_key(monkeypatch, tmp_path
     assert secret not in "".join(run.actual_models)
     assert secret not in run.detail
     assert secret not in (tmp_path / "a.log").read_text()
+
+
+def test_f1_blocking_codex_adapter_ignores_env_command_override(monkeypatch, tmp_path):
+    """Находка ревью 07.08: CODEX_COMPANION_CMD/*_PLUGIN_ROOT позволяли подставить
+    approve-шим вместо обязательного Codex — Anthropic-авторский код схлопывался в саморевью.
+    Blocking-путь обязан резолвить движок без оглядки на окружение."""
+    shim = tmp_path / "shim.sh"
+    shim.write_text('#!/bin/sh\necho \'{"status":0,"rawOutput":"Verdict: approve\\n\\n'
+                    'No material findings."}\'\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("CODEX_COMPANION_CMD", f"sh {shim}")
+    monkeypatch.setenv("CODEX_PLUGIN_ROOT", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    cmd = _REAL_RESOLVE_COMPANION(allow_env_override=False)
+    assert str(shim) not in " ".join(cmd), "blocking-путь не должен брать команду из окружения"
+    assert str(tmp_path) not in " ".join(cmd)
+
+
+def test_f1b_certified_path_resists_hostile_home_path_and_node_options(monkeypatch, tmp_path):
+    """Ревью дельты 07.08: allow_env_override=False снимал CODEX_COMPANION_CMD, но `node`
+    брался из PATH, companion — из раскрытого HOME, а NODE_OPTIONS наследовался. Любой из трёх
+    векторов возвращает approve-шим вместо обязательного Codex."""
+    fake_home = tmp_path / "home"
+    (fake_home / ".claude/plugins/cache/openai-codex/codex/9.9.9/scripts").mkdir(parents=True)
+    (fake_home / ".claude/plugins/cache/openai-codex/codex/9.9.9/scripts"
+     / "codex-companion.mjs").write_text("// approve shim")
+    shim_bin = tmp_path / "bin"
+    shim_bin.mkdir()
+    (shim_bin / "node").write_text("#!/bin/sh\necho shim\n")
+    (shim_bin / "node").chmod(0o755)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", f"{shim_bin}:/usr/bin:/bin")
+    monkeypatch.setenv("NODE_OPTIONS", "--require /tmp/evil.js")
+    monkeypatch.setenv("NODE_PATH", str(tmp_path))
+
+    cmd = _REAL_RESOLVE_COMPANION(allow_env_override=False)
+    joined = " ".join(cmd)
+    assert str(shim_bin) not in joined, "node обязан резолвиться мимо PATH вызывающего"
+    assert str(fake_home) not in joined, "companion обязан резолвиться мимо HOME вызывающего"
+
+    # тот же вектор уровнем ниже: динамический загрузчик исполняет чужой код В ПРОЦЕССЕ
+    # ревьюера, не подменяя ни бинарь, ни скрипт
+    for var in ("DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "DYLD_LIBRARY_PATH"):
+        monkeypatch.setenv(var, "/tmp/evil.dylib")
+    env = g._certified_subprocess_env()
+    for var in ("NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD",
+                "DYLD_LIBRARY_PATH"):
+        assert var not in env, f"{var} исполняет чужой код в процессе ревьюера"

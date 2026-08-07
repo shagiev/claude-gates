@@ -210,3 +210,20 @@ def test_duplicate_with_null_dup_of_does_not_swallow_new_critical(led):
     assert g.convergence_decision(L)[0] in ("block", "escalate")
     assert any(f["status"] == "open" and "деньги утекают" in (f.get("title") or "")
                for f in L["findings"].values())
+
+
+def test_f3_blocking_dup_onto_carried_root_reopens_it(led):
+    """Находка ревью 07.08: корень со статусом `carried` не блокирует, а DUP на него оседал
+    дубликатом — эскалировалась только severity. Получалось запрещённое P7 состояние
+    (severity=critical, status=carried), и новая critical второго члена пары не блокировала."""
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("low", "Minor nit")])
+    L["rounds"] = g.HARD_CAP_ROUNDS + 1
+    L["findings"]["F1"]["round"] = L["rounds"]
+    g.apply_carry_over(L)
+    assert L["findings"]["F1"]["status"] == "carried"
+    g.merge_round(L, [("critical", "[DUP:F1] на самом деле утекают деньги")])
+    assert L["findings"]["F1"]["status"] == "open", "carried-корень обязан пере-открыться"
+    assert L["findings"]["F1"]["severity"] == "critical"
+    # за hard-cap открытая находка эскалирует к человеку; инвариант здесь — «не allow»
+    assert g.convergence_decision(L)[0] in ("block", "escalate")

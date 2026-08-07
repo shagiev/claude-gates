@@ -508,14 +508,70 @@ def warn_if_strict() -> None:
               file=sys.stderr)
 
 
-def resolve_companion_cmd() -> list[str]:
-    override = os.environ.get("CODEX_COMPANION_CMD")
+def _trusted_home() -> Path:
+    """Домашний каталог из БД пользователей, а не из $HOME: переменную окружения выставляет
+    тот же вызывающий, что запускает деплой, и подменённый HOME указывает на свой кэш плагина."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
+
+
+#: PATH для сертифицированного прогона: системные каталоги + типовые установки node.
+#: PATH вызывающего не используется — иначе `node` подменяется шимом из репозитория.
+_TRUSTED_PATH_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin")
+#: переменные, которыми чужой код исполняется В ПРОЦЕССЕ ревьюера, не подменяя ни бинарь,
+#: ни скрипт: сначала уровень Node, затем уровень динамического загрузчика (SIP не спасает —
+#: node из homebrew не является защищённым бинарём).
+_NODE_INJECTION_VARS = (
+    "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+)
+
+
+def _certified_subprocess_env() -> dict:
+    """Окружение сертифицированного прогона: без Node-инъекций и с доверенным PATH."""
+    env = {k: v for k, v in os.environ.items() if k not in _NODE_INJECTION_VARS}
+    env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    return env
+
+
+def _trusted_node_bin() -> "str | None":
+    """Абсолютный node из доверенных каталогов (включая nvm под доверенным HOME)."""
+    home = _trusted_home()
+    nvm = sorted((home / ".nvm" / "versions" / "node").glob("*/bin/node"), reverse=True)
+    for cand in [Path(d) / "node" for d in _TRUSTED_PATH_DIRS] + nvm:
+        try:
+            resolved = cand.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK) and not _inside_repo(resolved):
+            return str(resolved)
+    return None
+
+
+def _inside_repo(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(Path(REPO_ROOT).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def resolve_companion_cmd(*, allow_env_override: bool = True) -> list[str]:
+    """allow_env_override=False — для СЕРТИФИЦИРОВАННОГО blocking-прогона. Иначе вызывающий
+    (тот же агент, что запускает деплой) подставляет через CODEX_COMPANION_CMD/*_PLUGIN_ROOT
+    свой approve-шим вместо обязательного Codex, и Anthropic-авторский код схлопывается в
+    саморевью. Тот же класс, что снятый env-обход REVIEW_PROVIDER (§4)."""
+    override = os.environ.get("CODEX_COMPANION_CMD") if allow_env_override else None
     if override:
         return shlex.split(override)
     # CODEX_PLUGIN_ROOT (наш override) и официальный CLAUDE_PLUGIN_ROOT (напр. --plugin-dir install);
     # используем только если companion реально там есть, иначе продолжаем к кэш-глобу (Codex P2).
     for env_var in ("CODEX_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
-        root = os.environ.get(env_var)
+        root = os.environ.get(env_var) if allow_env_override else None
         if not root:
             continue
         cand = Path(root) / "scripts" / "codex-companion.mjs"
@@ -524,11 +580,21 @@ def resolve_companion_cmd() -> list[str]:
         deep = sorted(glob.glob(str(Path(root) / "**" / "codex-companion.mjs"), recursive=True))
         if deep:
             return ["node", deep[-1]]
-    matches = sorted(glob.glob(
-        os.path.expanduser("~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
+    # Сертифицированный прогон: HOME/PATH вызывающего не участвуют, node — абсолютный,
+    # ни он, ни companion не могут лежать внутри ревьюируемого репозитория.
+    home = Path(os.path.expanduser("~")) if allow_env_override else _trusted_home()
+    matches = sorted(glob.glob(str(
+        home / ".claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
+    if not allow_env_override:
+        matches = [m for m in matches if not _inside_repo(Path(m))]
     if not matches:
         raise FileNotFoundError("codex-companion.mjs не найден (установлен ли плагин openai-codex?)")
-    return ["node", matches[-1]]
+    if allow_env_override:
+        return ["node", matches[-1]]
+    node = _trusted_node_bin()
+    if node is None:
+        raise FileNotFoundError("доверенный node не найден для сертифицированного прогона")
+    return [node, matches[-1]]
 
 
 _REVIEW_FOCUS = (
@@ -536,19 +602,23 @@ _REVIEW_FOCUS = (
     "Return a structured Verdict and findings with severity; critical/high block the deploy.")
 
 
-def _exec_companion(args: list[str]) -> subprocess.CompletedProcess | None:
+def _exec_companion(args: list[str], *,
+                    allow_env_override: bool = True) -> subprocess.CompletedProcess | None:
     """Единственное место, где companion запускается: резолв, таймаут и редакция argv в
     диагностике. Вынесено, чтобы у внешних потребителей (скилл design-review) НЕ было повода
-    собирать вызов самим — самосборка теряла CODEX_COMPANION_CMD и печатала argv мимо редакции.
+    собирать вызов самим — самосборка печатала argv мимо редакции.
+    allow_env_override=False обязателен для сертифицированного blocking-прогона (см.
+    resolve_companion_cmd): там путь к движку не берётся из окружения.
     None = отказ (плагин не найден / таймаут / OSError); решение по отказу — за вызывающим."""
     try:
-        cmd = resolve_companion_cmd()   # Codex P2: отсутствие плагина = outage (None), не traceback
+        cmd = resolve_companion_cmd(allow_env_override=allow_env_override)   # Codex P2: нет плагина = outage
     except FileNotFoundError as e:
         print(f"[codex-gate] плагин codex-companion не найден: {e}", file=sys.stderr)
         return None
     try:
         return subprocess.run(cmd + args, capture_output=True, text=True,
-                              timeout=_REVIEW_TIMEOUT_S)
+                              timeout=_REVIEW_TIMEOUT_S,
+                              env=None if allow_env_override else _certified_subprocess_env())
     except (subprocess.TimeoutExpired, OSError) as e:
         # источник #8 (R5-F2): TimeoutExpired.__str__ включает ВЕСЬ argv — если в команде есть
         # `--api-key=…`, он попал бы оператору целиком; редактируем текст исключения
@@ -962,6 +1032,14 @@ def merge_round(led: dict, blocking_findings: "list[tuple]",
                   f"«{redact_secrets(rest)[:80]}» (§6b: новая улика после решения человека)")
             continue
         if kind in ("dup", "dispute") and target is not None:
+            # `carried` не блокирует (convergence считает только `open`), поэтому DUP на такой
+            # корень оседал дубликатом, эскалировав лишь severity: получалось запрещённое P7
+            # состояние severity=critical/status=carried, и новая находка второго члена пары
+            # не блокировала. Блокирующая улика обязана вернуть корень в игру.
+            if target.get("status") == "carried" and _is_blocking_severity(sev):
+                target["status"] = "open"
+                audit(f"reopen-carried {fid} — блокирующая улика вернула перенесённую находку "
+                      "в открытые (§5/P7)")
             _SEV_RANK = {"critical": 3, "high": 2, "medium": 1, "low": 0}
             if _SEV_RANK.get(sev, 3) > _SEV_RANK.get(target.get("severity"), 3):   # unknown=critical с ОБЕИХ сторон (спор F4-2)
                 target["severity"] = sev   # re-raise эскалирует severity ОБЕИМИ ветками (споры
@@ -2161,7 +2239,8 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
     # `--sandbox` companion НЕ знает: флаг уезжал в positionals и склеивался с промптом.
     # Без `--write` ход и так read-only; промпт обязан быть ЕДИНСТВЕННЫМ позиционным.
     r = _exec_companion(["task", "--json", "--model", requested,
-                         _build_reviewer_prompt(diff_text, role=role)])
+                         _build_reviewer_prompt(diff_text, role=role)],
+                        allow_env_override=False)
     if r is None:
         return (None, requested, "companion недоступен (плагин не найден/таймаут)", {}, "unavailable")
     if r.returncode != 0:

@@ -67,6 +67,15 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # запустил живое ревью — реальные траты и вис до _REVIEW_TIMEOUT_S (900 с). Инертная
     # команда делает забытый мок невозможным (правило «тесты не ходят в production-сервисы»).
     monkeypatch.setenv("CODEX_COMPANION_CMD", "bash -c 'exit 99'")
+    # Blocking-путь СОЗНАТЕЛЬНО игнорирует CODEX_COMPANION_CMD (иначе вызывающий подставляет
+    # approve-шим вместо обязательного Codex). Значит инертной переменной уже недостаточно:
+    # подменяем сам резолвер — это атрибут модуля, а не окружение, поэтому агент им управлять
+    # не может, а тест забыть мок — не должен.
+    _real_resolve = g.resolve_companion_cmd
+    monkeypatch.setattr(
+        g, "resolve_companion_cmd",
+        lambda **kw: (["bash", "-c", "exit 99"] if kw.get("allow_env_override") is False
+                      else _real_resolve(**kw)))
     for _root_var in ("CODEX_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
         monkeypatch.delenv(_root_var, raising=False)   # override выше их и так перебивает
     # pre-push гейт: ambient INTEGRATION_* (напр. из ручного `INTEGRATION_SKIP=1 git push`)

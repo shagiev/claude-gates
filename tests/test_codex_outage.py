@@ -37,7 +37,7 @@ def _stub_output(monkeypatch, payload):
     """Codex-ревьюер пары отдаёт outage-конверт. Адаптер переехал на `task --json`, поэтому
     подменяем сам вызов companion, а не снятую легаси-обёртку."""
     monkeypatch.setattr(g, "_exec_companion",
-                        lambda args: SimpleNamespace(returncode=1, stdout=payload, stderr=""))
+                        lambda args, **_kw: SimpleNamespace(returncode=1, stdout=payload, stderr=""))
 
 
 def _rounds():
@@ -64,7 +64,10 @@ def test_outage_details_bounded():
 # ═══ формы A–D через check_reviewed_cli: fail-closed + rounds целы + причина видна ═══
 
 def test_form_a_companion_nonzero_fail_closed(gate_env, monkeypatch, capsys):
-    monkeypatch.setenv("CODEX_COMPANION_CMD", "bash -c 'echo Usage limit reached >&2; exit 1'")
+    # blocking-путь СОЗНАТЕЛЬНО игнорирует CODEX_COMPANION_CMD (подмена ревьюера — саморевью),
+    # поэтому отказ companion имитируем на его собственном seam
+    monkeypatch.setattr(g, "_exec_companion", lambda args, **_kw: SimpleNamespace(
+        returncode=1, stdout="", stderr="Usage limit reached"))
     assert g.check_reviewed_cli() == 2
     err = capsys.readouterr().err
     assert "Usage limit reached" in err                       # stderr companion виден
@@ -227,8 +230,8 @@ def test_r3_quoted_and_json_style_values_redacted():
 
 def test_r3_companion_stderr_redacted(gate_env, monkeypatch, capsys):
     # источник #2: non-zero exit печатал stderr дословно
-    monkeypatch.setenv("CODEX_COMPANION_CMD",
-                       "bash -c 'echo \"fatal: api_key=LEAKEDSECRET123\" >&2; exit 1'")
+    monkeypatch.setattr(g, "_exec_companion", lambda args, **_kw: SimpleNamespace(
+        returncode=1, stdout="", stderr="fatal: api_key=LEAKEDSECRET123"))
     assert g.check_reviewed_cli() == 2
     err = capsys.readouterr().err
     assert "LEAKEDSECRET123" not in err and "fatal" in err     # секрета нет, смысл есть
