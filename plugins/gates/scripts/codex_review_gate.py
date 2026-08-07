@@ -11,7 +11,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import tempfile
 import sys
 import urllib.error
 import urllib.request
@@ -521,20 +523,55 @@ def _trusted_home() -> Path:
 #: PATH для сертифицированного прогона: системные каталоги + типовые установки node.
 #: PATH вызывающего не используется — иначе `node` подменяется шимом из репозитория.
 _TRUSTED_PATH_DIRS = ("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin")
-#: переменные, которыми чужой код исполняется В ПРОЦЕССЕ ревьюера, не подменяя ни бинарь,
-#: ни скрипт: сначала уровень Node, затем уровень динамического загрузчика (SIP не спасает —
-#: node из homebrew не является защищённым бинарём).
-_NODE_INJECTION_VARS = (
-    "NODE_OPTIONS", "NODE_PATH", "NODE_REPL_EXTERNAL_MODULE",
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+#: Окружение сертифицированного прогона строится АЛЛОУЛИСТОМ, а не денилистом. Перечислять
+#: враждебные переменные — заведомо проигрышная игра: помимо инъекций кода (NODE_OPTIONS,
+#: LD_PRELOAD, DYLD_*) существуют провайдер-селекторы (CLAUDE_CODE_USE_BEDROCK/VERTEX),
+#: провайдерские base_url, skip-auth флаги, прокси (HTTPS_PROXY) и кастомные CA
+#: (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE) — любой из них уводит обязательный слот на
+#: подконтрольный шлюз, а `modelUsage`/`model` при этом отрапортуют сертифицированное имя.
+#: Всё, что не перечислено здесь, в прогон НЕ попадает. Отсутствие нужной переменной = отказ
+#: ревьюера, то есть fail-closed и видно оператору, а не тихий увод маршрута.
+_CERTIFIED_ENV_ALLOW = (
+    "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    # креды: это аутентификация, а не маршрут (base_url/провайдер-селекторы отброшены выше)
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
 )
 
 
-def _certified_subprocess_env() -> dict:
-    """Окружение сертифицированного прогона: без Node-инъекций и с доверенным PATH."""
-    env = {k: v for k, v in os.environ.items() if k not in _NODE_INJECTION_VARS}
+def _sterile_codex_home(requested_model: str) -> "str | None":
+    """Одноразовый gate-owned CODEX_HOME с конфигом, где задана ТОЛЬКО модель.
+
+    Аллоулист закрывает наследуемые переменные, но не файлы: `~/.codex/config.toml`
+    принадлежит вызывающему, и он может сохранить сертифицированное имя модели, дописав
+    `model_provider`/`base_url` — запрос уйдёт на подконтрольный эндпоинт, а реестр увидит
+    ожидаемое имя. Поэтому blocking-прогон получает свой конфиг без provider-секций.
+    Учётные данные копируются как есть: это аутентификация, а не маршрут."""
+    # Имя модели приходит из файла вызывающего: кавычка/перевод строки дописали бы в
+    # gate-owned конфиг ровно ту provider-секцию, ради изоляции которой он и создаётся.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", requested_model or ""):
+        return None
+    try:
+        home = Path(tempfile.mkdtemp(prefix="gates-codex-home-"))
+        (home / "config.toml").write_text(f'model = "{requested_model}"\n')
+        src = _trusted_home() / ".codex"
+        for name in ("auth.json", "credentials.json"):
+            cand = src / name
+            if cand.is_file():
+                shutil.copy2(cand, home / name)
+        return str(home)
+    except OSError:
+        return None
+
+
+def _certified_subprocess_env(codex_home: "str | None" = None) -> dict:
+    """Минимальное окружение: аллоулист + доверенные PATH и HOME. Ни одна переменная
+    вызывающего не может ни подменить бинарь, ни увести запрос на чужой эндпоинт."""
+    env = {k: v for k, v in os.environ.items() if k in _CERTIFIED_ENV_ALLOW}
     env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    env["HOME"] = str(_trusted_home())
+    if codex_home:
+        env["CODEX_HOME"] = codex_home
     return env
 
 
@@ -602,8 +639,8 @@ _REVIEW_FOCUS = (
     "Return a structured Verdict and findings with severity; critical/high block the deploy.")
 
 
-def _exec_companion(args: list[str], *,
-                    allow_env_override: bool = True) -> subprocess.CompletedProcess | None:
+def _exec_companion(args: list[str], *, allow_env_override: bool = True,
+                    codex_home: "str | None" = None) -> subprocess.CompletedProcess | None:
     """Единственное место, где companion запускается: резолв, таймаут и редакция argv в
     диагностике. Вынесено, чтобы у внешних потребителей (скилл design-review) НЕ было повода
     собирать вызов самим — самосборка печатала argv мимо редакции.
@@ -618,7 +655,8 @@ def _exec_companion(args: list[str], *,
     try:
         return subprocess.run(cmd + args, capture_output=True, text=True,
                               timeout=_REVIEW_TIMEOUT_S,
-                              env=None if allow_env_override else _certified_subprocess_env())
+                              env=(None if allow_env_override
+                                   else _certified_subprocess_env(codex_home)))
     except (subprocess.TimeoutExpired, OSError) as e:
         # источник #8 (R5-F2): TimeoutExpired.__str__ включает ВЕСЬ argv — если в команде есть
         # `--api-key=…`, он попал бы оператору целиком; редактируем текст исключения
@@ -1739,13 +1777,14 @@ def reviewer_certification(provider: str, requested_model: str, role: str,
     return None
 
 
-def codex_model() -> str:
+def codex_model(*, allow_env_override: bool = True) -> str:
     """Фактическая модель Codex-ревью — из `~/.codex/config.toml` (companion не принимает
     --model для review, берётся дефолт CLI). F3: раньше в кэш/вердикт писалось «codex», и смена
     модели не инвалидировала кэш, а вердикт не подтверждал, КТО судил. Нечитаемо → 'unknown'."""
     # companion уважает CODEX_HOME — читать надо ЭФФЕКТИВНЫЙ конфиг, иначе ревью шло бы под
     # одной моделью, а кэш/вердикт записывали другую (ревью R5)
-    cfg = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "config.toml"
+    cfg = ((Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "config.toml")
+           if allow_env_override else (_trusted_home() / ".codex" / "config.toml"))
     try:
         for line in cfg.read_text().splitlines():
             t = line.strip()
@@ -2114,7 +2153,9 @@ def _resolve_claude_bin() -> "str | None":
     # Mandatory artifact must not be satisfiable by an arbitrary PATH shim. These are the
     # supported native/Homebrew/system install locations; absence is fail-closed with setup
     # guidance. The exact server-side model is independently checked in modelUsage below.
-    home = Path.home()
+    # Claude — обязательный член пары, поэтому его бинарь резолвится так же строго, как
+    # companion: $HOME вызывающего подставил бы шим из ~/.local/bin (находка F6).
+    home = _trusted_home()
     fixed = (
         home / ".local" / "bin" / "claude",
         home / ".claude" / "local" / "claude",
@@ -2226,7 +2267,7 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
     ⚠️ Аттестации фактической модели тут НЕТ: companion эхо-ит `request.model`, а
     `codex_model()` читает локальный конфиг. Это `declared`-запись (остаток M8 в AGENTS.md).
     """
-    requested = codex_model()
+    requested = codex_model(allow_env_override=False)   # конфиг ревьюера — доверенный, не из env
     cert = reviewer_certification("codex", requested, role, allow_candidate=allow_candidate)
     if cert is None:
         return (None, requested, "нет certified Codex model для роли " + role, {}, "unavailable")
@@ -2238,9 +2279,14 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
     # выглядело бы «пустым выводом» — при сертификации так молча провалилась половина кейсов.
     # `--sandbox` companion НЕ знает: флаг уезжал в positionals и склеивался с промптом.
     # Без `--write` ход и так read-only; промпт обязан быть ЕДИНСТВЕННЫМ позиционным.
-    r = _exec_companion(["task", "--json", "--model", requested,
-                         _build_reviewer_prompt(diff_text, role=role)],
-                        allow_env_override=False)
+    sterile_home = _sterile_codex_home(requested)
+    try:
+        r = _exec_companion(["task", "--json", "--model", requested,
+                             _build_reviewer_prompt(diff_text, role=role)],
+                            allow_env_override=False, codex_home=sterile_home)
+    finally:
+        if sterile_home:
+            shutil.rmtree(sterile_home, ignore_errors=True)
     if r is None:
         return (None, requested, "companion недоступен (плагин не найден/таймаут)", {}, "unavailable")
     if r.returncode != 0:
@@ -2284,7 +2330,8 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     try:
         result = subprocess.run(cmd, cwd=REPO_ROOT,
                                 input=_build_reviewer_prompt(diff_text, role=role),
-                                capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S)
+                                capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S,
+                                env=_certified_subprocess_env())
     except subprocess.TimeoutExpired:
         return (None, "", f"таймаут {_CLAUDE_TIMEOUT_S}s", {}, "timeout")
     except OSError as exc:

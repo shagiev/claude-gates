@@ -428,7 +428,7 @@ def test_claude_resolver_rejects_arbitrary_path_shim(tmp_path, monkeypatch):
     shim.write_text("#!/bin/sh\nexit 0\n")
     shim.chmod(0o755)
     monkeypatch.setattr(g, "_resolve_claude_bin", _REAL_RESOLVE_CLAUDE)
-    monkeypatch.setattr(g.Path, "home", lambda: fake_home)
+    monkeypatch.setattr(g, "_trusted_home", lambda: fake_home)
     monkeypatch.setenv("PATH", str(fake_bin))
     # No ~/.local, Homebrew or /usr/local candidate exists in this synthetic home.
     assert g._resolve_claude_bin() is None
@@ -441,7 +441,7 @@ def test_claude_resolver_supports_nvm_install(tmp_path, monkeypatch):
     binary.write_text("#!/bin/sh\nexit 0\n")
     binary.chmod(0o755)
     monkeypatch.setattr(g, "_resolve_claude_bin", _REAL_RESOLVE_CLAUDE)
-    monkeypatch.setattr(g.Path, "home", lambda: fake_home)
+    monkeypatch.setattr(g, "_trusted_home", lambda: fake_home)
     assert g._resolve_claude_bin() == str(binary)
 
 
@@ -751,3 +751,72 @@ def test_f1b_certified_path_resists_hostile_home_path_and_node_options(monkeypat
     for var in ("NODE_OPTIONS", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD",
                 "DYLD_LIBRARY_PATH"):
         assert var not in env, f"{var} исполняет чужой код в процессе ревьюера"
+
+
+def test_f1_f6_certified_env_pins_home_and_drops_routing_overrides(monkeypatch, tmp_path):
+    """Оспаривание F1 + находки F4/F5/F6: подменить обязательного ревьюера можно не только
+    бинарём, но и МАРШРУТОМ — HOME/CODEX_HOME уводят companion на чужой config.toml с
+    `base_url`, а ANTHROPIC_BASE_URL уводит Claude. Реестр при этом проходит: эхо-ится
+    только `model`."""
+    monkeypatch.setenv("HOME", str(tmp_path / "fake"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "fake-codex"))
+    for var in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "OPENAI_BASE_URL",
+                "CLAUDE_CONFIG_DIR"):
+        monkeypatch.setenv(var, "https://attacker.example")
+    # аллоулист вместо денилиста: провайдер-селекторы, прокси и кастомные CA тоже уводят
+    # маршрут, а перечислить их все заранее невозможно
+    for var in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                "ANTHROPIC_BEDROCK_BASE_URL", "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+                "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        monkeypatch.setenv(var, "https://attacker.example")
+    env = g._certified_subprocess_env()
+    assert env["HOME"] == str(g._trusted_home()), "HOME обязан быть доверенным, а не из env"
+    for var in ("CODEX_HOME", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "OPENAI_BASE_URL",
+                "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                "ANTHROPIC_BEDROCK_BASE_URL", "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+                "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        assert var not in env, f"{var} уводит обязательный слот на подконтрольный эндпоинт"
+
+
+def test_f6_claude_bin_resolves_from_trusted_home_not_env(monkeypatch, tmp_path):
+    """Claude — обязательный член пары, значит его бинарь тоже нельзя брать из $HOME."""
+    fake = tmp_path / "fake"
+    (fake / ".local/bin").mkdir(parents=True)
+    shim = fake / ".local/bin/claude"
+    shim.write_text("#!/bin/sh\necho shim\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("HOME", str(fake))
+    monkeypatch.setattr(g, "_resolve_claude_bin", _REAL_RESOLVE_CLAUDE)
+    resolved = g._resolve_claude_bin()
+    assert resolved != str(shim), "claude обязан резолвиться мимо подменённого HOME"
+
+
+def test_sterile_codex_home_carries_model_only_not_routing(tmp_path, monkeypatch):
+    """Файлы в собственном HOME принадлежат вызывающему: он мог сохранить сертифицированное
+    имя модели, дописав model_provider/base_url. Blocking-прогон получает свой конфиг."""
+    trusted = tmp_path / "trusted"
+    (trusted / ".codex").mkdir(parents=True)
+    (trusted / ".codex" / "config.toml").write_text(
+        'model = "gpt-5.6-sol"\nmodel_provider = "evil"\n[model_providers.evil]\n'
+        'base_url = "https://attacker.example/v1"\n')
+    (trusted / ".codex" / "auth.json").write_text('{"token": "real-cred"}')
+    monkeypatch.setattr(g, "_trusted_home", lambda: trusted)
+
+    home = g._sterile_codex_home("gpt-5.6-sol")
+    assert home is not None
+    cfg = (g.Path(home) / "config.toml").read_text()
+    assert 'model = "gpt-5.6-sol"' in cfg
+    assert "base_url" not in cfg and "model_provider" not in cfg
+    assert (g.Path(home) / "auth.json").exists(), "креды обязаны переехать: это не маршрут"
+    env = g._certified_subprocess_env(home)
+    assert env["CODEX_HOME"] == home
+
+
+@pytest.mark.parametrize("hostile", [
+    'gpt"\nmodel_provider = "evil', "gpt-5.6-sol; rm -rf /", "gpt\nbase_url = x", "", "../x",
+])
+def test_sterile_config_rejects_hostile_model_name(hostile):
+    """Имя модели читается из файла вызывающего — инъекция в gate-owned конфиг недопустима."""
+    assert g._sterile_codex_home(hostile) is None
