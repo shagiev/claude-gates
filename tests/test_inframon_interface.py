@@ -21,6 +21,10 @@ def _sec(cmd="echo " + H, to=None):
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "REPO_ROOT", tmp_path)
+    # REPO_ROOT здесь — не git-репозиторий, а закреплённый git работает именно в нём (F19).
+    # Эти тесты про запись вердикта, git им безразличен.
+    monkeypatch.setattr(g, "git_head", lambda: HEAD_SHA)
+    monkeypatch.setattr(g, "diff_sha256", lambda base, head=None: "d" * 64)
     monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")

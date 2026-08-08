@@ -510,6 +510,10 @@ def warn_if_strict() -> None:
               file=sys.stderr)
 
 
+class TrustedGitError(RuntimeError):
+    """Доверенный git недоступен — вход ревьюеров не получить безопасно (fail-closed)."""
+
+
 class TrustedHomeError(RuntimeError):
     """Доверенный HOME недоступен — сертифицированный прогон невозможен (fail-closed)."""
 
@@ -758,9 +762,12 @@ def run_companion_review(base: str | None, scope: str) -> str | None:
 
 
 def git_head() -> str:
+    # Фолбэка на голый git НЕТ: он вернул бы управление PATH вызывающего и позволил подменить
+    # HEAD, то есть выбрать заведомо чистый диапазон — ровно дыра F19, которую закрывали.
     r = _trusted_git("rev-parse", "HEAD")
-    if r is not None and r.returncode == 0:
-        return r.stdout.strip()
+    if r is None or r.returncode != 0:
+        raise TrustedGitError("доверенный git недоступен — HEAD не разрешить безопасно")
+    return r.stdout.strip()
     return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
                           check=True).stdout.strip()
 
@@ -769,8 +776,9 @@ def diff_sha256(base: str, head: str = "HEAD") -> str:
     # head явно (R2-F2): check_reviewed биндит всё к захваченному head_before, а не к «HEAD»,
     # который мог сдвинуться конкурентным коммитом за время гейта.
     _r = _trusted_git("diff", "--no-ext-diff", "--no-textconv", f"{base}..{head}")
-    if _r is not None and _r.returncode == 0:
-        return hashlib.sha256(_r.stdout.encode()).hexdigest()
+    if _r is None or _r.returncode != 0:
+        raise TrustedGitError("доверенный git недоступен — дифф-хэш не посчитать безопасно")
+    return hashlib.sha256(_r.stdout.encode()).hexdigest()
     diff = subprocess.run(["git", "diff", f"{base}..{head}"], capture_output=True, text=True,
                           check=True).stdout
     return hashlib.sha256(diff.encode()).hexdigest()

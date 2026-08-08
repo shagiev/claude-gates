@@ -22,6 +22,8 @@ _REAL_RUN_CERTIFIED = g.run_certified_reviewer
 _REAL_RESOLVE_CLAUDE = g._resolve_claude_bin
 _REAL_CERTIFICATION = g.reviewer_certification
 _REAL_RESOLVE_COMPANION = g.resolve_companion_cmd
+_REAL_TRUSTED_GIT = g._trusted_git
+_REAL_GIT_HEAD = g.git_head
 _CLEAN = f"{_VT} approve\n\nNo material findings.\n"
 _BLOCK = f"{_VT} needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
 
@@ -1081,6 +1083,7 @@ def test_f19_git_env_overrides_cannot_forge_reviewer_input(monkeypatch):
         seen["env"] = kwargs.get("env") or {}
         return SimpleNamespace(returncode=0, stdout="real diff", stderr="")
 
+    monkeypatch.setattr(g, "_trusted_git", _REAL_TRUSTED_GIT)   # нужен НАСТОЯЩИЙ хардненинг
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     text, err = g._diff_text("HEAD~1", "HEAD")
     assert text == "real diff" and not err
@@ -1099,6 +1102,7 @@ def test_f19_head_resolution_uses_trusted_git(monkeypatch):
         calls.append(list(cmd))
         return SimpleNamespace(returncode=0, stdout="deadbeef\n", stderr="")
 
+    monkeypatch.setattr(g, "_trusted_git", _REAL_TRUSTED_GIT)
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     assert g.git_head() == "deadbeef"
     assert calls and calls[0][0] != "git", "HEAD резолвится голым git из PATH вызывающего"

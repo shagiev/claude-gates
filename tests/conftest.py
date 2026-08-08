@@ -57,6 +57,12 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # подменить Claude adapter, обязан получить deterministic unavailable, а не запустить CLI.
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: None)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
+    # В проде git закреплён абсолютным путём и санированным окружением (F19/F22). Тесты же
+    # подменяют subprocess.run и опознают вызов по имени `git`, поэтому здесь _trusted_git
+    # делегирует привычной форме — иначе пришлось бы переписывать все фейки, не проверяя
+    # ничего нового. Сам хардненинг проверяется точечными тестами F19/F22.
+    monkeypatch.setattr(g, "_trusted_git", lambda *args: g.subprocess.run(
+        ["git", *args], cwd=g.REPO_ROOT, capture_output=True, text=True))
     # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
     # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
     monkeypatch.setenv("REVIEW_PROVIDER", "portable")
