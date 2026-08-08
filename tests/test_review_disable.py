@@ -89,7 +89,7 @@ def test_s4_deploy_blocked_with_two_exits(env, tmp_path, monkeypatch, capsys):
     assert "Смена провайдера выключение НЕ обходит" in err   # без ложного третьего выхода
 
 
-def test_s12_valid_cache_does_not_bypass_disable(env, tmp_path, monkeypatch):
+def test_s12_valid_cache_does_not_bypass_disable(env, tmp_path, monkeypatch, clean_pair):
     # ЦЕНТРАЛЬНЫЙ сценарий R2-F3: ранний allow по кэшу шёл раньше проверки маркера
     _deploy_env(monkeypatch, tmp_path)
     head, diff = g.git_head(), g.diff_sha256("HEAD~1", g.git_head())

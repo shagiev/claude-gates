@@ -14,6 +14,11 @@ if str(_SCRIPTS) not in sys.path:
 
 import codex_review_gate as g  # noqa: E402
 
+# Протокольный токен собирается из частей: буквальная строка в фикстурах
+# попадала в ревьюируемый дифф и создавала неоднозначность, которую строгий
+# парсер обязан отвергать (находка F12).
+_VT = "Verd" + "ict:"
+
 
 @pytest.fixture(autouse=True)
 def _gates_test_isolation(monkeypatch, tmp_path):
@@ -52,9 +57,18 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # подменить Claude adapter, обязан получить deterministic unavailable, а не запустить CLI.
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: None)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
-    # Большинство исторических unit-тестов проверяют explicit legacy Codex-контур. Продуктовый
-    # default теперь portable; тесты дефолта обязаны сами удалить эту переменную.
-    monkeypatch.setenv("REVIEW_PROVIDER", "codex")
+    # В проде git закреплён абсолютным путём и санированным окружением (F19/F22). Тесты же
+    # подменяют subprocess.run и опознают вызов по имени `git`, поэтому здесь _trusted_git
+    # делегирует привычной форме — иначе пришлось бы переписывать все фейки, не проверяя
+    # ничего нового. Сам хардненинг проверяется точечными тестами F19/F22.
+    monkeypatch.setattr(g, "_trusted_git", lambda *args: g.subprocess.run(
+        ["git", *args], cwd=g.REPO_ROOT, capture_output=True, text=True))
+    # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
+    # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
+    monkeypatch.setenv("REVIEW_PROVIDER", "portable")
+    # см. F11: resolved-by-user принимается только из интерактивного терминала;
+    # тестам протокола он эмулируется, запрет проверяется точечным тестом.
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
     # ИНЦИДЕНТ 2026-07-25: FINDINGS_DIR/LEDGER_DIR были изолированы только в фикстуре
     # ОДНОГО тест-файла — новый тест-файл без локального мока писал в БОЕВОЙ
     # logs/review_findings (создал мусорную серию с critical-находкой из фикстуры, уронил
@@ -67,6 +81,15 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # запустил живое ревью — реальные траты и вис до _REVIEW_TIMEOUT_S (900 с). Инертная
     # команда делает забытый мок невозможным (правило «тесты не ходят в production-сервисы»).
     monkeypatch.setenv("CODEX_COMPANION_CMD", "bash -c 'exit 99'")
+    # Blocking-путь СОЗНАТЕЛЬНО игнорирует CODEX_COMPANION_CMD (иначе вызывающий подставляет
+    # approve-шим вместо обязательного Codex). Значит инертной переменной уже недостаточно:
+    # подменяем сам резолвер — это атрибут модуля, а не окружение, поэтому агент им управлять
+    # не может, а тест забыть мок — не должен.
+    _real_resolve = g.resolve_companion_cmd
+    monkeypatch.setattr(
+        g, "resolve_companion_cmd",
+        lambda **kw: (["bash", "-c", "exit 99"] if kw.get("allow_env_override") is False
+                      else _real_resolve(**kw)))
     for _root_var in ("CODEX_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
         monkeypatch.delenv(_root_var, raising=False)   # override выше их и так перебивает
     # pre-push гейт: ambient INTEGRATION_* (напр. из ручного `INTEGRATION_SKIP=1 git push`)
@@ -80,3 +103,21 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
     monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: [])
     monkeypatch.delenv("CODEX_DEPLOY_BASELINE", raising=False)
+
+
+@pytest.fixture()
+def clean_pair(monkeypatch):
+    """Обязательная blocking-пара (Codex+Claude) отрабатывает чисто.
+
+    Нужна тестам деплой-пути, которые проверяют НЕ ревью, а его последствия (вердикт, ledger,
+    reviewed-sha). Раньше им хватало одного shell-стаба companion; теперь панель обязательна,
+    поэтому «чисто» должны отработать ОБА — иначе гейт честно блокирует (§3)."""
+    clean = f"{_VT} approve\n\nNo material findings.\n"
+
+    def _run(cert, _base, _head):
+        return g.ReviewerRun("blocking", cert.provider, cert.requested_model,
+                             cert.actual_models, cert.family, cert.certification_id,
+                             "ok", verdict=g.parse_review_output(clean))
+
+    monkeypatch.setattr(g, "run_certified_reviewer", _run)
+    return _run
