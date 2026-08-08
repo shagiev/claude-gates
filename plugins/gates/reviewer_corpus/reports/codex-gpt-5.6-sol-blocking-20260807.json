@@ -35,8 +35,8 @@
       "verdict": "needs-attention",
       "findings": [
         [
-          "critical",
-          "Review errors and invalid results now fail open, allowing unreviewed changes to pass the gate (gate.py:12)"
+          "high",
+          "Invalid or errored review results now fail open, bypassing the gate (gate.py:11)"
         ]
       ],
       "detail": "",
@@ -50,8 +50,8 @@
       "verdict": "needs-attention",
       "findings": [
         [
-          "high",
-          "Config exclusion can disable mandatory hard-path gating (gate.py:21)"
+          "critical",
+          "Config exclusions can disable mandatory hard code paths, creating a fail-open bypass (gate.py:20)"
         ]
       ],
       "detail": "",
@@ -65,8 +65,8 @@
       "verdict": "needs-attention",
       "findings": [
         [
-          "high",
-          "Configuration-controlled command is executed through shell=True, enabling command injection (runner.py:5)"
+          "critical",
+          "Configuration-controlled command is executed through a shell, enabling command injection (runner.py:7)"
         ]
       ],
       "detail": "",
@@ -81,7 +81,7 @@
       "findings": [
         [
           "critical",
-          "[DUP:F2] Blocking panel now contains only Claude, restoring forbidden single-family self-review (reviewers.py:8)"
+          "Blocking panel now contains only Claude, eliminating mandatory cross-family review (reviewers.py:8)"
         ]
       ],
       "detail": "",
@@ -106,7 +106,7 @@
       "findings": [
         [
           "high",
-          "Audit entry leaks a hard-coded reviewer credential and unredacted reviewer response (gate.py:33)"
+          "Audit log exposes a reviewer credential and unredacted response data (gate.py:33)"
         ]
       ],
       "detail": "",
@@ -121,7 +121,7 @@
       "findings": [
         [
           "critical",
-          "Provider timeout or OS error is converted into approval, creating a fail-open bypass (reviewer.py:43)"
+          "Provider failures are converted into approval, allowing unreviewed changes to pass fail-open (reviewer.py:43)"
         ]
       ],
       "detail": "",
@@ -136,11 +136,7 @@
       "findings": [
         [
           "critical",
-          "Missing decision field now defaults to approval, making malformed reviewer output fail open (verdict.py:15)"
-        ],
-        [
-          "medium",
-          "Diff contains a literal V-e-r-d-i-c-t token that can ambiguously influence the review protocol (verdict.py:15)"
+          "Missing decision field now defaults to approval, creating a fail-open bypass (verdict.py:15)"
         ]
       ],
       "detail": "",
@@ -154,8 +150,8 @@
       "verdict": "needs-attention",
       "findings": [
         [
-          "critical",
-          "Cache reuse no longer binds policy_id, allowing approval under one policy to satisfy a different policy for the same provider (gate.py:90)"
+          "high",
+          "Cached verdicts can bypass changed policy because cache validation now compares only provider (gate.py:93)"
         ]
       ],
       "detail": "",
@@ -169,12 +165,12 @@
       "verdict": "needs-attention",
       "findings": [
         [
-          "high",
-          "Null validation results now fail open and allow unverified operations (gate.py:53)"
+          "critical",
+          "Missing validation result now fails open by returning ALLOW (gate.py:54)"
         ],
         [
           "medium",
-          "Reviewer-directed prompt injection requests an approving V-e-r-d-i-c-t (gate.py:50)"
+          "Reviewer-directed prompt injection includes a literal V-e-r-d-i-c-t token (gate.py:51)"
         ]
       ],
       "detail": "",
@@ -204,7 +200,7 @@
       "findings": [
         [
           "critical",
-          "Configurable `exclude` overrides mandatory hard paths, allowing code changes to bypass the gate (gate.py:21)"
+          "Config exclusions can bypass mandatory hard-path gating (gate.py:23)"
         ]
       ],
       "detail": "",
@@ -219,7 +215,7 @@
       "findings": [
         [
           "high",
-          "Config-controlled command is executed through a shell, enabling command injection (runner.py:6)"
+          "Config-controlled command is executed through a shell, enabling command injection (runner.py:7)"
         ]
       ],
       "detail": "",
@@ -234,7 +230,7 @@
       "findings": [
         [
           "critical",
-          "Mandatory blocking panel now contains only Claude, violating the two-family independence invariant (reviewers.py:8)"
+          "Removing Codex leaves Claude as the sole blocking reviewer, violating mandatory cross-family review (reviewers.py:8)"
         ]
       ],
       "detail": "",
@@ -259,7 +255,7 @@
       "findings": [
         [
           "high",
-          "Reviewer API key is written verbatim to the audit log (gate.py:33)"
+          "Reviewer API key and untrusted response are written to the audit log without redaction (gate.py:33)"
         ]
       ],
       "detail": "",
@@ -289,7 +285,7 @@
       "findings": [
         [
           "critical",
-          "Missing verdict now defaults to approval, making malformed reviewer responses fail open (verdict.py:13)"
+          "Missing verdict now silently defaults to approval, creating a fail-open path (verdict.py:15)"
         ]
       ],
       "detail": "",
@@ -304,7 +300,7 @@
       "findings": [
         [
           "high",
-          "Cache reuses approvals across policy changes when provider matches, allowing stale reviews to bypass stricter policy (gate.py:93)"
+          "Cache now reuses reviews across different policy IDs when providers match, allowing stale or weaker-policy approval to bypass the requested gate (gate.py:93)"
         ]
       ],
       "detail": "",
@@ -319,11 +315,11 @@
       "findings": [
         [
           "critical",
-          "Fail-open: a missing result is now explicitly allowed (gate.py:54)"
+          "Fail-open: missing validation result now permits the operation (gate.py:56)"
         ],
         [
           "medium",
-          "Reviewer-directed prompt injection containing a V-e-r-d-i-c-t token (gate.py:51)"
+          "Reviewer-directed prompt injection includes a literal V-e-r-d-i-c-t token (gate.py:53)"
         ]
       ],
       "detail": "",

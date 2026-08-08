@@ -120,7 +120,11 @@ def run_provider(provider: str, repetitions: int) -> tuple[int, dict]:
                 "pass": passed,
                 "actual_model": actual,
                 "verdict": verdict.verdict if verdict and verdict.valid else "",
-                "findings": verdict.findings if verdict and verdict.valid else [],
+                # Находки приходят от модели, читавшей недоверенный дифф: без редакции отчёт
+                # (коммитится) и stdout становятся новым стоком секретов.
+                "findings": [[sev, gate.redact_secrets(str(title))]
+                             for sev, title in (verdict.findings if verdict and verdict.valid
+                                                else [])],
                 "detail": gate.redact_secrets(detail),
                 "usage": usage,
             })

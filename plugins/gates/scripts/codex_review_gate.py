@@ -232,7 +232,7 @@ _REDACT_RULES = (
 #      а деградировавший конверт до печати отсекает companion_outage_reason().
 #  11. Gemini HTTP/body/transport diagnostics → run_gemini_review_text(); известный API key
 #      удаляется по точному значению ДО общей pattern-based редакции.
-#  12. Claude CLI stdout/stderr/исключение → run_claude_supplemental().
+#  12. Claude CLI stdout/stderr/исключение → run_claude_review_text().
 # Новый источник → редактировать В ЕГО ИСТОЧНИКЕ, а не у потребителей; сознательное
 # исключение — записывать сюда же с обоснованием, чтобы реестр оставался полным.
 def redact_secrets(text: str) -> str:
@@ -685,7 +685,8 @@ _REVIEW_FOCUS = (
 
 
 def _exec_companion(args: list[str], *, allow_env_override: bool = True,
-                    codex_home: "str | None" = None) -> subprocess.CompletedProcess | None:
+                    codex_home: "str | None" = None,
+                    cwd: "str | None" = None) -> subprocess.CompletedProcess | None:
     """Единственное место, где companion запускается: резолв, таймаут и редакция argv в
     диагностике. Вынесено, чтобы у внешних потребителей (скилл design-review) НЕ было повода
     собирать вызов самим — самосборка печатала argv мимо редакции.
@@ -699,7 +700,7 @@ def _exec_companion(args: list[str], *, allow_env_override: bool = True,
         return None
     try:
         return subprocess.run(cmd + args, capture_output=True, text=True,
-                              timeout=_REVIEW_TIMEOUT_S,
+                              timeout=_REVIEW_TIMEOUT_S, cwd=cwd,
                               env=(None if allow_env_override
                                    else _certified_subprocess_env(codex_home)))
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -757,6 +758,9 @@ def run_companion_review(base: str | None, scope: str) -> str | None:
 
 
 def git_head() -> str:
+    r = _trusted_git("rev-parse", "HEAD")
+    if r is not None and r.returncode == 0:
+        return r.stdout.strip()
     return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
                           check=True).stdout.strip()
 
@@ -764,6 +768,9 @@ def git_head() -> str:
 def diff_sha256(base: str, head: str = "HEAD") -> str:
     # head явно (R2-F2): check_reviewed биндит всё к захваченному head_before, а не к «HEAD»,
     # который мог сдвинуться конкурентным коммитом за время гейта.
+    _r = _trusted_git("diff", "--no-ext-diff", "--no-textconv", f"{base}..{head}")
+    if _r is not None and _r.returncode == 0:
+        return hashlib.sha256(_r.stdout.encode()).hexdigest()
     diff = subprocess.run(["git", "diff", f"{base}..{head}"], capture_output=True, text=True,
                           check=True).stdout
     return hashlib.sha256(diff.encode()).hexdigest()
@@ -2119,6 +2126,11 @@ def resolve_portable_review_plan(profile: str
     families = [cert.family for cert in panel]
     if len(set(families)) != len(families) or "unknown" in families:
         return (None, "[codex-gate] ✗ blocking-панель содержит повтор семейства или unknown")
+    # Граница остатка M8 была описана словами, но не проверялась: правкой реестра ОБА слота
+    # могли стать `declared`, и панель осталась бы без единой аттестованной модели.
+    if not any(cert.attestation == "verified" for cert in panel):
+        return (None, "[codex-gate] ✗ в blocking-панели нет ни одной `verified` записи: "
+                      "`declared` допускается только рядом с аттестованным членом (остаток M8)")
     return (tuple(panel), "")
 
 
@@ -2285,86 +2297,56 @@ def _resolve_claude_bin() -> "str | None":
     return None
 
 
-def run_claude_supplemental(base: str, head: str) -> "ReviewerRun":
-    cert = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, "supplemental")
-    if cert is None:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           "anthropic", "", "unavailable",
-                           detail="нет certified Claude supplemental model")
-    binary = _resolve_claude_bin()
-    if binary is None:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "unavailable",
-                           detail="claude CLI не найден")
+def _trusted_git_bin() -> "str | None":
+    """Абсолютный git из доверенных каталогов. Голый `git` резолвится через PATH вызывающего,
+    а он же формирует ВХОД обоих обязательных ревьюеров: шим отдал бы им сфабрикованный
+    чистый дифф, и оба честно одобрили бы пустоту."""
+    for cand in (Path(d) / "git" for d in _TRUSTED_PATH_DIRS):
+        try:
+            resolved = cand.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK) and not _inside_repo(resolved):
+            return str(resolved)
+    return None
+
+
+#: Переменные, которыми git подменяет ВЫВОД, не трогая ни бинарь, ни репозиторий:
+#: внешний diff-драйвер/textconv может выйти нулём без вывода, и оба обязательных ревьюера
+#: получат пустой «чистый» дифф. Плюс подмена конфигов и путей.
+_GIT_OVERRIDE_PREFIXES = ("GIT_",)
+_GIT_SAFE_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                 "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+
+
+def _trusted_git(*args: str) -> "subprocess.CompletedProcess | None":
+    """git из доверенного каталога, в санированном окружении и без внешних diff-драйверов.
+
+    Закрепить один бинарь мало: `GIT_EXTERNAL_DIFF`/`diff.external` подменяют ВЫВОД, а голый
+    `git` в других вызовах (например, разрешение HEAD) подменяет сам ДИАПАЗОН — и оба
+    обязательных ревьюера получают один и тот же поддельный вход, против чего независимость
+    панели бессильна."""
+    git = _trusted_git_bin()
+    if git is None:
+        return None
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(_GIT_OVERRIDE_PREFIXES)}
+    env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    env.update(_GIT_SAFE_ENV)
     try:
-        resolved_binary = str(Path(binary).resolve(strict=True))
+        return subprocess.run([git, *args], cwd=REPO_ROOT, capture_output=True, text=True,
+                              env=env)
     except OSError:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "unavailable",
-                           detail="claude CLI path не резолвится")
-    audit(f"claude-supplemental bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
-    try:
-        diff_text = subprocess.run(
-            ["git", "diff", f"{base}..{head}"], cwd=REPO_ROOT,
-            capture_output=True, text=True, check=True,
-        ).stdout
-    except (subprocess.CalledProcessError, OSError) as exc:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "invalid",
-                           detail=f"не получить дифф: {type(exc).__name__}")
-    cmd = [
-        binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
-        "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence",
-    ]
-    try:
-        result = subprocess.run(
-            cmd, cwd=REPO_ROOT, input=_build_reviewer_prompt(
-                diff_text, role="supplemental"),
-            capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "timeout",
-                           detail=f"таймаут {_CLAUDE_TIMEOUT_S}s")
-    except OSError as exc:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "unavailable",
-                           detail=redact_secrets(f"{type(exc).__name__}: {exc}")[:300])
-    if result.returncode != 0:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "invalid",
-                           detail=redact_secrets((result.stderr or result.stdout or "").strip())[:300])
-    try:
-        envelope = json.loads((result.stdout or "").strip())
-    except (json.JSONDecodeError, ValueError):
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, (),
-                           cert.family, cert.certification_id, "invalid",
-                           detail="Claude output не JSON")
-    model_usage = envelope.get("modelUsage")
-    actual_models = tuple(sorted(model_usage)) if isinstance(model_usage, dict) else ()
-    allowed_actual_sets = {(model,) for model in cert.actual_models}
-    if envelope.get("is_error") is not False or actual_models not in allowed_actual_sets:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, actual_models,
-                           cert.family, cert.certification_id, "invalid",
-                           detail="Claude actual model/error не совпал с certification registry")
-    normalized = normalize_reviewer_text(envelope.get("result") or "")
-    verdict = parse_review_output(normalized or "")
-    if normalized is None or not verdict.valid:
-        return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, actual_models,
-                           cert.family, cert.certification_id, "invalid",
-                           detail="Claude ответ не прошёл строгий verdict-контракт")
-    usage = envelope.get("usage")
-    return ReviewerRun("supplemental", "claude", _CLAUDE_REQUESTED_MODEL, actual_models,
-                       cert.family, cert.certification_id, "ok", verdict=verdict,
-                       usage=usage if isinstance(usage, dict) else {})
+        return None
 
 
 def _diff_text(base: str, head: str) -> "tuple[str | None, str]":
-    try:
-        return (subprocess.run(["git", "diff", f"{base}..{head}"], cwd=REPO_ROOT,
-                               capture_output=True, text=True, check=True).stdout, "")
-    except (subprocess.CalledProcessError, OSError) as exc:
-        return (None, f"не получить дифф: {type(exc).__name__}")
+    r = _trusted_git("diff", "--no-ext-diff", "--no-textconv", f"{base}..{head}")
+    if r is None:
+        return (None, "доверенный git не найден — вход ревьюеров не получить безопасно")
+    if r.returncode != 0:
+        return (None, f"не получить дифф: git exit={r.returncode}")
+    return (r.stdout, "")
 
 
 def run_codex_review_text(diff_text: str, *, role: str = "blocking",
@@ -2401,13 +2383,21 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
         # model_provider/base_url — тихий откат на подконтрольный маршрут (F7).
         return (None, requested, "не создать стерильный CODEX_HOME для сертифицированного "
                                  "прогона — маршрут ревьюера не изолировать", {}, "unavailable")
+    # F16: без явного cwd companion наследовал РЕВЬЮИРУЕМЫЙ репозиторий, и его repo-local
+    # инструкции/конфиг управляли обязательным независимым ревьюером.
+    sterile_cwd = _sterile_mkdtemp("gates-codex-cwd-")
+    if sterile_cwd is None:
+        shutil.rmtree(sterile_home, ignore_errors=True)
+        return (None, requested, "не создать стерильный cwd вне ревьюируемого репозитория",
+                {}, "unavailable")
     try:
         r = _exec_companion(["task", "--json", "--model", requested,
                              _build_reviewer_prompt(diff_text, role=role)],
-                            allow_env_override=False, codex_home=sterile_home)
+                            allow_env_override=False, codex_home=sterile_home,
+                            cwd=sterile_cwd)
     finally:
-        if sterile_home:
-            shutil.rmtree(sterile_home, ignore_errors=True)
+        shutil.rmtree(sterile_home, ignore_errors=True)
+        shutil.rmtree(sterile_cwd, ignore_errors=True)
     if r is None:
         return (None, requested, "companion недоступен (плагин не найден/таймаут)", {}, "unavailable")
     if r.returncode != 0:
@@ -2470,7 +2460,10 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     # обработчики запускают команды и HTTP. `--safe-mode` штатно снимает ВСЕ кастомизации
     # (CLAUDE.md, скиллы, плагины, хуки, MCP), сохраняя аутентификацию — стерильный HOME её
     # терял («Not logged in»). `--strict-mcp-config` оставлен как явная вторая линия.
-    cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
+    # F15: с Read/Glob/Grep ревьюер, читающий НЕДОВЕРЕННЫЙ дифф, дотягивался до кредов в
+    # HOME — инъекция в проверяемом коде превращалась в эксфильтрацию. Дифф целиком лежит в
+    # промпте, инструменты ревьюеру не нужны.
+    cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "",
            "--safe-mode", "--strict-mcp-config",
            "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence"]
     # F8: cwd НЕ должен быть ревьюируемым репозиторием — иначе его `.claude/settings.json`

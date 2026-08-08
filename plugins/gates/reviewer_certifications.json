@@ -18,7 +18,7 @@
       "attestation": "declared",
       "report": {
         "path": "reports/codex-gpt-5.6-sol-blocking-20260807.json",
-        "sha256": "ed7b4b0c9a3ea1c1519e610bf7d806e4a214f5a19e870b4a1aa4632fa2eb7650",
+        "sha256": "8259a659d0591b5ad7ffb6dbc7b8d38fe446ca9f0659fbfc39851bc5ab92e7f2",
         "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
         "repetitions": 2
       }
@@ -39,7 +39,7 @@
       "attestation": "verified",
       "report": {
         "path": "reports/claude-opus-5-blocking-20260807.json",
-        "sha256": "0594a53b49424c0796957f37846b590afed433eee2e867df8171b6baa8a70f32",
+        "sha256": "5aa0bc6ae152674747f0a662bccf77fcf97e58ac17dc0d9e6131d1c4d900149e",
         "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
         "repetitions": 2
       }

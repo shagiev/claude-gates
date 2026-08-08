@@ -359,10 +359,11 @@ def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
 
     def fake_run(cmd, **_kwargs):
-        if cmd[:2] == ["git", "diff"]:
+        if len(cmd) > 1 and cmd[1] == "diff":      # git резолвится абсолютным путём (F19)
             return SimpleNamespace(returncode=0, stdout="diff", stderr="")
         assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "opus"
-        assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep"
+        # F15: инструментов нет — дифф целиком в промпте, а HOME несёт креды
+        assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
         assert "diff" not in cmd
         # роль описана как член обязательной двухсемейной панели, а не как «non-Anthropic»
         assert "two-family blocking adversarial review panel" in _kwargs["input"]
@@ -393,7 +394,8 @@ def test_claude_failure_diagnostic_is_redacted(monkeypatch):
     secret = "sk-" + "x" * 48
 
     def fake_run(cmd, **_kwargs):
-        if cmd[:2] == ["git", "diff"]:
+        # git закреплён абсолютным путём (F19), поэтому опознаём по подкоманде
+        if len(cmd) > 1 and cmd[1] == "diff":
             return SimpleNamespace(returncode=0, stdout="diff", stderr="")
         return SimpleNamespace(returncode=1, stdout="", stderr=f"token={secret}")
 
@@ -1063,3 +1065,40 @@ def test_managed_policy_blocks_certified_run(monkeypatch, tmp_path):
         "diff", role="blocking", allow_candidate=True)
     assert text is None and status == "unavailable"
     assert "managed-политика" in detail
+
+
+def test_f19_git_env_overrides_cannot_forge_reviewer_input(monkeypatch):
+    """Закрепить бинарь мало: GIT_EXTERNAL_DIFF/diff.external подменяют ВЫВОД (внешний
+    драйвер выходит нулём без вывода), а голый git в разрешении HEAD подменяет ДИАПАЗОН.
+    Оба обязательных ревьюера получили бы один и тот же поддельный вход."""
+    for var in ("GIT_EXTERNAL_DIFF", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0", "GIT_DIR", "GIT_WORK_TREE"):
+        monkeypatch.setenv(var, "/tmp/hostile")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["argv"] = list(cmd)
+        seen["env"] = kwargs.get("env") or {}
+        return SimpleNamespace(returncode=0, stdout="real diff", stderr="")
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    text, err = g._diff_text("HEAD~1", "HEAD")
+    assert text == "real diff" and not err
+    assert "--no-ext-diff" in seen["argv"] and "--no-textconv" in seen["argv"]
+    assert not any(k.startswith("GIT_") and k not in g._GIT_SAFE_ENV for k in seen["env"]), \
+        "GIT_*-оверрайды вызывающего доехали до git"
+    assert seen["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert seen["argv"][0] != "git", "git обязан резолвиться абсолютным путём"
+
+
+def test_f19_head_resolution_uses_trusted_git(monkeypatch):
+    """Подмена HEAD выбирает ЗАВЕДОМО чистый диапазон — тот же обход, что подмена содержимого."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="deadbeef\n", stderr="")
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    assert g.git_head() == "deadbeef"
+    assert calls and calls[0][0] != "git", "HEAD резолвится голым git из PATH вызывающего"
