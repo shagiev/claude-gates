@@ -18,8 +18,8 @@
       "attestation": "declared",
       "report": {
         "path": "reports/codex-gpt-5.6-sol-blocking-20260807.json",
-        "sha256": "03cecd8c87ca9f9052bd005ea773853e46be31953640b3d5c59f6f41266b5ba8",
-        "corpus_sha256": "7a8a09f62265269629a1ce285913e8facf06acfc0413cdfd7381bafc198b687a",
+        "sha256": "ed7b4b0c9a3ea1c1519e610bf7d806e4a214f5a19e870b4a1aa4632fa2eb7650",
+        "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
         "repetitions": 2
       }
     },
@@ -39,8 +39,8 @@
       "attestation": "verified",
       "report": {
         "path": "reports/claude-opus-5-blocking-20260807.json",
-        "sha256": "f84189f7b12341d82fa384bcf756ce2cf81e87f9a9d3e3f4d9dc55095cd8d2b0",
-        "corpus_sha256": "7a8a09f62265269629a1ce285913e8facf06acfc0413cdfd7381bafc198b687a",
+        "sha256": "bba82af66f394ecbf2d795e20777b483589397b23fd735182f351f1545b0dce3",
+        "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
         "repetitions": 2
       }
     },

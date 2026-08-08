@@ -115,13 +115,13 @@ def test_b21_status_flip_without_report_is_rejected(tmp_path, monkeypatch, wired
     body = json.loads(reg.read_text())
     del body["certifications"][0]["report"]
     reg.write_text(json.dumps(body))
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None, 'прод не должен получить blocking-слот'
 
 
 def test_b20_missing_report_file_is_rejected(wired):
     _reg, rep = wired()
     rep.unlink()
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b20_tampered_report_is_rejected(wired):
@@ -130,22 +130,22 @@ def test_b20_tampered_report_is_rejected(wired):
     body["results"][0]["pass"] = True
     body["note"] = "подправлено после подсчёта sha"
     rep.write_text(json.dumps(body))
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b20_failed_report_is_rejected(wired):
     wired(all_pass=False)
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b20_too_few_repetitions_is_rejected(wired):
     wired(reps=1)
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b20_report_from_other_corpus_is_rejected(wired):
     wired(report_corpus_sha="0" * 64)
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b27_incomplete_matrix_is_rejected(wired):
@@ -154,7 +154,7 @@ def test_b27_incomplete_matrix_is_rejected(wired):
             for cid in CASE_IDS for r in (1, 2)]
     rows.pop()
     wired(rows=rows)
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b27_single_failed_row_is_rejected(wired):
@@ -162,7 +162,7 @@ def test_b27_single_failed_row_is_rejected(wired):
             for cid in CASE_IDS for r in (1, 2)]
     rows[3]["pass"] = False
     wired(rows=rows)
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_b28_split_actual_models_is_rejected(wired):
@@ -171,8 +171,8 @@ def test_b28_split_actual_models_is_rejected(wired):
             for cid in CASE_IDS for r in (1, 2)]
     rows[0]["actual_model"] = "gpt-mini-untested"
     wired(rows=rows)
-    assert g.load_reviewer_certifications() == (None, ()), \
-        "модель, не прошедшая полную матрицу, не должна получать blocking-слот"
+    # понижено до candidate: модель, не прошедшая полную матрицу, не получает blocking-слот
+    assert _blocking() is None
 
 
 @pytest.mark.parametrize("bad", ["../outside.json", "/etc/passwd", "reports/../../escape.json"])
@@ -181,7 +181,7 @@ def test_b26_report_path_outside_shipped_dir_is_rejected(wired, bad):
     body = json.loads(reg.read_text())
     body["certifications"][0]["report"]["path"] = bad
     reg.write_text(json.dumps(body))
-    assert g.load_reviewer_certifications() == (None, ())
+    assert _blocking() is None      # понижено до candidate: прод без слота
 
 
 def test_candidate_entry_needs_no_report(wired, tmp_path, monkeypatch):
@@ -204,3 +204,32 @@ def test_certification_id_is_path_safe(wired, bad_id):
     body["certifications"][0]["certification_id"] = bad_id
     reg.write_text(json.dumps(body))
     assert g.load_reviewer_certifications() == (None, ())
+
+
+def test_runner_lookup_survives_stale_report_but_production_does_not(wired):
+    """Ловушка, из-за которой падала пересъёмка: раннер перезаписывает отчёт, sha расходится,
+    и весь реестр отваливается — включая запись, которую раннер как раз и сертифицирует.
+    Боевой путь обязан остаться fail-closed, инструмент — работать."""
+    _reg, rep = wired()
+    rep.write_text(rep.read_text() + "\n")          # отчёт изменился → sha разошёлся
+    # Запись ПОНИЖАЕТСЯ до candidate, реестр остаётся читаемым: иначе пересъёмка отчёта
+    # обрушала бы реестр и делала следующую пересъёмку невозможной.
+    policy, certs = g.load_reviewer_certifications()
+    assert policy == "portable-review-v2" and certs
+    assert g.reviewer_certification("codex", "gpt-5.6-sol", "blocking") is None   # прод: нет
+    assert g.reviewer_certification("codex", "gpt-5.6-sol", "blocking",
+                                    allow_candidate=True) is not None             # инструмент
+    # флага, отключающего проверку связки, быть не должно: он выдавал бы certified без улик
+    import inspect
+    assert "require_report" not in inspect.signature(g.reviewer_certification).parameters
+
+
+def test_demoted_entry_explains_itself_to_operator(wired, monkeypatch):
+    """Понижение не должно быть немым: оператор обязан узнать, что запись есть, но связка
+    отчёта не сошлась — иначе он вслепую перезапускает сертификацию (реальный сценарий)."""
+    _reg, rep = wired()
+    rep.write_text(rep.read_text() + "\n")
+    monkeypatch.setattr(g, "codex_model", lambda **_kw: "gpt-5.6-sol")
+    _plan, err = g.resolve_portable_review_plan("portable")
+    assert "НЕ certified" in err and "связка отчёта" in err
+    assert "audit" in err

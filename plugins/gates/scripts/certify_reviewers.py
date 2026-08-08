@@ -96,6 +96,13 @@ def run_provider(provider: str, repetitions: int) -> tuple[int, dict]:
     runner, adapter, requested_of = _RUNNERS[provider]
     requested = requested_of()
     cert = gate.reviewer_certification(provider, requested, "blocking", allow_candidate=True)
+    if cert is None:
+        # Реестр мог стать невалидным целиком (напр. отчёт ДРУГОГО провайдера перезаписан и
+        # его sha разошёлся с записью). Тогда каждый кейс падает с «нет certified model», и
+        # отчёт выглядит как провал МОДЕЛИ на корпусе — ложная улика. Падаем сразу и внятно.
+        raise ValueError(
+            f"нет записи реестра для {provider}/{requested} (роль blocking). Проверь реестр: "
+            "он невалиден целиком, если у любой certified blocking-записи разошёлся отчёт")
     rows = []
     actual_models = set()
     all_pass = True

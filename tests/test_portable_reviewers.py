@@ -2,6 +2,7 @@
 docs/2026-08-07-host-relative-reviewer-ladder-design.md, §3/§4, матрица B1..B14)."""
 import io
 import json
+import pathlib
 import urllib.error
 from dataclasses import replace
 from types import SimpleNamespace
@@ -349,7 +350,7 @@ def test_certification_corpus_requires_policy_id(tmp_path, monkeypatch):
         cr.load_corpus()
 
 
-def test_claude_supplemental_pins_actual_model_and_strict_contract(monkeypatch):
+def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
 
     def fake_run(cmd, **_kwargs):
@@ -358,7 +359,10 @@ def test_claude_supplemental_pins_actual_model_and_strict_contract(monkeypatch):
         assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "opus"
         assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep"
         assert "diff" not in cmd
-        assert "blocking adversarial reviewer" in _kwargs["input"]
+        # роль описана как член обязательной двухсемейной панели, а не как «non-Anthropic»
+        assert "two-family blocking adversarial review panel" in _kwargs["input"]
+        assert "non-Anthropic" not in _kwargs["input"], \
+            "промпт не должен противоречить действующей политике панели"
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps({
@@ -463,7 +467,7 @@ def test_policy_change_invalidates_portable_cache(tmp_path, monkeypatch):
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), panel)
     monkeypatch.setattr(
         g, "load_reviewer_certifications",
-        lambda: ("portable-review-v2", (supplemental,)),
+        lambda **_kw: ("portable-review-v2", (supplemental,)),
     )
     assert g.read_valid_ledger("a" * 40, "d" * 64, panel) is None
 
@@ -820,3 +824,63 @@ def test_sterile_codex_home_carries_model_only_not_routing(tmp_path, monkeypatch
 def test_sterile_config_rejects_hostile_model_name(hostile):
     """Имя модели читается из файла вызывающего — инъекция в gate-owned конфиг недопустима."""
     assert g._sterile_codex_home(hostile) is None
+
+
+def test_f7_sterile_home_failure_is_fail_closed_not_caller_config(monkeypatch):
+    """F7: не удалось изолировать маршрут — прогон обязан отказать, а не уехать на ~/.codex
+    вызывающего с его model_provider/base_url."""
+    monkeypatch.setattr(g, "_sterile_codex_home", lambda _m: None)
+    monkeypatch.setattr(g, "_exec_companion",
+                        lambda *a, **kw: pytest.fail("companion не должен запускаться без "
+                                                     "изолированного CODEX_HOME"))
+    text, _actual, detail, _usage, status = g.run_codex_review_text(
+        "diff", role="blocking", allow_candidate=True)
+    assert text is None and status == "unavailable"
+    assert "CODEX_HOME" in detail
+
+
+def test_f8_claude_does_not_run_inside_reviewed_repo(monkeypatch, tmp_path):
+    """F8: ревьюируемый репозиторий не должен управлять ревьюером через .claude/settings.json
+    и хуки — cwd обязан быть стерильным."""
+    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+            "is_error": False, "result": _CLEAN,
+            "modelUsage": {"claude-opus-5": {"inputTokens": 1}}}))
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    g.run_claude_review_text("diff", role="blocking", allow_candidate=True)
+    assert seen["cwd"] != str(g.REPO_ROOT) and seen["cwd"] is not None
+    assert not str(seen["cwd"]).startswith(str(g.REPO_ROOT)), "cwd внутри ревьюируемого репо"
+
+
+def test_tmpdir_cannot_place_sterile_cwd_inside_reviewed_repo(monkeypatch, tmp_path):
+    """TMPDIR управляется вызывающим и уважается mkdtemp: указав его в подкаталог репозитория,
+    он вернул бы ревьюеру доступ к .claude/settings.json и хукам по предкам."""
+    inside = pathlib.Path(g.REPO_ROOT) / "logs" / "hostile-tmp"
+    inside.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TMPDIR", str(inside))
+    assert "TMPDIR" not in g._certified_subprocess_env(), "TMPDIR не должен доезжать до ребёнка"
+    created = g._sterile_mkdtemp("gates-test-")
+    try:
+        assert created is not None
+        assert not str(created).startswith(str(g.REPO_ROOT)), "cwd оказался внутри репозитория"
+    finally:
+        if created:
+            g.shutil.rmtree(created, ignore_errors=True)
+        g.shutil.rmtree(inside, ignore_errors=True)
+
+
+def test_plugin_data_path_is_derived_not_inherited(monkeypatch, tmp_path):
+    """Companion читает rollout из каталога данных плагина. Путь обязан вычисляться от
+    доверенного HOME: приняв его из окружения, мы вернули бы вызывающему управление тем,
+    откуда ревьюер читает своё состояние."""
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path / "hostile"))
+    monkeypatch.setattr(g, "_trusted_home", lambda: tmp_path / "trusted")
+    env = g._certified_subprocess_env()
+    assert env["CLAUDE_PLUGIN_DATA"] == str(
+        tmp_path / "trusted" / ".claude" / "plugins" / "data" / "codex-openai-codex")
+    assert "hostile" not in env["CLAUDE_PLUGIN_DATA"]
