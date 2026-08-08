@@ -12,6 +12,9 @@ import codex_review_gate as g
 @pytest.fixture()
 def led(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "FINDINGS_DIR", tmp_path / "rf")
+    # `resolved-by-user` требует интерактивного терминала (F11). Тесты протокола проверяют
+    # СЕМАНТИКУ статуса, поэтому терминал им эмулируется; сам запрет проверяет отдельный тест.
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
     return tmp_path
 
 
@@ -227,3 +230,18 @@ def test_f3_blocking_dup_onto_carried_root_reopens_it(led):
     assert L["findings"]["F1"]["severity"] == "critical"
     # за hard-cap открытая находка эскалирует к человеку; инвариант здесь — «не allow»
     assert g.convergence_decision(L)[0] in ("block", "escalate")
+
+
+def test_f11_resolved_by_user_requires_human_terminal(led, monkeypatch):
+    """Эскалация не должна держаться на дисциплине агента: `resolved-by-user` мгновенно
+    снимает блокирующую находку и вызывается тем же входом, что и остальные адъюдикации."""
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("critical", "Money leak")])
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
+    with pytest.raises(g.AdjudicationError) as exc:
+        g.adjudicate(L, "F1", "resolved-by-user", "агент решил за человека")
+    assert "терминал" in str(exc.value)
+    assert L["findings"]["F1"]["status"] == "open"
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    g.adjudicate(L, "F1", "resolved-by-user", "решение человека")
+    assert L["findings"]["F1"]["status"] == "resolved-by-user"

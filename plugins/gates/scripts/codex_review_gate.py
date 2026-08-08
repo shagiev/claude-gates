@@ -510,14 +510,20 @@ def warn_if_strict() -> None:
               file=sys.stderr)
 
 
+class TrustedHomeError(RuntimeError):
+    """Доверенный HOME недоступен — сертифицированный прогон невозможен (fail-closed)."""
+
+
 def _trusted_home() -> Path:
     """Домашний каталог из БД пользователей, а не из $HOME: переменную окружения выставляет
     тот же вызывающий, что запускает деплой, и подменённый HOME указывает на свой кэш плагина."""
     try:
         import pwd
         return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):
-        return Path.home()
+    except (ImportError, KeyError) as exc:
+        # Откат на Path.home() возвращал бы управление $HOME вызывающему — ровно тот вектор,
+        # который эта функция и закрывает. Без доверенного источника прогон не состоится.
+        raise TrustedHomeError(f"домашний каталог не резолвится доверенно: {type(exc).__name__}")
 
 
 #: PATH для сертифицированного прогона: системные каталоги + типовые установки node.
@@ -1161,6 +1167,18 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
         raise AdjudicationError(f"статус {status!r} ∉ {sorted(ADJ_STATUSES)}")
     if not reason.strip():
         raise AdjudicationError("причина обязательна (аудит)")
+    # F11: `resolved-by-user` мгновенно снимает блокирующую находку и вызывается ТЕМ ЖЕ
+    # агентом, что пишет код, через тот же вход. Требование TTY отсекает дефолтный
+    # неинтерактивный вызов, но ДОКАЗАТЕЛЬСТВОМ участия человека НЕ является: агент может
+    # выделить PTY (проверено ревью). Механическое разделение «агент/человек» на одной машине
+    # требует внеполосного подписанного одноразового подтверждения — остаток R-HUMAN-APPROVAL.
+    # Поэтому вторая половина защиты — громкость: решение попадает в аудит с пометкой и
+    # session id, чтобы подделанное одобрение было видно постфактум.
+    if status == "resolved-by-user" and not sys.stdin.isatty():
+        raise AdjudicationError(
+            "`resolved-by-user` — решение ЧЕЛОВЕКА и принимается только из интерактивного "
+            "терминала. Неинтерактивный вызов отклонён: иначе автор кода снимал бы "
+            "блокирующую находку сам. Набери команду вручную.")
     sev_known = f.get("severity") in KNOWN_SEVERITIES
     if status == "residual-failsafe" and (f.get("severity") == "critical" or not sev_known):
         raise AdjudicationError(
@@ -1183,6 +1201,10 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
     import time as _time
     led["last_adj_ts"] = _time.time()
     led["needs_review_round"] = True   # Codex должен УВИДЕТЬ адъюдикацию (спор F3-2: кэш
+    if status == "resolved-by-user":
+        audit(f"HUMAN-APPROVAL {fid} [{f.get('severity')}] session={_env_session()} "
+              f"reason={f['reason']!r} — блокирующая находка снята решением человека; "
+              "признак TTY не является доказательством (остаток R-HUMAN-APPROVAL)")
     audit(f"adjudicate {fid} → {status}: {f['reason']!r}")   # позволял allow без его раунда)
 
 
@@ -2337,7 +2359,10 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
     ⚠️ Аттестации фактической модели тут НЕТ: companion эхо-ит `request.model`, а
     `codex_model()` читает локальный конфиг. Это `declared`-запись (остаток M8 в AGENTS.md).
     """
-    requested = codex_model(allow_env_override=False)   # конфиг ревьюера — доверенный, не из env
+    try:
+        requested = codex_model(allow_env_override=False)   # конфиг ревьюера — доверенный
+    except TrustedHomeError as exc:
+        return (None, "", f"{exc}", {}, "unavailable")
     cert = reviewer_certification("codex", requested, role, allow_candidate=allow_candidate)
     if cert is None:
         return (None, requested, "нет certified Codex model для роли " + role, {}, "unavailable")
@@ -2392,15 +2417,24 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
                                   allow_candidate=allow_candidate)
     if cert is None:
         return (None, "", "нет certified Claude model для роли " + role, {}, "unavailable")
-    binary = _resolve_claude_bin()
+    try:
+        binary = _resolve_claude_bin()
+    except TrustedHomeError as exc:
+        # fail-closed сохраняется и без этой ветки (необработанное исключение = ненулевой код),
+        # но оператор получал traceback вместо причины
+        return (None, "", f"{exc}", {}, "unavailable")
     if binary is None:
         return (None, "", "claude CLI не найден", {}, "unavailable")
     try:
         resolved_binary = str(Path(binary).resolve(strict=True))
     except OSError:
         return (None, "", "claude CLI path не резолвится", {}, "unavailable")
+    if _inside_repo(Path(resolved_binary)):
+        return (None, "", "claude CLI резолвится ВНУТРЬ ревьюируемого репозитория — "
+                          "проверяемый код не может поставлять проверяющего", {}, "unavailable")
     audit(f"claude-{role} bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
-    cmd = [binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
+    # исполняем РЕЗОЛВНУТЫЙ путь: символьная ссылка могла указывать мимо проверенного файла
+    cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
            "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence"]
     # F8: cwd НЕ должен быть ревьюируемым репозиторием — иначе его `.claude/settings.json`
     # и хуки управляют ревьюером (маршрут, исполнение кода), то есть проверяемый контент

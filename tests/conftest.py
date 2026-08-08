@@ -55,6 +55,9 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
     # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
     monkeypatch.setenv("REVIEW_PROVIDER", "portable")
+    # см. F11: resolved-by-user принимается только из интерактивного терминала;
+    # тестам протокола он эмулируется, запрет проверяется точечным тестом.
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
     # ИНЦИДЕНТ 2026-07-25: FINDINGS_DIR/LEDGER_DIR были изолированы только в фикстуре
     # ОДНОГО тест-файла — новый тест-файл без локального мока писал в БОЕВОЙ
     # logs/review_findings (создал мусорную серию с critical-находкой из фикстуры, уронил

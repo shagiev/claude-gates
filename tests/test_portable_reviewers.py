@@ -884,3 +884,84 @@ def test_plugin_data_path_is_derived_not_inherited(monkeypatch, tmp_path):
     assert env["CLAUDE_PLUGIN_DATA"] == str(
         tmp_path / "trusted" / ".claude" / "plugins" / "data" / "codex-openai-codex")
     assert "hostile" not in env["CLAUDE_PLUGIN_DATA"]
+
+
+def test_f6_trusted_home_fails_closed_without_passwd(monkeypatch):
+    """Откат на Path.home() возвращал бы вызывающему управление $HOME: без доверенного
+    источника прогон обязан не состояться, а не тихо продолжиться."""
+    import pwd
+    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: (_ for _ in ()).throw(KeyError("no uid")))
+    with pytest.raises(g.TrustedHomeError):
+        g._trusted_home()
+
+
+def test_f8_repo_local_claude_binary_is_rejected(monkeypatch):
+    """Проверяемый код не может поставлять проверяющего — прямой путь внутрь репозитория."""
+    shim = pathlib.Path(g.REPO_ROOT) / "logs" / "claude-shim"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+    monkeypatch.setattr(g.subprocess, "run",
+                        lambda *a, **k: pytest.fail("бинарь внутри репо не должен исполняться"))
+    try:
+        monkeypatch.setattr(g, "_resolve_claude_bin", lambda: str(shim))
+        text, _a, detail, _u, status = g.run_claude_review_text(
+            "diff", role="blocking", allow_candidate=True)
+        assert text is None and status == "unavailable"
+        assert "ВНУТРЬ ревьюируемого репозитория" in detail
+    finally:
+        shim.unlink(missing_ok=True)
+
+
+def test_f8_symlink_pointing_into_repo_is_rejected(monkeypatch, tmp_path):
+    """Ссылка снаружи, цель внутри репозитория: проверять надо РЕЗОЛВНУТЫЙ путь."""
+    target = pathlib.Path(g.REPO_ROOT) / "logs" / "claude-target"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    link = tmp_path / "claude"
+    link.symlink_to(target)
+    monkeypatch.setattr(g.subprocess, "run",
+                        lambda *a, **k: pytest.fail("цель ссылки внутри репо не исполняется"))
+    try:
+        monkeypatch.setattr(g, "_resolve_claude_bin", lambda: str(link))
+        text, _a, detail, _u, status = g.run_claude_review_text(
+            "diff", role="blocking", allow_candidate=True)
+        assert text is None and status == "unavailable" and "ВНУТРЬ" in detail
+    finally:
+        target.unlink(missing_ok=True)
+
+
+def test_f8_executes_resolved_target_not_the_link(monkeypatch, tmp_path):
+    """Исполняться обязан резолвнутый файл: ссылка могла указывать мимо проверенного."""
+    target = tmp_path / "real-claude"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    link = tmp_path / "claude-link"
+    link.symlink_to(target)
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["argv0"] = cmd[0]
+        return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
+            "is_error": False, "result": _CLEAN,
+            "modelUsage": {"claude-opus-5": {"inputTokens": 1}}}))
+
+    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: str(link))
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    g.run_claude_review_text("diff", role="blocking", allow_candidate=True)
+    assert seen["argv0"] == str(target.resolve()), "исполнена ссылка, а не её цель"
+
+
+@pytest.mark.parametrize("runner", ["codex", "claude"])
+def test_trusted_home_failure_gives_clean_refusal_not_traceback(monkeypatch, runner):
+    """Fail-closed держится и без этой ветки, но оператор должен видеть причину, а не traceback."""
+    monkeypatch.setattr(g, "_trusted_home",
+                        lambda: (_ for _ in ()).throw(g.TrustedHomeError("passwd недоступен")))
+    # conftest подменяет резолвер инертной заглушкой ради изоляции — здесь нужен настоящий,
+    # иначе ветка TrustedHomeError не входится вовсе
+    monkeypatch.setattr(g, "_resolve_claude_bin", _REAL_RESOLVE_CLAUDE)
+    fn = g.run_codex_review_text if runner == "codex" else g.run_claude_review_text
+    text, _a, detail, _u, status = fn("diff", role="blocking", allow_candidate=True)
+    assert text is None and status == "unavailable"
+    assert "passwd" in detail
