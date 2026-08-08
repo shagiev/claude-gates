@@ -6,8 +6,13 @@ import pytest
 
 import codex_review_gate as g
 
-_CLEAN = "Verdict: approve\n\nNo material findings.\n"
-_BLOCK = "Verdict: needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
+# Протокольный токен собирается из частей: буквальная строка в фикстурах попадала
+# в ревьюируемый дифф и создавала ту самую неоднозначность, которую строгий парсер
+# обязан отвергать (находка F12).
+_VT = "Verd" + "ict:"
+
+_CLEAN = f"{_VT} approve\n\nNo material findings.\n"
+_BLOCK = f"{_VT} needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
 
 
 @pytest.fixture()

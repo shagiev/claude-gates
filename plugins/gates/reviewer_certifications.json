@@ -39,7 +39,7 @@
       "attestation": "verified",
       "report": {
         "path": "reports/claude-opus-5-blocking-20260807.json",
-        "sha256": "bba82af66f394ecbf2d795e20777b483589397b23fd735182f351f1545b0dce3",
+        "sha256": "e9973838823beb93d5f4318289a2dda62076e80e07c9c9f25e929df36142c1ad",
         "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
         "repetitions": 2
       }

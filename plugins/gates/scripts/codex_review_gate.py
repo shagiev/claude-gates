@@ -604,12 +604,38 @@ def _sterile_codex_home(requested_model: str) -> "str | None":
         return None
 
 
-def _certified_subprocess_env(codex_home: "str | None" = None) -> dict:
+def _sterile_claude_home() -> "str | None":
+    """Одноразовый gate-owned HOME для Claude-ревьюера: без settings, хуков и плагинов.
+
+    `--strict-mcp-config` закрывает только MCP. Пользовательские хуки живут в настройках под
+    HOME и исполняются НЕ через MCP: `UserPromptSubmit` получает промпт (то есть недоверенный
+    дифф) до ревью, `Pre/PostToolUse` срабатывают на Read/Glob/Grep. Их обработчики запускают
+    команды и HTTP — та же сетевая/пишущая поверхность, что закрыли для MCP.
+    Учётные данные копируются: это аутентификация, а не кастомизация."""
+    created = _sterile_mkdtemp("gates-claude-home-")
+    if created is None:
+        return None
+    try:
+        home = Path(created)
+        (home / ".claude").mkdir()
+        src = _trusted_home() / ".claude"
+        for name in (".credentials.json", "credentials.json"):
+            cand = src / name
+            if cand.is_file():
+                shutil.copy2(cand, home / ".claude" / name)
+        return created
+    except OSError:
+        shutil.rmtree(created, ignore_errors=True)
+        return None
+
+
+def _certified_subprocess_env(codex_home: "str | None" = None,
+                              home_override: "str | None" = None) -> dict:
     """Минимальное окружение: аллоулист + доверенные PATH и HOME. Ни одна переменная
     вызывающего не может ни подменить бинарь, ни увести запрос на чужой эндпоинт."""
     env = {k: v for k, v in os.environ.items() if k in _CERTIFIED_ENV_ALLOW}
     env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
-    env["HOME"] = str(_trusted_home())
+    env["HOME"] = home_override or str(_trusted_home())
     # Companion хранит состояние потока (rollout) в каталоге данных плагина: без него `task`
     # падает с «no rollout found». Путь ВЫЧИСЛЯЕТСЯ от доверенного HOME, а не берётся из
     # окружения — иначе вызывающий снова управлял бы каталогом, из которого читает ревьюер.
@@ -2434,7 +2460,11 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
                           "проверяемый код не может поставлять проверяющего", {}, "unavailable")
     audit(f"claude-{role} bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
     # исполняем РЕЗОЛВНУТЫЙ путь: символьная ссылка могла указывать мимо проверенного файла
+    # F14: `--tools` НЕ ограничивает MCP — ревьюер наследовал MCP-серверы вызывающего, то есть
+    # недоверенный текст диффа попадал к агенту с сетевыми/пишущими стоками (наблюдено живьём).
+    # `--strict-mcp-config` без `--mcp-config` означает: ни одного MCP-сервера не загружено.
     cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
+           "--strict-mcp-config",
            "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence"]
     # F8: cwd НЕ должен быть ревьюируемым репозиторием — иначе его `.claude/settings.json`
     # и хуки управляют ревьюером (маршрут, исполнение кода), то есть проверяемый контент
@@ -2443,17 +2473,23 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     if sterile_cwd is None:
         return (None, "", "не создать стерильный cwd вне ревьюируемого репозитория", {},
                 "unavailable")
+    sterile_home = _sterile_claude_home()
+    if sterile_home is None:
+        shutil.rmtree(sterile_cwd, ignore_errors=True)
+        return (None, "", "не создать стерильный HOME ревьюера — хуки и плагины вызывающего "
+                          "не изолировать", {}, "unavailable")
     try:
         result = subprocess.run(cmd, cwd=sterile_cwd,
                                 input=_build_reviewer_prompt(diff_text, role=role),
                                 capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S,
-                                env=_certified_subprocess_env())
+                                env=_certified_subprocess_env(home_override=sterile_home))
     except subprocess.TimeoutExpired:
         return (None, "", f"таймаут {_CLAUDE_TIMEOUT_S}s", {}, "timeout")
     except OSError as exc:
         return (None, "", redact_secrets(f"{type(exc).__name__}: {exc}")[:300], {}, "unavailable")
     finally:
         shutil.rmtree(sterile_cwd, ignore_errors=True)
+        shutil.rmtree(sterile_home, ignore_errors=True)
     if result.returncode != 0:
         return (None, "", redact_secrets((result.stderr or result.stdout or "").strip())[:300], {},
                 "invalid")

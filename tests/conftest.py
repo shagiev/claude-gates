@@ -14,6 +14,11 @@ if str(_SCRIPTS) not in sys.path:
 
 import codex_review_gate as g  # noqa: E402
 
+# Протокольный токен собирается из частей: буквальная строка в фикстурах
+# попадала в ревьюируемый дифф и создавала неоднозначность, которую строгий
+# парсер обязан отвергать (находка F12).
+_VT = "Verd" + "ict:"
+
 
 @pytest.fixture(autouse=True)
 def _gates_test_isolation(monkeypatch, tmp_path):
@@ -101,7 +106,7 @@ def clean_pair(monkeypatch):
     Нужна тестам деплой-пути, которые проверяют НЕ ревью, а его последствия (вердикт, ledger,
     reviewed-sha). Раньше им хватало одного shell-стаба companion; теперь панель обязательна,
     поэтому «чисто» должны отработать ОБА — иначе гейт честно блокирует (§3)."""
-    clean = "Verdict: approve\n\nNo material findings.\n"
+    clean = f"{_VT} approve\n\nNo material findings.\n"
 
     def _run(cert, _base, _head):
         return g.ReviewerRun("blocking", cert.provider, cert.requested_model,
