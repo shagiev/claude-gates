@@ -604,38 +604,12 @@ def _sterile_codex_home(requested_model: str) -> "str | None":
         return None
 
 
-def _sterile_claude_home() -> "str | None":
-    """Одноразовый gate-owned HOME для Claude-ревьюера: без settings, хуков и плагинов.
-
-    `--strict-mcp-config` закрывает только MCP. Пользовательские хуки живут в настройках под
-    HOME и исполняются НЕ через MCP: `UserPromptSubmit` получает промпт (то есть недоверенный
-    дифф) до ревью, `Pre/PostToolUse` срабатывают на Read/Glob/Grep. Их обработчики запускают
-    команды и HTTP — та же сетевая/пишущая поверхность, что закрыли для MCP.
-    Учётные данные копируются: это аутентификация, а не кастомизация."""
-    created = _sterile_mkdtemp("gates-claude-home-")
-    if created is None:
-        return None
-    try:
-        home = Path(created)
-        (home / ".claude").mkdir()
-        src = _trusted_home() / ".claude"
-        for name in (".credentials.json", "credentials.json"):
-            cand = src / name
-            if cand.is_file():
-                shutil.copy2(cand, home / ".claude" / name)
-        return created
-    except OSError:
-        shutil.rmtree(created, ignore_errors=True)
-        return None
-
-
-def _certified_subprocess_env(codex_home: "str | None" = None,
-                              home_override: "str | None" = None) -> dict:
+def _certified_subprocess_env(codex_home: "str | None" = None) -> dict:
     """Минимальное окружение: аллоулист + доверенные PATH и HOME. Ни одна переменная
     вызывающего не может ни подменить бинарь, ни увести запрос на чужой эндпоинт."""
     env = {k: v for k, v in os.environ.items() if k in _CERTIFIED_ENV_ALLOW}
     env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
-    env["HOME"] = home_override or str(_trusted_home())
+    env["HOME"] = str(_trusted_home())
     # Companion хранит состояние потока (rollout) в каталоге данных плагина: без него `task`
     # падает с «no rollout found». Путь ВЫЧИСЛЯЕТСЯ от доверенного HOME, а не берётся из
     # окружения — иначе вызывающий снова управлял бы каталогом, из которого читает ревьюер.
@@ -2267,6 +2241,27 @@ def run_gemini_review(base: str, head: str) -> "ReviewerRun":
                        detail="" if verdict.valid else "невалидный verdict", usage=usage)
 
 
+#: Managed-политика администратора переживает `--safe-mode` (managed CLAUDE.md и managed
+#: hooks). Она может исполнить хук против недоверенного диффа или изменить промпт ревьюера,
+#: то есть сертифицированное окружение перестаёт быть воспроизводимым между установками.
+_MANAGED_SETTINGS_PATHS = (
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+    "/etc/claude-code/managed-settings.json",
+    "/Library/Application Support/ClaudeCode/CLAUDE.md",
+    "/etc/claude-code/CLAUDE.md",
+)
+
+
+def _managed_policy_present() -> "str | None":
+    for path in _MANAGED_SETTINGS_PATHS:
+        try:
+            if Path(path).is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def _resolve_claude_bin() -> "str | None":
     # Mandatory artifact must not be satisfiable by an arbitrary PATH shim. These are the
     # supported native/Homebrew/system install locations; absence is fail-closed with setup
@@ -2458,13 +2453,25 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     if _inside_repo(Path(resolved_binary)):
         return (None, "", "claude CLI резолвится ВНУТРЬ ревьюируемого репозитория — "
                           "проверяемый код не может поставлять проверяющего", {}, "unavailable")
+    managed = _managed_policy_present()
+    if managed is not None:
+        # `--safe-mode` снимает пользовательские кастомизации, но НЕ managed-политику: она
+        # может нести хуки и CLAUDE.md, то есть исполнять код против недоверенного диффа и
+        # менять промпт. Сертификация, снятая без неё, ничего не говорит о таком прогоне.
+        return (None, "", f"активна managed-политика ({managed}): сертифицированное окружение "
+                          "ревьюера не воспроизводится — прогон остановлен", {}, "unavailable")
     audit(f"claude-{role} bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
     # исполняем РЕЗОЛВНУТЫЙ путь: символьная ссылка могла указывать мимо проверенного файла
     # F14: `--tools` НЕ ограничивает MCP — ревьюер наследовал MCP-серверы вызывающего, то есть
     # недоверенный текст диффа попадал к агенту с сетевыми/пишущими стоками (наблюдено живьём).
     # `--strict-mcp-config` без `--mcp-config` означает: ни одного MCP-сервера не загружено.
+    # `--tools` НЕ ограничивает ни MCP, ни ХУКИ: `UserPromptSubmit` получал промпт с
+    # недоверенным диффом до ревью, `Pre/PostToolUse` срабатывали на Read/Glob/Grep, а их
+    # обработчики запускают команды и HTTP. `--safe-mode` штатно снимает ВСЕ кастомизации
+    # (CLAUDE.md, скиллы, плагины, хуки, MCP), сохраняя аутентификацию — стерильный HOME её
+    # терял («Not logged in»). `--strict-mcp-config` оставлен как явная вторая линия.
     cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "Read,Glob,Grep",
-           "--strict-mcp-config",
+           "--safe-mode", "--strict-mcp-config",
            "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence"]
     # F8: cwd НЕ должен быть ревьюируемым репозиторием — иначе его `.claude/settings.json`
     # и хуки управляют ревьюером (маршрут, исполнение кода), то есть проверяемый контент
@@ -2473,23 +2480,17 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     if sterile_cwd is None:
         return (None, "", "не создать стерильный cwd вне ревьюируемого репозитория", {},
                 "unavailable")
-    sterile_home = _sterile_claude_home()
-    if sterile_home is None:
-        shutil.rmtree(sterile_cwd, ignore_errors=True)
-        return (None, "", "не создать стерильный HOME ревьюера — хуки и плагины вызывающего "
-                          "не изолировать", {}, "unavailable")
     try:
         result = subprocess.run(cmd, cwd=sterile_cwd,
                                 input=_build_reviewer_prompt(diff_text, role=role),
                                 capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S,
-                                env=_certified_subprocess_env(home_override=sterile_home))
+                                env=_certified_subprocess_env())
     except subprocess.TimeoutExpired:
         return (None, "", f"таймаут {_CLAUDE_TIMEOUT_S}s", {}, "timeout")
     except OSError as exc:
         return (None, "", redact_secrets(f"{type(exc).__name__}: {exc}")[:300], {}, "unavailable")
     finally:
         shutil.rmtree(sterile_cwd, ignore_errors=True)
-        shutil.rmtree(sterile_home, ignore_errors=True)
     if result.returncode != 0:
         return (None, "", redact_secrets((result.stderr or result.stdout or "").strip())[:300], {},
                 "invalid")
@@ -2500,18 +2501,53 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     model_usage = envelope.get("modelUsage")
     # Ключи modelUsage приходят из ответа CLI, то есть недоверенны: при отбраковке они
     # попадают в audit и operator output, и секретоподобное значение утекло бы наружу.
-    actual_models = (tuple(sorted(redact_secrets(str(m)) for m in model_usage))
-                     if isinstance(model_usage, dict) else ())
+    usage_by_model = ({redact_secrets(str(m)): v for m, v in model_usage.items()}
+                      if isinstance(model_usage, dict) else {})
+    actual_models = tuple(sorted(usage_by_model))
     actual = ",".join(actual_models)
-    if envelope.get("is_error") is not False or actual_models not in {
-            (m,) for m in cert.actual_models}:
-        return (None, actual, "Claude actual model/error не совпал с certification registry",
+    if envelope.get("is_error") is not False:
+        # Сырой конверт обрезался на 300 символах, и причина (result/subtype/api_error_status)
+        # в диагностику не попадала — оператор видел усечённый JSON. Разбираем явно.
+        parts = [f"{k}={redact_secrets(str(envelope.get(k)))[:200]}"
+                 for k in ("subtype", "api_error_status", "stop_reason", "result")
+                 if envelope.get(k) not in (None, "")]
+        return (None, actual, "Claude вернул is_error: " + ("; ".join(parts) or "без деталей"),
                 {}, "invalid")
+    # Под `--safe-mode` CLI штатно привлекает служебную модель того же вендора: замер 08.08.2026
+    # показал стабильный `claude-haiku-4-5` (вход 5893 / выход ~15) рядом с `claude-opus-5`
+    # (выход ~250). Требование РОВНО ОДНОЙ модели отвергало бы корректные ревью, поэтому правило
+    # уточнено: сертифицированная модель обязана присутствовать И написать вердикт (наибольший
+    # выход), а любая другая — принадлежать тому же семейству. Модель ЧУЖОГО вендора или
+    # сертифицированная модель, не писавшая ответ, по-прежнему делают артефакт невалидным.
+    def _out(model: str) -> "int | None":
+        u = usage_by_model.get(model)
+        v = u.get("outputTokens") if isinstance(u, dict) else None
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+    certified = [m for m in cert.actual_models if m in usage_by_model]
+    foreign = [m for m in actual_models if model_family(m) != cert.family]
+    outs = {m: _out(m) for m in actual_models}
+    cert_out = outs.get(certified[0]) if certified else None
+    # СТРОГИЙ единственный максимум и положительные счётчики: при ничьей или отсутствующих
+    # значениях прежнее правило пропускало артефакт (0 == max(0, 0)) — атрибуции не было вовсе.
+    unique_max = (cert_out is not None
+                  and all(o is not None for o in outs.values())
+                  and all(o < cert_out for m, o in outs.items() if m != certified[0]))
+    if not certified or foreign or not unique_max:
+        return (None, actual, "Claude actual model не совпал с certification registry "
+                              "(сертифицированная модель отсутствует, не писала вердикт "
+                              "или в ответе модель чужого семейства)", {}, "invalid")
+    # «Фактическая модель» = та, что НАПИСАЛА артефакт. Служебные модели того же вендора
+    # идут в usage для аудита, но не в идентичность прогона — иначе отчёт сертификации
+    # содержал бы склейку имён и не сходился бы с записью реестра.
     normalized = normalize_reviewer_text(envelope.get("result") or "")
     if normalized is None:
-        return (None, actual, "Claude ответ не прошёл строгий verdict-контракт", {}, "invalid")
+        return (None, certified[0], "Claude ответ не прошёл строгий verdict-контракт",
+                {}, "invalid")
     usage = envelope.get("usage")
-    return (normalized, actual, "", usage if isinstance(usage, dict) else {}, "ok")
+    usage = dict(usage) if isinstance(usage, dict) else {}
+    usage["models_seen"] = list(actual_models)      # включая служебные — видно в отчёте и аудите
+    return (normalized, certified[0], "", usage, "ok")
 
 
 def _run_text_reviewer(cert: ReviewerCertification, role: str, base: str, head: str,
