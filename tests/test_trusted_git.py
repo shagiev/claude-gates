@@ -111,3 +111,14 @@ def test_ladder_tree_hash_ignores_repository_clean_filter(tmp_path):
                               capture_output=True, text=True).stdout.strip()
 
     assert ours != filtered, "tree-хэш лесенки всё ещё считается через clean-фильтр"
+
+
+def test_fetch_adapter_rejects_command_executing_transport():
+    """`ext::` исполняет ПРОИЗВОЛЬНУЮ команду — это RCE, а не выбор источника."""
+    import prepush_gate as pg
+
+    for bad in ("ext::sh -c 'touch /tmp/pwned'", "EXT::whoami", "--upload-pack=evil"):
+        assert not pg._fetch_remote_allowed(bad), bad
+    for ok in ("https://github.com/x/y.git", "git@github.com:x/y.git",
+               "ssh://git@host/x.git", "/srv/bare/repo.git", "file:///srv/bare/repo.git"):
+        assert pg._fetch_remote_allowed(ok), ok

@@ -501,7 +501,7 @@ def test_e2e_fetch_runs_once_for_two_refs(repo, monkeypatch):
     real = subprocess.run
 
     def spy(cmd, *a, **kw):
-        if isinstance(cmd, list) and cmd[:2] == ["git", "fetch"]:
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git") and "fetch" in cmd:
             calls.append(tuple(cmd))
         return real(cmd, *a, **kw)
 
@@ -596,7 +596,9 @@ def test_e2e_rev_list_failure_blocks(repo, monkeypatch, capsys):
     real = subprocess.run
 
     def spy(cmd, *a, **kw):
-        if isinstance(cmd, list) and cmd[:2] == ["git", "rev-list"]:
+        # слой зовёт АБСОЛЮТНЫЙ git с `-c`-флагами нейтрализации, поэтому подкоманду
+        # ищем в argv, а не по фиксированной позиции
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git") and "rev-list" in cmd:
             class R:
                 returncode, stdout, stderr = 128, "", "fatal: bad revision"
             return R()
@@ -743,7 +745,7 @@ def test_git_calls_with_config_derived_refs_use_end_of_options(repo, monkeypatch
     real = subprocess.run
 
     def spy(cmd, *a, **kw):
-        if isinstance(cmd, list) and cmd[:1] == ["git"]:
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git"):
             seen.append(cmd)
         return real(cmd, *a, **kw)
 
@@ -751,6 +753,6 @@ def test_git_calls_with_config_derived_refs_use_end_of_options(repo, monkeypatch
     monkeypatch.setattr(pg.subprocess, "run", spy)
     _run(repo, feat)
     for name in ("fetch", "merge-tree", "rev-parse"):
-        calls = [c for c in seen if len(c) > 1 and c[1] == name]
+        calls = [c for c in seen if name in c]
         assert calls, f"вызов git {name} не состоялся — тест перестал проверять то, что заявляет"
         assert all("--end-of-options" in c for c in calls), f"git {name} без --end-of-options"

@@ -22,13 +22,73 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+#: Транспорты, запрещённые для сетевой операции. `ext::` исполняет ПРОИЗВОЛЬНУЮ команду —
+#: это RCE, а не выбор источника. Значение, начинающееся с `-`, инжектит опцию в argv.
+#: Локальные пути и `file://` НЕ запрещаем: они не исполняют код, а «remote указывает на
+#: подконтрольный локальный репозиторий» — та же граница, что R-ARTIFACT-PROVENANCE
+#: (владелец машины), и запрет ломал бы легитимные локальные bare-репозитории.
+_FORBIDDEN_REMOTE_PREFIXES = ("ext::", "-")
+
+
+def _fetch_remote_allowed(url: str) -> bool:
+    low = (url or "").strip().lower()
+    return bool(low) and not low.startswith(_FORBIDDEN_REMOTE_PREFIXES)
+
+
+def _prepush_fetch(root: "Path", remote: str, branch: str, timeout: int):
+    """Сетевая операция — ОТДЕЛЬНЫЙ адаптер: `protocol.*.allow=never` несовместим с fetch по
+    построению, поэтому транспорт разрешается явно и URL валидируется. Всё остальное
+    (абсолютный бинарь, аллоулист окружения, нейтрализация исполняемых конфигов) — как в слое."""
+    git = _trusted_git_bin()
+    if git is None:
+        raise TrustedGitError("доверенный git недоступен — fetch не выполнить безопасно")
+    url = _prepush_git("remote", "get-url", remote, cwd=root)
+    if url.returncode != 0:
+        # remote неизвестен/не читается — это ДОСТУПНОСТЬ, а не безопасность: пусть решает
+        # существующая политика on_fetch_failure (по умолчанию блок, скип аудируется).
+        return subprocess.CompletedProcess([], 128, "", f"remote {remote!r} не читается")
+    if not _fetch_remote_allowed(url.stdout.strip()):
+        # А это уже безопасность: `ext::` исполняет произвольную команду.
+        raise TrustedGitError(
+            f"remote {remote!r} использует запрещённый транспорт (`ext::` исполняет "
+            "произвольную команду) — сетевая операция отклонена")
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    env["HOME"] = str(_trusted_home())
+    env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    env.update({k: v for k, v in _GIT_SAFE_ENV.items()})
+    # убираем ПАРУ `-c protocol.allow=never` целиком: одиночный висячий `-c` съедал
+    # следующий аргумент как значение конфига, и `fetch` переставал быть подкомандой
+    pairs = list(zip(_GIT_NEUTRALIZE[::2], _GIT_NEUTRALIZE[1::2]))
+    neutralize = tuple(x for flag, val in pairs if val != "protocol.allow=never"
+                       for x in (flag, val))
+    return subprocess.run([git, *neutralize, "fetch", "--quiet", "--end-of-options",
+                           remote, branch],
+                          cwd=root, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def _prepush_git(*args: str, cwd: "Path | None" = None):
+    """Локальные чтения pre-push — через доверенный слой. Голый git позволял шиму отдать
+    `rev-list --count` = "0" и пропустить интеграционные проверки без аудита."""
+    r = _trusted_git(*args, cwd=cwd)
+    if r is None:
+        raise TrustedGitError("доверенный git недоступен — pre-push не может принять решение")
+    return r
+
+
+
 try:
     from codex_review_gate import (GATE_CONFIG_NAME, _config_section_at_ref,
+                                   _trusted_git, _trusted_git_bin, _GIT_ENV_ALLOW,
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
+                                   _trusted_home, TrustedGitError,
                                    _deploy_section_hash, _run_empirical, redact_secrets)
     from ladder_gate import _audit_line
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (GATE_CONFIG_NAME, _config_section_at_ref,  # type: ignore
+                                   _trusted_git, _trusted_git_bin, _GIT_ENV_ALLOW,
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
+                                   _trusted_home, TrustedGitError,
                                    _deploy_section_hash, _run_empirical, redact_secrets)
     from ladder_gate import _audit_line                                       # type: ignore
 
@@ -150,8 +210,8 @@ def default_base_ref(root: "Path | None" = None) -> str:
     git о фактической основной ветке remote'а, и только если он не знает — падаем на литерал."""
     if root is None:
         return _DEFAULT_BASE_REF
-    r = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                       cwd=root, capture_output=True, text=True)
+    r = _prepush_git("symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+                       cwd=root)
     ref = r.stdout.strip()
     return ref if r.returncode == 0 and "/" in ref else _DEFAULT_BASE_REF
 
@@ -241,21 +301,20 @@ def _resolve_remote_name(root: Path, remote: str) -> "str | None":
     """argv[0] у pre-push — имя remote ЛИБО URL (`git push https://… feature`). Для URL
     пространство `refs/remotes/<remote>/…` не существует, и детектор пересоздания молча
     не срабатывал (ревью 2026-07-26). Возвращает имя настроенного remote либо None."""
-    names = subprocess.run(["git", "remote"], cwd=root, capture_output=True, text=True)
+    names = _prepush_git("remote", cwd=root)
     configured = [n for n in names.stdout.split() if n]
     if remote in configured:
         return remote
     for name in configured:
-        url = subprocess.run(["git", "remote", "get-url", name], cwd=root,
-                             capture_output=True, text=True).stdout.strip()
+        url = _prepush_git("remote", "get-url", name, cwd=root).stdout.strip()
         if url and url == remote:
             return name
     return None
 
 
 def _tracking_ref_exists(root: Path, remote: str, branch: str) -> bool:
-    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "--end-of-options",
-                        f"refs/remotes/{remote}/{branch}"], cwd=root, capture_output=True)
+    r = _prepush_git("rev-parse", "--verify", "--quiet", "--end-of-options",
+                        f"refs/remotes/{remote}/{branch}", cwd=root)
     return r.returncode == 0
 
 
@@ -331,8 +390,8 @@ def self_weaken_verdict(root: Path, remote_sha: str, remote: str, branch: str,
 def predict_merge(root: Path, base: str, sha: str) -> MergeResult:
     """`merge-tree --write-tree` — предсказание БЕЗ касания рабочего дерева.
     «Неизвестно» ≠ «чисто» (И3)."""
-    r = subprocess.run(["git", "merge-tree", "--write-tree", "--end-of-options", base, sha],
-                       cwd=root, capture_output=True, text=True)
+    r = _prepush_git("merge-tree", "--write-tree", "--end-of-options", base, sha,
+                       cwd=root)
     if r.returncode == 0:
         first = r.stdout.strip().splitlines()
         oid = first[0].strip() if first else ""
@@ -367,8 +426,7 @@ def _git_common_dir(root: Path) -> Path:
     """`.git` — НЕ всегда каталог: в связанном worktree и в submodule это файл, поэтому путь
     пробы нельзя строить как `root/.git/...` (ревью 2026-07-26: `worktree add` там падает,
     оператор получает блок с непонятным сообщением)."""
-    r = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=root,
-                       capture_output=True, text=True)
+    r = _prepush_git("rev-parse", "--git-common-dir", cwd=root)
     if r.returncode != 0 or not r.stdout.strip():
         return root / ".git"
     p = Path(r.stdout.strip())
@@ -429,7 +487,7 @@ def probe_worktree(root: Path, base: str, sha: str, tree: str):
 def worktree_snapshot(root: Path) -> str:
     """Снимок ОТСЛЕЖИВАЕМЫХ изменений рабочего дерева — контроль побочного эффекта (И1).
     Записи в gitignored пути (кэши) намеренно не видны: остаток §9.2."""
-    r = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True)
+    r = _prepush_git("status", "--porcelain", cwd=root)
     return hashlib.sha256(r.stdout.encode()).hexdigest()
 
 
@@ -479,8 +537,8 @@ def _onboarded(root: Path) -> bool:
     на импорте и из хука/tmp-репо непригодна (та же причина, что у `_audit_line`)."""
     if (root / GATE_CONFIG_NAME).exists():
         return True
-    return subprocess.run(["git", "cat-file", "-e", f"HEAD:{GATE_CONFIG_NAME}"],
-                          cwd=root, capture_output=True).returncode == 0
+    return _prepush_git("cat-file", "-e", f"HEAD:{GATE_CONFIG_NAME}",
+                          cwd=root).returncode == 0
 
 
 def main(argv: list[str], stdin_text: "str | None" = None, root: "Path | None" = None) -> int:
@@ -553,9 +611,7 @@ def _fetch_base(root: Path, cfg: IntegrationConfig, fetched: dict) -> "str | Non
     if key in fetched:
         return fetched[key]
     try:
-        r = subprocess.run(["git", "fetch", "--quiet", "--end-of-options", remote, branch],
-                           cwd=root,
-                           capture_output=True, text=True, timeout=cfg.fetch_timeout)
+        r = _prepush_fetch(root, remote, branch, cfg.fetch_timeout)
         reason = None if r.returncode == 0 else (
             redact_secrets(r.stderr.strip())[:300] or "git fetch не удался")
     except subprocess.TimeoutExpired:
@@ -581,8 +637,8 @@ def _check_integration(root: Path, line: PushRef, cfg: IntegrationConfig, fetche
                           f"reason={reason!r} — слияние НЕ проверялось (конфигурируемый обход)")
         print(report_fetch_failed(cfg.on_fetch_failure, reason), file=sys.stderr)
         return 0                        # шаги отставания/слияния/тестов НЕ выполняются (И3)
-    behind = subprocess.run(["git", "rev-list", "--count", f"{line.local_sha}..{cfg.base_ref}"],
-                            cwd=root, capture_output=True, text=True)
+    behind = _prepush_git("rev-list", "--count", f"{line.local_sha}..{cfg.base_ref}",
+                            cwd=root)
     if behind.returncode != 0:
         # И3: сбой сравнения — «неизвестно», а не «есть что интегрировать, разберёмся ниже».
         print(f"[prepush] ✗ {line.local_ref}: не удалось сравнить с {cfg.base_ref} "
@@ -605,8 +661,7 @@ def _check_integration(root: Path, line: PushRef, cfg: IntegrationConfig, fetche
         print(f"[prepush] ✗ {line.local_ref}: предсказание слияния не удалось "
               f"({merged.detail}) — «неизвестно» не значит «чисто»", file=sys.stderr)
         return 2
-    base_sha = subprocess.run(["git", "rev-parse", "--end-of-options", cfg.base_ref], cwd=root,
-                              capture_output=True, text=True).stdout.strip()
+    base_sha = _prepush_git("rev-parse", "--end-of-options", cfg.base_ref, cwd=root).stdout.strip()
     _audit_line(root, f"integration ok ref={line.local_ref} sha={line.local_sha[:12]} "
                       f"base={cfg.base_ref} base_sha={base_sha[:12]} — конфликтов нет")
     if not cfg.merge_test_command:
