@@ -757,14 +757,18 @@ def test_set_hook_repo_context_updates_all_repo_derived_paths(repo):
     assert g.REPO_ROOT == repo.resolve()
     assert g.AUDIT_LOG == repo / "logs" / "codex_review_audit.log"
     assert g.DESIGN_MARKER == repo / ".claude" / ".design-approved"
-    assert g.LEDGER_DIR == repo / "logs" / "review_ledger"
+    # Ledger'ы серии — тоже состояние, влияющее на решение, и тоже ВНЕ репозитория:
+    # `logs/` игнорируется git'ом, поэтому подброшенный файл не делал дерево грязным.
+    assert g.LEDGER_DIR == g._gate_state_dir() / "review_ledger"
     assert g.LAST_DEPLOYED == repo / ".claude" / ".last-deployed-sha"
     assert g.LAST_REVIEWED == repo / ".claude" / ".last-reviewed-sha"
     # Состояние, ВЛИЯЮЩЕЕ НА РЕШЕНИЕ, живёт вне репозитория: pin авторизует команду,
     # назначающую границу ревью, и лёжа в `.claude/` позволял ветке исключить себя из ревью.
     assert g.DEPLOY_PIN == g._gate_state_dir() / "deploy-section-pin"
     assert repo.resolve() not in g.DEPLOY_PIN.parents
-    assert g.FINDINGS_DIR == repo / "logs" / "review_findings"
+    assert g.FINDINGS_DIR == g._gate_state_dir() / "review_findings"
+    for d in (g.LEDGER_DIR, g.FINDINGS_DIR):
+        assert repo.resolve() not in d.parents, f"{d} внутри репозитория"
     assert g.VERDICT_DIR == repo / "logs" / "review_verdicts"
 
 
