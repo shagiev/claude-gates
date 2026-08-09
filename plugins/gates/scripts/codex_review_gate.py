@@ -1292,7 +1292,8 @@ def merge_round(led: dict, blocking_findings: "list[tuple]",
         fnd[new_fid()] = rec_new
 
 
-def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
+def adjudicate(led: dict, fid: str, status: str, reason: str,
+               operator_confirmed: bool = False) -> None:
     """Классификация Claude по стоп-политике. Guards (ML-C1): critical не residual;
     причина обязательна; resolved-by-user — только решение человека (можно всё)."""
     f = (led.get("findings") or {}).get(fid)
@@ -1303,17 +1304,24 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
     if not reason.strip():
         raise AdjudicationError("причина обязательна (аудит)")
     # F11: `resolved-by-user` мгновенно снимает блокирующую находку и вызывается ТЕМ ЖЕ
-    # агентом, что пишет код, через тот же вход. Требование TTY отсекает дефолтный
-    # неинтерактивный вызов, но ДОКАЗАТЕЛЬСТВОМ участия человека НЕ является: агент может
-    # выделить PTY (проверено ревью). Механическое разделение «агент/человек» на одной машине
-    # требует внеполосного подписанного одноразового подтверждения — остаток R-HUMAN-APPROVAL.
-    # Поэтому вторая половина защиты — громкость: решение попадает в аудит с пометкой и
-    # session id, чтобы подделанное одобрение было видно постфактум.
-    if status == "resolved-by-user" and not sys.stdin.isatty():
+    # агентом, что пишет код, через тот же вход.
+    #
+    # Требование TTY было ОТМЕНЕНО по боевому опыту 09.08.2026. Оно не давало гарантии (агент
+    # выделяет PTY — проверено ревью, остаток R-HUMAN-APPROVAL), но выгоняло человека из
+    # рабочего окружения: под Claude Code даже `!`-команда идёт без tty, то есть оператору
+    # приходилось открывать отдельный терминал. Препятствие, которое не держит нарушителя и
+    # мешает добросовестному, — плохой размен.
+    #
+    # Взамен — ЯВНОЕ ЗАЯВЛЕНИЕ: `--operator-confirmed`. Оно тоже не доказывает участие
+    # человека, но снимает случайность (флаг нельзя проставить «по инерции») и оставляет в
+    # аудите отдельную метку с указанием способа, по которой снятие находки видно постфактум.
+    if status == "resolved-by-user" and not (sys.stdin.isatty() or operator_confirmed):
         raise AdjudicationError(
-            "`resolved-by-user` — решение ЧЕЛОВЕКА и принимается только из интерактивного "
-            "терминала. Неинтерактивный вызов отклонён: иначе автор кода снимал бы "
-            "блокирующую находку сам. Набери команду вручную.")
+            "`resolved-by-user` — решение ЧЕЛОВЕКА. Подтверди явно:\n"
+            "  adjudicate <Fid> resolved-by-user --operator-confirmed \"причина\"\n"
+            "  (или --reason-file <путь>, чтобы не набирать длинный текст)\n"
+            "Флаг — не барьер, а ЗАЯВЛЕНИЕ: оно пишется в аудит отдельной меткой, поэтому "
+            "снятие находки агентом видно постфактум (остаток R-HUMAN-APPROVAL).")
     sev_known = f.get("severity") in KNOWN_SEVERITIES
     if status == "residual-failsafe" and (f.get("severity") == "critical" or not sev_known):
         raise AdjudicationError(
@@ -1337,9 +1345,11 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
     led["last_adj_ts"] = _time.time()
     led["needs_review_round"] = True   # Codex должен УВИДЕТЬ адъюдикацию (спор F3-2: кэш
     if status == "resolved-by-user":
-        audit(f"HUMAN-APPROVAL {fid} [{f.get('severity')}] session={_env_session()} "
-              f"reason={f['reason']!r} — блокирующая находка снята решением человека; "
-              "признак TTY не является доказательством (остаток R-HUMAN-APPROVAL)")
+        how = "tty" if sys.stdin.isatty() else "operator-confirmed-flag"
+        audit(f"HUMAN-APPROVAL {fid} [{f.get('severity')}] session={_env_session()} via={how} "
+              f"reason={f['reason']!r} — блокирующая находка снята решением человека. "
+              "Ни TTY, ни флаг НЕ доказывают участие человека (остаток R-HUMAN-APPROVAL): "
+              "это заявление, оставляющее след для последующей проверки")
     audit(f"adjudicate {fid} → {status}: {f['reason']!r}")   # позволял allow без его раунда)
 
 
@@ -3642,10 +3652,13 @@ def main(argv: list[str]) -> int:
         if not _require_repo():
             return 2
         args_a = argv[1:]
-        # `resolved-by-user` требует ИНТЕРАКТИВНОГО терминала, то есть человек набирает
-        # команду руками. Заставлять его перенабирать длинную причину — трение без пользы:
-        # текст всё равно пишет агент, человек подтверждает РЕШЕНИЕ. `--reason-file` даёт
-        # набрать короткую команду, оставив требование терминала на месте.
+        # `--operator-confirmed` — явное заявление оператора вместо требования терминала
+        # (см. adjudicate: tty не держал нарушителя, но выгонял человека из рабочего окружения).
+        # `--reason-file` избавляет от перенабора длинного текста: обоснование пишет агент,
+        # человек подтверждает РЕШЕНИЕ.
+        operator_confirmed = "--operator-confirmed" in args_a
+        if operator_confirmed:
+            args_a = [a for a in args_a if a != "--operator-confirmed"]
         if "--reason-file" in args_a:
             i = args_a.index("--reason-file")
             path = args_a[i + 1] if i + 1 < len(args_a) else ""
@@ -3673,7 +3686,8 @@ def main(argv: list[str]) -> int:
                 print("findings-ledger повреждён", file=sys.stderr)
                 return 2
             try:
-                adjudicate(led, argv[1], argv[2], argv[3])
+                adjudicate(led, argv[1], argv[2], argv[3],
+                           operator_confirmed=operator_confirmed)
             except AdjudicationError as e:
                 print(f"[codex-gate] {e}", file=sys.stderr)
                 return 2
