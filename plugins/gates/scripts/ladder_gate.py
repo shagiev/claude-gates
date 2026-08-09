@@ -25,11 +25,15 @@ except ImportError:            # PyYAML может отсутствовать в
 # уже в sys.path (тесты через conftest, запуск обоих скриптов из одного каталога), фолбэк —
 # при запуске как голый скрипт из произвольного cwd.
 try:
-    from codex_review_gate import is_code_path, _trusted_git, TrustedGitError
+    from codex_review_gate import (is_code_path, _trusted_git, TrustedGitError,
+                                   _trusted_git_bin, _trusted_home, _GIT_ENV_ALLOW,
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS)
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
-                                   TrustedGitError)
+                                   TrustedGitError, _trusted_git_bin, _trusted_home,
+                                   _GIT_ENV_ALLOW, _GIT_SAFE_ENV, _GIT_NEUTRALIZE,
+                                   _TRUSTED_PATH_DIRS)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -203,20 +207,21 @@ def compute_tree(root: Path) -> str:
             h = _trusted_git("hash-object", "--no-filters", "-w", "--", rel, cwd=root)
             if h is None or h.returncode != 0:
                 raise TrustedGitError(f"не посчитать хэш {rel!r} — tree-хэш не посчитать")
-            u = subprocess.run(["git", "update-index", "--add", "--cacheinfo",
-                                f"{mode},{h.stdout.strip()},{rel}"],
-                               cwd=root, env=env, capture_output=True, text=True)
+            u = _git_mutate(root, env, "update-index", "--add", "--cacheinfo",
+                            f"{mode},{h.stdout.strip()},{rel}")
             if u.returncode != 0:
                 raise TrustedGitError(f"update-index отверг {rel!r}")
-        r = subprocess.run(["git", "write-tree"], cwd=root, env=env, check=True,
-                           capture_output=True, text=True)
+        r = _git_mutate(root, env, "write-tree")
+        if r.returncode != 0:
+            raise TrustedGitError("write-tree не удался — tree-хэш не посчитать")
         return r.stdout.strip()
 
 
 def index_tree(root: Path) -> str:
     """git write-tree РЕАЛЬНОГО индекса (для pre-commit — ровно то, что закоммитится)."""
-    r = subprocess.run(["git", "write-tree"], cwd=root, check=True,
-                       capture_output=True, text=True)
+    r = _git_mutate(root, None, "write-tree")
+    if r.returncode != 0:
+        raise TrustedGitError("write-tree реального индекса не удался")
     return r.stdout.strip()
 
 
@@ -337,9 +342,10 @@ def _audit_line(root: Path, msg: str) -> None:
 
 def changed_paths_staged(root: Path) -> list[str]:
     """Пути, застейдженные относительно HEAD (`git diff --cached --name-only`)."""
-    r = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=root, check=True,
-                       capture_output=True, text=True)
-    return [line for line in r.stdout.splitlines() if line]
+    # Голый git позволял шиму выйти нулём с ПУСТЫМ выводом: код-коммит выглядел
+    # не-кодовым, check_precommit возвращал 0 до проверки лесенки и без записи скипа.
+    out = _git_out(root, ["diff", "--cached", "--name-only"])
+    return [line for line in out.splitlines() if line]
 
 
 def commit_touches_code(paths: list[str]) -> bool:
@@ -422,6 +428,22 @@ def _write_ledger(root: Path, sha: str, payload: dict) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     tmp.replace(p)   # атомарная публикация
+
+
+def _git_mutate(root: Path, env: "dict | None", *args: str):
+    """Мутации индекса/дерева: абсолютный бинарь и санированное окружение, как в слое.
+    Отдельно от `_trusted_git`, потому что нуждается в GIT_INDEX_FILE."""
+    git = _trusted_git_bin()
+    if git is None:
+        raise TrustedGitError("доверенный git недоступен — индекс/дерево не построить")
+    base = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    base["HOME"] = str(_trusted_home())
+    base["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    base.update(_GIT_SAFE_ENV)
+    if env and env.get("GIT_INDEX_FILE"):
+        base["GIT_INDEX_FILE"] = env["GIT_INDEX_FILE"]
+    return subprocess.run([git, *_GIT_NEUTRALIZE, *args], cwd=root,
+                          capture_output=True, text=True, env=base)
 
 
 def _git_out(root: Path, args: list[str]) -> str:

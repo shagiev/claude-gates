@@ -2,6 +2,7 @@
 Ф1 authoritative baseline (B1-B12): pin секции deploy, no-fallback, env-переходы с аудитом.
 Ф2 вердикт деплой-гейта (V1-V8): delete-then-write под локом, скипы видимы."""
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,12 @@ def env(tmp_path, monkeypatch):
     # Эти тесты про запись вердикта, git им безразличен.
     monkeypatch.setattr(g, "git_head", lambda: HEAD_SHA)
     monkeypatch.setattr(g, "diff_sha256", lambda base, head=None: "d" * 64)
+    # ancestry теперь тоже идёт через доверенный слой (обход через шим закрыт), а REPO_ROOT
+    # здесь — не репозиторий: отвечаем успехом, эти тесты про запись вердикта
+    _real_tg = g._trusted_git
+    monkeypatch.setattr(g, "_trusted_git", lambda *a, **kw: (
+        SimpleNamespace(returncode=0, stdout="", stderr="")
+        if a and a[0] == "merge-base" else _real_tg(*a, **kw)))
     monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")

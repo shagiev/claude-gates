@@ -458,30 +458,56 @@ def hookless_env():
         yield env
 
 
+#: На время checkout фильтры отключаются: `filter.<drv>.process` и `.smudge` исполняют
+#: команды, выбранные атрибутами ревьюируемого репозитория.
+_PROBE_NEUTRALIZE = ("-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
+                     "-c", "filter.lfs.required=false")
+
+
+def _probe_git(root: Path, env: dict, *args: str):
+    """Мутирующие операции probe — абсолютный бинарь, аллоулист окружения, нейтрализация.
+    Отдельно от `_trusted_git`, потому что нуждается в GIT_CONFIG_* из hookless_env."""
+    git = _trusted_git_bin()
+    if git is None:
+        raise TrustedGitError("доверенный git недоступен — probe не построить")
+    base_env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    base_env["HOME"] = str(_trusted_home())
+    base_env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    base_env.update(_GIT_SAFE_ENV)
+    # GIT_CONFIG_* из hookless_env — это НАШИ значения (пустой hooksPath), не вызывающего
+    for k, v in env.items():
+        if k.startswith("GIT_CONFIG_"):
+            base_env[k] = v
+    return subprocess.run([git, *_GIT_NEUTRALIZE, *_PROBE_NEUTRALIZE, *args], cwd=root,
+                          capture_output=True, text=True, env=base_env)
+
+
 @contextlib.contextmanager
 def probe_worktree(root: Path, base: str, sha: str, tree: str):
     """Материализует смерженное дерево в отдельный worktree. Рабочее дерево пользователя
     не трогается (И1). Уборка best-effort + prune на старте (И7: SIGKILL `finally` не выполнит)."""
+    # `worktree add` делает CHECKOUT, то есть запускает smudge/process-фильтры, выбранные
+    # атрибутами и локальным конфигом РЕВЬЮИРУЕМОГО репозитория — код проверяемой стороны
+    # исполнялся бы до интеграционных тестов. Плюс раньше сюда уезжало полное окружение
+    # вызывающего (PATH/loader). Оба закрыты: доверенный бинарь, аллоулист, нейтрализация,
+    # и фильтры отключены явно на время checkout.
     with hookless_env() as env:
-        subprocess.run(["git", "worktree", "prune"], cwd=root, capture_output=True, env=env)
-        ct = subprocess.run(["git", "commit-tree", tree, "-p", base, "-p", sha,
-                             "-m", "integration probe"], cwd=root, capture_output=True,
-                            text=True, env=env)
+        _probe_git(root, env, "worktree", "prune")
+        ct = _probe_git(root, env, "commit-tree", tree, "-p", base, "-p", sha,
+                        "-m", "integration probe")
         if ct.returncode != 0 or not ct.stdout.strip():
             raise RuntimeError("commit-tree не удался: "
                                f"{redact_secrets(ct.stderr.strip())[:300]}")
         commit = ct.stdout.strip()
         path = _git_common_dir(root) / "gates-probe" / f"{os.getpid()}-{sha[:8]}"
-        r = subprocess.run(["git", "worktree", "add", "-q", "--detach", str(path), commit],
-                           cwd=root, capture_output=True, text=True, env=env)
+        r = _probe_git(root, env, "worktree", "add", "-q", "--detach", str(path), commit)
         if r.returncode != 0:
             raise RuntimeError("worktree add не удался: "
                                f"{redact_secrets(r.stderr.strip())[:300]}")
         try:
             yield path, env
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(path)],
-                           cwd=root, capture_output=True, env=env)
+            _probe_git(root, env, "worktree", "remove", "--force", str(path))
 
 
 def worktree_snapshot(root: Path) -> str:

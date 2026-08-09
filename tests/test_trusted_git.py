@@ -174,5 +174,50 @@ def test_deploy_template_has_no_bare_git_in_decision_path():
     for bad in ("git rev-parse", "git status", "git diff"):
         assert bad not in deploy, f"в деплой-пути шаблона остался голый {bad!r}"
     assert "verify-deployable" in deploy and "GATES_ARTIFACT" in deploy
-    # выкатывается РАСПАКОВАННЫЙ артефакт, а не рабочее дерево
-    assert "tar -xf $$GATES_ARTIFACT" in deploy
+
+
+def test_artifact_ignores_export_ignore_attribute(repo, monkeypatch, tmp_path, capsys):
+    """`git archive` уважает export-ignore, то есть содержимым артефакта управляет
+    непроверенное состояние репозитория. Артефакт собирается из дерева коммита."""
+    import tarfile
+
+    (repo / "secret.txt").write_text("must ship\n")
+    (repo / ".gitattributes").write_text("secret.txt export-ignore\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "attrs")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    (tmp_path / "lr").write_text(head)
+    monkeypatch.setattr(g, "LAST_REVIEWED", tmp_path / "lr")
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
+    monkeypatch.setattr(g, "_require_repo", lambda: True)
+
+    assert g.main(["verify-deployable"]) == 0
+    art = [l.split("=", 1)[1] for l in capsys.readouterr().out.splitlines()
+           if l.startswith("GATES_ARTIFACT=")][0]
+    with tarfile.open(art) as tf:
+        names = set(tf.getnames())
+    assert "secret.txt" in names, "export-ignore выбросил закоммиченный файл из артефакта"
+    assert "a.txt" in names
+
+
+def test_deploy_skeleton_fails_instead_of_reporting_false_success(tmp_path):
+    """Прежний скелет ЭХОИЛ команды выкатки и всё равно двигал baseline: `make deploy`
+    рапортовал успех для кода, который никуда не уехал. Проверяем ИСПОЛНЕНИЕМ, а не
+    поиском подстроки — прошлый тест был ложноположительным."""
+    import pathlib as _pl
+
+    tpl = (_pl.Path(g.__file__).resolve().parent.parent
+           / "templates" / "Makefile.snippet").read_text()
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    (proj / "Makefile").write_text(tpl)
+
+    # оба обязательных таргета НЕ переопределены → деплой обязан упасть
+    for target in ("deploy-payload", "verify-deployed"):
+        r = subprocess.run(["make", "-s", target], cwd=proj, capture_output=True, text=True)
+        assert r.returncode != 0, f"{target} по умолчанию обязан падать"
+        assert "не переопределён" in r.stdout + r.stderr
+
+    # baseline не должен появиться от одного лишь запуска
+    assert not (proj / ".claude" / ".last-deployed-sha").exists()

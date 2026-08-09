@@ -39,12 +39,27 @@ deploy: check-reviewed   # + твои проверки: check-committed test myp
 		echo "❌ решение ревью устарело (конкурентная находка/адъюдикация после allow) — прерываю"; \
 		exit 1; \
 	fi; \
-	echo "==> ВЫКАТЫВАЙ АРТЕФАКТ, а не рабочее дерево:"; \
-	echo "==>   mkdir -p build/payload && tar -xf $$GATES_ARTIFACT -C build/payload"; \
-	echo "==>   rsync -a build/payload/ host:/srv/app/    # вместо rsync ."; \
-	echo "==> затем пост-деплой верификация; при УСПЕХЕ зафиксируй baseline:"; \
+	$(MAKE) --no-print-directory deploy-payload GATES_ARTIFACT="$$GATES_ARTIFACT" || exit 1; \
+	$(MAKE) --no-print-directory verify-deployed GATES_ARTIFACT="$$GATES_ARTIFACT" || exit 1; \
 	printf '%s\n' "$$REVIEWED_SHA" > .claude/.last-deployed-sha; \
-	echo "==> baseline ревью обновлён: $$(cat .claude/.last-deployed-sha)"
+	echo "✅ выкачен и проверен артефакт $$REVIEWED_SHA; baseline ревью обновлён"
+
+# ── ОБЯЗАТЕЛЬНО переопредели оба таргета в своём Makefile ──────────────────────
+# Скелет НЕ выкатывает: пока они не заменены, `make deploy` ПАДАЕТ. Иначе цель
+# рапортовала бы успех и двигала baseline ревью на код, который никуда не уехал
+# (находка ревью 09.08.2026: команды были аргументами echo, а baseline всё равно сдвигался).
+# $(GATES_ARTIFACT) — tar, собранный ИЗ отревьюенного коммита, а не рабочее дерево.
+deploy-payload:
+	@echo "❌ deploy-payload не переопределён. Пример:"; \
+	echo "   deploy-payload:"; \
+	echo "   	mkdir -p build/payload && tar -xf \$$(GATES_ARTIFACT) -C build/payload"; \
+	echo "   	rsync -a --delete build/payload/ host:/srv/app/"; \
+	exit 1
+
+verify-deployed:
+	@echo "❌ verify-deployed не переопределён: baseline нельзя двигать, не проверив, что"; \
+	echo "   выкаченное реально работает (healthcheck/версия на КАЖДОМ хосте)."; \
+	exit 1
 
 # Протокол сходимости (Фаза 1.6) — адъюдикация находок между раундами:
 #   bash .githooks/gates-run codex_review_gate.py findings

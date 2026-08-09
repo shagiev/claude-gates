@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -2793,9 +2794,12 @@ def check_reviewed_cli() -> int:
             return 2
         # baseline должен быть предком HEAD, иначе baseline..HEAD не покрывает реальный дельту
         # (протухший/кросс-машинный/rollback SHA) — Codex P2, fail-closed.
-        anc = subprocess.run(["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
-                             capture_output=True, text=True)
-        if anc.returncode != 0:
+        # Голый git + текущий HEAD давали обход: шим, возвращающий 0, делал предком ЛЮБОЙ
+        # baseline. Взяв no-op потомка с тем же деревом, вызывающий получал пустой диапазон —
+        # лесенка и оба ревьюера одобряли «нет изменений», а артефакт собирался из HEAD.
+        # Сверяем через слой и против ЗАХВАЧЕННОГО head_before, а не ambient HEAD.
+        anc = _trusted_git("merge-base", "--is-ancestor", baseline, head_before)
+        if anc is None or anc.returncode != 0:
             print(f"[codex-gate] ✗ baseline {baseline[:12]} не предок HEAD (протухший/кросс-машинный) "
                   "— задай верный CODEX_DEPLOY_BASELINE. Деплой остановлен.", file=sys.stderr)
             return 2
@@ -3596,10 +3600,52 @@ def main(argv: list[str]) -> int:
             print("[codex-gate] ✗ не создать каталог артефакта вне ревьюируемого репозитория",
                   file=sys.stderr)
             return 2
+        # `git archive` НЕ даёт побайтового манифеста дерева: `export-ignore`/`export-subst`
+        # из `.gitattributes` или `.git/info/attributes` выбрасывают и переписывают файлы, то
+        # есть содержимым артефакта управляет непроверенное состояние репозитория. Собираем tar
+        # сами из дерева коммита: `ls-tree -r -z` + сырые blob'ы через `cat-file`.
         tar = Path(out_dir) / f"{head[:12]}.tar"
-        r = _trusted_git("archive", "--format=tar", "-o", str(tar), head)
-        if r is None or r.returncode != 0:
-            print("[codex-gate] ✗ не построить артефакт из коммита", file=sys.stderr)
+        listing = _trusted_git("ls-tree", "-r", "-z", head)
+        if listing is None or listing.returncode != 0:
+            print("[codex-gate] ✗ не прочитать дерево коммита — артефакт не собрать",
+                  file=sys.stderr)
+            return 2
+        import tarfile
+        entries = 0
+        try:
+            with tarfile.open(tar, "w", format=tarfile.PAX_FORMAT) as tf:
+                for entry in listing.stdout.split("\0"):
+                    if not entry.strip():
+                        continue
+                    meta, _, path = entry.partition("\t")
+                    parts = meta.split()
+                    if len(parts) < 3 or not path:
+                        print("[codex-gate] ✗ ls-tree изменил формат — артефакт не собрать",
+                              file=sys.stderr)
+                        return 2
+                    mode, otype, oid = parts[0], parts[1], parts[2]
+                    if otype != "blob":                 # подмодули артефактом не выкатываются
+                        continue
+                    blob = _trusted_git("cat-file", "blob", oid)
+                    if blob is None or blob.returncode != 0:
+                        print(f"[codex-gate] ✗ не прочитать blob {oid[:12]} для {path}",
+                              file=sys.stderr)
+                        return 2
+                    data = blob.stdout.encode("utf-8", "surrogateescape")
+                    info = tarfile.TarInfo(path)
+                    if mode == "120000":                # симлинк: цель — содержимое blob'а
+                        info.type, info.linkname, info.size = tarfile.SYMTYPE, data.decode(), 0
+                        tf.addfile(info)
+                    else:
+                        info.mode = 0o755 if mode == "100755" else 0o644
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
+                    entries += 1
+        except (OSError, tarfile.TarError) as exc:
+            print(f"[codex-gate] ✗ не собрать артефакт: {type(exc).__name__}", file=sys.stderr)
+            return 2
+        if entries == 0:
+            print("[codex-gate] ✗ артефакт пуст — дерево коммита не прочитано", file=sys.stderr)
             return 2
         digest = hashlib.sha256(tar.read_bytes()).hexdigest()
         audit(f"verify-deployable head={head} artifact={tar} sha256={digest}")
