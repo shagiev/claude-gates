@@ -21,6 +21,10 @@ def _sec(cmd="echo " + H, to=None):
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "REPO_ROOT", tmp_path)
+    # REPO_ROOT здесь — не git-репозиторий, а закреплённый git работает именно в нём (F19).
+    # Эти тесты про запись вердикта, git им безразличен.
+    monkeypatch.setattr(g, "git_head", lambda: HEAD_SHA)
+    monkeypatch.setattr(g, "diff_sha256", lambda base, head=None: "d" * 64)
     monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
@@ -186,7 +190,7 @@ def _read_verdict():
     return json.loads(files[0].read_text())
 
 
-def test_v1_fresh_allow_writes_verdict(env, tmp_path, monkeypatch):
+def test_v1_fresh_allow_writes_verdict(env, tmp_path, monkeypatch, clean_pair):
     _allow_env(monkeypatch, tmp_path)
     import pathlib
     fix = pathlib.Path(__file__).parent / "fixtures" / "stub_companion_pass.sh"
@@ -198,11 +202,16 @@ def test_v1_fresh_allow_writes_verdict(env, tmp_path, monkeypatch):
     assert v["head_sha"] == g.git_head() and v["run_id"]
 
 
-def test_v2_cached_allow_writes_verdict(env, tmp_path, monkeypatch):
+def test_v2_cached_allow_writes_verdict(env, tmp_path, monkeypatch, clean_pair):
     _allow_env(monkeypatch, tmp_path)
     head, diff = g.git_head(), g.diff_sha256("HEAD~1")
+    # Кэш обязан быть снят ТОЙ ЖЕ панелью: легаси-запись без `reviewers` больше не годится
+    # (B13 — approve другой панели не удовлетворяет обязательную пару).
+    panel, err = g.resolve_portable_review_plan("portable")
+    assert panel is not None, err
     g.write_ledger(head, diff, "HEAD~1",
-                   g.parse_review_output("Verdict: approve\nNo material findings.\n"))
+                   g.parse_review_output("Verdict: approve\nNo material findings.\n"),
+                   reviewers=[g._cert_cache_record(c, "blocking") for c in panel])
     assert g.check_reviewed_cli() == 0
     assert _read_verdict()["gates"]["codex"] == "cached"
 
@@ -249,7 +258,7 @@ def test_v5b_unlink_failure_with_existing_blocks(env, monkeypatch):
     assert rc == 2                                               # старый маскировал бы скипы
 
 
-def test_v7_historical_ladder_skips_visible(env, tmp_path, monkeypatch):
+def test_v7_historical_ladder_skips_visible(env, tmp_path, monkeypatch, clean_pair):
     _allow_env(monkeypatch, tmp_path)
     monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: ["deadbeef"])
     head, diff = g.git_head(), g.diff_sha256("HEAD~1")

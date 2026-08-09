@@ -231,7 +231,7 @@ def test_check_reviewed_blocks_on_critical(tmp_path, monkeypatch):
     assert g.check_reviewed_cli() == 2
 
 
-def test_check_reviewed_passes_and_writes(tmp_path, monkeypatch):
+def test_check_reviewed_passes_and_writes(tmp_path, monkeypatch, clean_pair):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path); _clean(monkeypatch)
     monkeypatch.setenv("CODEX_COMPANION_CMD", " ".join(_stub("stub_companion_pass.sh")))
     assert g.check_reviewed_cli() == 0
@@ -573,7 +573,7 @@ def test_parse_json_malformed_envelope_is_invalid():   # Codex high: malformed �
         assert g.decide_exit(v, fail_closed=True) == 2, bad
 
 
-def test_check_reviewed_records_reviewed_sha(tmp_path, monkeypatch):   # Codex high: bind approved SHA
+def test_check_reviewed_records_reviewed_sha(tmp_path, monkeypatch, clean_pair):   # Codex high: bind approved SHA
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
     monkeypatch.setattr(g, "LAST_REVIEWED", tmp_path / ".last-reviewed-sha")
     monkeypatch.setattr(g, "working_tree_clean", lambda: True)
@@ -777,9 +777,9 @@ def test_merge_dup_of_open_links_and_original_stays_open(led):
 
 def test_merge_dup_of_residual_is_reraise_dispute(led):     # спека R1: DUP ≠ согласие
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "Edge case")])                # F1
+    g.merge_round(L, [("medium", "Edge case")])              # F1
     g.adjudicate(L, "F1", "residual-failsafe", "пере-блок, не пропуск")
-    g.merge_round(L, [("high", "[DUP:F1] again")])
+    g.merge_round(L, [("medium", "[DUP:F1] again")])
     assert L["findings"]["F1"]["status"] == "open"
     assert L["findings"]["F1"]["disputes"] == 1
 
@@ -788,7 +788,7 @@ def test_decision_block_allow_escalate(led):
     L = g.load_findings_ledger("b")
     g.merge_round(L, [("high", "Issue A")])
     assert g.convergence_decision(L)[0] == "block"           # open → блок
-    g.adjudicate(L, "F1", "refuted", "эмпирика: тест X зелёный")
+    g.adjudicate(L, "F1", "fixed", "эмпирика: тест X зелёный")   # §6c: refuted тут запрещён
     assert g.convergence_decision(L)[0] == "allow"           # нет open → сошлись
     g.merge_round(L, [("high", "[DISPUTE:F1] contested")])   # спор по high → человек
     assert g.convergence_decision(L)[0] == "escalate"
@@ -841,8 +841,9 @@ def test_merge_dup_of_fixed_is_reraise(led):     # протокол-догфуд
 
 def test_ledger_archived_on_new_baseline(led):   # протокол-догфуд F2
     L = g.load_findings_ledger("base-A")
-    g.merge_round(L, [("high", "Old series issue")])
+    g.merge_round(L, [("medium", "Old series issue")])
     g.adjudicate(L, "F1", "refuted", "устарело")
+    g.merge_round(L, [])                         # §5b: подтверждённое решение не наследуется
     g.save_findings_ledger(L)
     L2 = g.load_findings_ledger("base-B")        # новая серия → архив старой
     assert L2["findings"] == {} and L2["baseline"] == "base-B"
@@ -888,7 +889,7 @@ def test_accepted_dispute_does_not_deadlock(led):    # принятый спор
 
 def test_adjudication_requires_review_round(led):    # спор F3-2: кэш не минует показ Codex'у
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "Issue")])
+    g.merge_round(L, [("medium", "Issue")])
     g.adjudicate(L, "F1", "refuted", "опровергнуто")
     assert L.get("needs_review_round") is True              # Codex ещё не видел
     g.merge_round(L, [])                                     # реальный раунд показал
@@ -897,7 +898,7 @@ def test_adjudication_requires_review_round(led):    # спор F3-2: кэш н�
 
 def test_dup_reraise_escalates_severity(led):    # спор F1-2: critical-DUP повышает оригинал
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "Issue")])
+    g.merge_round(L, [("medium", "Issue")])
     g.adjudicate(L, "F1", "residual-failsafe", "трение")
     g.merge_round(L, [("critical", "[DUP:F1] actually money loss")])
     assert L["findings"]["F1"]["severity"] == "critical"    # эскалировано
@@ -922,7 +923,7 @@ def test_check_decision_cli(led, monkeypatch, capsys):       # ревалида�
     assert g.main(["check-decision"]) == 2                   # open → устарело → блок
     with g.findings_lock():
         L = g.load_findings_ledger(None)
-        g.adjudicate(L, "F1", "refuted", "проверено")
+        g.adjudicate(L, "F1", "fixed", "проверено")          # §6c: refuted для high запрещён
         g.save_findings_ledger(L)
     assert g.main(["check-decision"]) == 2                   # адъюдикация не показана Codex
     with g.findings_lock():
@@ -933,20 +934,25 @@ def test_check_decision_cli(led, monkeypatch, capsys):       # ревалида�
 
 
 def test_resolved_by_user_not_reopenable(led):   # F3 d=5: финальность человека
+    """Исходная запись остаётся терминальной (нет вечной эскалации), НО блокирующая улика
+    после решения человека открывает ОТДЕЛЬНУЮ находку — §6b, ревью ред. 3."""
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "Race")])
+    g.merge_round(L, [("low", "Nit")])
     g.adjudicate(L, "F1", "resolved-by-user", "юзер решил")
-    g.merge_round(L, [("high", "[DISPUTE:F1] still racy")])
+    g.merge_round(L, [("low", "[DISPUTE:F1] still nitpicking")])
     assert L["findings"]["F1"]["status"] == "resolved-by-user"   # не пере-открыт
-    assert g.convergence_decision(L)[0] == "allow"
-    g.merge_round(L, [("high", "[DUP:F1] again")])               # и DUP не пере-открывает
+    assert g.convergence_decision(L)[0] == "allow"               # мелочь не воскрешает
+    g.merge_round(L, [("low", "[DUP:F1] again")])                # и DUP не пере-открывает
     assert L["findings"]["F1"]["status"] == "resolved-by-user"
+    g.merge_round(L, [("critical", "[DISPUTE:F1] новая улика: деньги")])
+    assert L["findings"]["F1"]["status"] == "resolved-by-user"   # исходная всё ещё терминальна
+    assert g.convergence_decision(L)[0] == "block"               # но блокирующая улика открыта
 
 
 def test_stale_review_does_not_clear_flag(led):  # спор F3-3: ts-guard
     import time
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "Issue")])
+    g.merge_round(L, [("medium", "Issue")])
     t_before_adj = time.time() - 10
     g.adjudicate(L, "F1", "refuted", "проверено")
     g.merge_round(L, [], review_started_ts=t_before_adj)   # старый review (стартовал ДО)
@@ -957,7 +963,7 @@ def test_stale_review_does_not_clear_flag(led):  # спор F3-3: ts-guard
 
 def test_dispute_reraise_escalates_severity(led):    # спор F1-3: симметрия с DUP
     L = g.load_findings_ledger("b")
-    g.merge_round(L, [("high", "Issue")])
+    g.merge_round(L, [("medium", "Issue")])
     g.adjudicate(L, "F1", "refuted", "x")
     g.merge_round(L, [("critical", "[DISPUTE:F1] actually critical")])
     assert L["findings"]["F1"]["severity"] == "critical"
@@ -1010,20 +1016,22 @@ def test_ledger_without_baseline_fail_closed(led):   # спор F7-3
 
 # --- Carry-over (реш. юзера 22.07): пост-hard-cap находки не блокируют срочный деплой ---
 def test_carry_over_new_high_post_hardcap(led):
+    """§5 (ревью ред. 2): раньше новая high после hard-cap уезжала в carried и переставала
+    блокировать — шумом можно было догнать серию до cap и обесценить находку, не снимая её."""
     L = g.load_findings_ledger("b")
     L["rounds"] = 9                                       # за hard-cap
     g.merge_round(L, [("high", "Late nuance")])           # rounds → 10, новая находка
     g.apply_carry_over(L)
-    assert L["findings"]["F1"]["status"] == "carried"
-    assert g.convergence_decision(L)[0] == "allow"        # деплой едет
+    assert L["findings"]["F1"]["status"] == "open"        # high НЕ обесценивается счётчиком
+    assert g.convergence_decision(L)[0] == "escalate"     # open за hard-cap → человек
 
 
 def test_carry_over_skips_critical_and_disputed(led):
     L = g.load_findings_ledger("b")
     L["rounds"] = 9
-    g.merge_round(L, [("critical", "Money loss"), ("high", "Nuance")])
+    g.merge_round(L, [("critical", "Money loss"), ("medium", "Nuance")])
     g.adjudicate(L, "F2", "refuted", "x")
-    g.merge_round(L, [("high", "[DISPUTE:F2] contested")])   # спорная
+    g.merge_round(L, [("medium", "[DISPUTE:F2] contested")])  # спорная
     g.apply_carry_over(L)
     assert L["findings"]["F1"]["status"] == "open"        # critical НЕ переносится
     assert L["findings"]["F2"]["status"] == "open"        # спорная НЕ переносится
