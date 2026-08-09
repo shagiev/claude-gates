@@ -1386,8 +1386,12 @@ def convergence_decision(led: dict) -> "tuple[str, str]":
         if (d >= thr and f.get("status") == "open") or d >= 3:
             return ("escalate",
                     f"[codex-gate] ⚖️ ЭСКАЛАЦИЯ: спор по {k} «{f.get('title', '')[:60]}» "
-                    f"(disputes={d}, severity={f.get('severity')}). Нужно решение человека: "
-                    f"`adjudicate {k} resolved-by-user \"...\"` | fix | аварийный SKIP.")
+                    f"(disputes={d}, severity={f.get('severity')}). Нужно решение человека — "
+                    f"набери в терминале:\n"
+                    f"  bash .githooks/gates-run codex_review_gate.py adjudicate {k} "
+                    f"resolved-by-user --reason-file <путь>\n"
+                    f"  (или ... resolved-by-user \"$(pbpaste)\" — текст из буфера)\n"
+                    f"  Альтернативы: fix | аварийный SKIP.")
     for k, f in opens.items():
         if int(f.get("carry_count") or 0) >= 2:   # анти-гниение: 2 серии подряд → человек
             return ("escalate",
@@ -3597,9 +3601,31 @@ def main(argv: list[str]) -> int:
     if cmd == "adjudicate":                    # adjudicate <Fid> <status> "<причина>"
         if not _require_repo():
             return 2
+        args_a = argv[1:]
+        # `resolved-by-user` требует ИНТЕРАКТИВНОГО терминала, то есть человек набирает
+        # команду руками. Заставлять его перенабирать длинную причину — трение без пользы:
+        # текст всё равно пишет агент, человек подтверждает РЕШЕНИЕ. `--reason-file` даёт
+        # набрать короткую команду, оставив требование терминала на месте.
+        if "--reason-file" in args_a:
+            i = args_a.index("--reason-file")
+            path = args_a[i + 1] if i + 1 < len(args_a) else ""
+            try:
+                reason_text = Path(path).read_text().strip()
+            except OSError as exc:
+                print(f"[codex-gate] не прочитать --reason-file {path!r}: "
+                      f"{type(exc).__name__}", file=sys.stderr)
+                return 1
+            if not reason_text:
+                print("[codex-gate] --reason-file пуст: причина обязательна (аудит)",
+                      file=sys.stderr)
+                return 1
+            args_a = args_a[:i] + args_a[i + 2:] + [reason_text]
+        argv = [cmd, *args_a]
         if len(argv) < 4:
             print("usage: adjudicate <Fid> fixed|residual-failsafe|refuted|resolved-by-user"
-                  "|open \"причина\"", file=sys.stderr)
+                  "|open \"причина\"\n"
+                  "       adjudicate <Fid> <status> --reason-file <путь>   "
+                  "(чтобы не перенабирать длинный текст)", file=sys.stderr)
             return 1
         with findings_lock():
             led = load_findings_ledger(None)

@@ -245,3 +245,32 @@ def test_f11_resolved_by_user_requires_human_terminal(led, monkeypatch):
     monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
     g.adjudicate(L, "F1", "resolved-by-user", "решение человека")
     assert L["findings"]["F1"]["status"] == "resolved-by-user"
+
+
+def test_reason_file_keeps_human_command_short(led, tmp_path, monkeypatch, capsys):
+    """`resolved-by-user` требует терминала — значит человек набирает руками. Перенабор
+    длинной причины был трением без пользы: текст пишет агент, человек подтверждает решение."""
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("critical", "Money leak")])
+    g.save_findings_ledger(L)
+    reason = tmp_path / "why.txt"
+    reason.write_text("Решение владельца: возражение закрыто по существу в abc1234.\n")
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    assert g.main(["adjudicate", "F1", "resolved-by-user", "--reason-file", str(reason)]) == 0
+    saved = g.load_findings_ledger(None)["findings"]["F1"]
+    assert saved["status"] == "resolved-by-user"
+    assert "по существу в abc1234" in saved["reason"]
+
+
+def test_reason_file_missing_or_empty_is_rejected(led, tmp_path, monkeypatch):
+    """Причина обязательна: пустой файл не должен превращаться в пустое обоснование."""
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("critical", "Money leak")])
+    g.save_findings_ledger(L)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    empty = tmp_path / "empty.txt"
+    empty.write_text("   \n")
+    assert g.main(["adjudicate", "F1", "resolved-by-user", "--reason-file", str(empty)]) == 1
+    assert g.main(["adjudicate", "F1", "resolved-by-user",
+                   "--reason-file", str(tmp_path / "nope.txt")]) == 1
+    assert g.load_findings_ledger(None)["findings"]["F1"]["status"] == "open"
