@@ -64,6 +64,8 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     monkeypatch.setattr(g, "_trusted_git", lambda *args, cwd=None: g.subprocess.run(
         ["git", *args], cwd=str(cwd) if cwd else g.REPO_ROOT,
         capture_output=True, text=True))
+    monkeypatch.setattr(g, "_trusted_git_bytes", lambda *args, cwd=None: g.subprocess.run(
+        ["git", *args], cwd=str(cwd) if cwd else g.REPO_ROOT, capture_output=True))
     # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
     # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
     monkeypatch.setenv("REVIEW_PROVIDER", "portable")

@@ -30,19 +30,27 @@ deploy: check-reviewed   # + твои проверки: check-committed test myp
 	trap 'exit 130' INT TERM; \
 	ART=$$(bash .githooks/gates-run codex_review_gate.py verify-deployable) || exit 1; \
 	GATES_ARTIFACT=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT=//p'); \
-	REVIEWED_SHA=$$(cat .claude/.last-reviewed-sha); \
-	if [ -z "$$GATES_ARTIFACT" ]; then \
+	REVIEWED_SHA=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT_HEAD=//p'); \
+	if [ -z "$$GATES_ARTIFACT" ] || [ -z "$$REVIEWED_SHA" ]; then \
 		echo "❌ verify-deployable не выдал артефакт — гарантия не действует, прерываю"; \
 		exit 1; \
 	fi; \
-	if ! bash .githooks/gates-run codex_review_gate.py check-decision; then \
-		echo "❌ решение ревью устарело (конкурентная находка/адъюдикация после allow) — прерываю"; \
+	if ! bash .githooks/gates-run codex_review_gate.py check-decision --head "$$REVIEWED_SHA"; then \
+		echo "❌ решение ревью устарело либо HEAD сдвинулся после сборки артефакта — прерываю"; \
+		exit 1; \
+	fi; \
+	ART_SHA=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT_SHA256=//p'); \
+	if ! bash .githooks/gates-run codex_review_gate.py check-artifact \
+			--artifact "$$GATES_ARTIFACT" --head "$$REVIEWED_SHA" --sha256 "$$ART_SHA"; then \
+		echo "❌ артефакт изменился после сборки — прерываю ДО выкатки"; \
 		exit 1; \
 	fi; \
 	$(MAKE) --no-print-directory deploy-payload GATES_ARTIFACT="$$GATES_ARTIFACT" || exit 1; \
-	$(MAKE) --no-print-directory verify-deployed GATES_ARTIFACT="$$GATES_ARTIFACT" || exit 1; \
-	printf '%s\n' "$$REVIEWED_SHA" > .claude/.last-deployed-sha; \
-	echo "✅ выкачен и проверен артефакт $$REVIEWED_SHA; baseline ревью обновлён"
+	$(MAKE) --no-print-directory verify-deployed GATES_ARTIFACT="$$GATES_ARTIFACT" \
+		GATES_HEAD="$$REVIEWED_SHA" GATES_ARTIFACT_SHA256="$$ART_SHA" || exit 1; \
+	bash .githooks/gates-run codex_review_gate.py finalize-deploy \
+		--artifact "$$GATES_ARTIFACT" --head "$$REVIEWED_SHA" --sha256 "$$ART_SHA" || exit 1; \
+	echo "✅ выкачен и проверен артефакт $$REVIEWED_SHA"
 
 # ── ОБЯЗАТЕЛЬНО переопредели оба таргета в своём Makefile ──────────────────────
 # Скелет НЕ выкатывает: пока они не заменены, `make deploy` ПАДАЕТ. Иначе цель
@@ -56,9 +64,12 @@ deploy-payload:
 	echo "   	rsync -a --delete build/payload/ host:/srv/app/"; \
 	exit 1
 
+# $(GATES_HEAD) и $(GATES_ARTIFACT_SHA256) передаются сюда, чтобы healthcheck проверял
+# КОНКРЕТНУЮ версию на каждом хосте, а не «сервис вообще жив». Гейт правдивость этой проверки
+# не доказывает (остаток R-ACTUATOR-HANDOFF) — но baseline он двигает по СВОЕМУ evidence.
 verify-deployed:
-	@echo "❌ verify-deployed не переопределён: baseline нельзя двигать, не проверив, что"; \
-	echo "   выкаченное реально работает (healthcheck/версия на КАЖДОМ хосте)."; \
+	@echo "❌ verify-deployed не переопределён: выкатку нельзя считать состоявшейся, не"; \
+	echo "   проверив версию $$(GATES_HEAD) на КАЖДОМ хосте (healthcheck)."; \
 	exit 1
 
 # Протокол сходимости (Фаза 1.6) — адъюдикация находок между раундами:

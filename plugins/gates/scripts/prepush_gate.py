@@ -61,7 +61,23 @@ def _prepush_fetch(root: "Path", remote: str, branch: str, timeout: int):
     pairs = list(zip(_GIT_NEUTRALIZE[::2], _GIT_NEUTRALIZE[1::2]))
     neutralize = tuple(x for flag, val in pairs if val != "protocol.allow=never"
                        for x in (flag, val))
-    return subprocess.run([git, *neutralize, "fetch", "--quiet", "--end-of-options",
+    # Проверки URL НЕДОСТАТОЧНО: git исполняет `remote.<name>.uploadpack` как КОМАНДУ на
+    # локальном транспорте, а `remote.<name>.vcs` и `core.gitProxy` дают то же самое другими
+    # путями. Воспроизведено ревью 09.08.2026 на системном git: `remote.probe.uploadpack`
+    # исполнилась при обычном pre-push fetch правами хука. Гасим все три и жёстко закрепляем
+    # upload-pack: неотразимая часть — именно КОМАНДА, а не адрес.
+    # `--upload-pack` из командной строки перебивает `remote.<name>.uploadpack` (замерено
+    # 09.08.2026), поэтому дублировать его через `-c` не нужно — иначе git ругается на два
+    # значения. А вот `remote.<name>.vcs` гасить ПУСТЫМ значением нельзя: git тогда ищет
+    # helper `git-remote-` и fetch ломается. Поэтому vcs — ОТКЛОНЯЕМ, как filter-драйверы.
+    vcs = _prepush_git("config", "--get", f"remote.{remote}.vcs", cwd=root)
+    if vcs.returncode == 0 and vcs.stdout.strip():
+        raise TrustedGitError(
+            f"remote {remote!r} задаёт vcs={vcs.stdout.strip()!r} — git исполнит внешний "
+            "transport-helper; сетевая операция отклонена")
+    exec_conf = ("-c", "core.gitProxy=")
+    return subprocess.run([git, *neutralize, *exec_conf, "fetch", "--quiet",
+                           "--upload-pack", "git-upload-pack", "--end-of-options",
                            remote, branch],
                           cwd=root, capture_output=True, text=True, timeout=timeout, env=env)
 
@@ -434,7 +450,7 @@ def _git_common_dir(root: Path) -> Path:
 
 
 @contextlib.contextmanager
-def hookless_env():
+def hookless_env(root: "Path | None" = None):
     """Хуки в пробе НЕ изолированы сами по себе: `core.hooksPath` наследуется из общего конфига
     (измерено). Без этого вложенный `git commit` в тест-команде запустил бы наши pre/post-commit
     против дерева-пробы и записал бы ledger для висячего SHA (И6).
@@ -442,26 +458,49 @@ def hookless_env():
     Указываем на РЕАЛЬНО пустой каталог, а не на «магически несуществующий» путь: так
     «хуков здесь нет» — факт, а не допущение о названии (ревью 2026-07-26)."""
     with tempfile.TemporaryDirectory(prefix="gates-probe-hooks-") as empty:
+        # ⛔ Унаследованные GIT_CONFIG_* НЕ переносятся. Раньше они дополнялись, и это давало
+        # ровно ту дыру, ради которой probe и обвешан проверками: `GIT_CONFIG_COUNT=1` +
+        # `filter.evil.smudge` вызывающего доезжали до `worktree add`, тогда как перечисление
+        # драйверов идёт через `_trusted_git`, который их снимает. Проверка видела пустоту, а
+        # checkout исполнял команду (воспроизведено ревью 09.08.2026). Конфигурация checkout
+        # обязана состоять ТОЛЬКО из наших записей — иначе проверять нечего.
         env = dict(os.environ)
-        # Унаследованные GIT_CONFIG_* НЕ затираем, а дополняем: `GIT_CONFIG_COUNT=1` поверх
-        # чужих записей терял, например, внедрённый safe.directory. И снимаем
-        # GIT_CONFIG_PARAMETERS — иначе `-c core.hooksPath=...` родителя пересиливает нас,
-        # и хуки в пробе всё-таки срабатывают (ревью 2026-07-26, нарушение И6).
         env.pop("GIT_CONFIG_PARAMETERS", None)
-        try:
-            n = int(env.get("GIT_CONFIG_COUNT", "0"))
-        except ValueError:
-            n = 0
-        env[f"GIT_CONFIG_KEY_{n}"] = "core.hooksPath"
-        env[f"GIT_CONFIG_VALUE_{n}"] = empty
-        env["GIT_CONFIG_COUNT"] = str(n + 1)
+        for k in [k for k in env if k.startswith("GIT_CONFIG_")]:
+            env.pop(k, None)
+        env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
+        env["GIT_CONFIG_VALUE_0"] = empty
+        n = 1
+        if root is not None:
+            # `safe.directory` раньше приезжал из окружения вызывающего вместе со всем
+            # остальным. Он нужен по делу (иначе git откажется работать с каталогом), поэтому
+            # выставляется НАМИ и только для того корня, который мы же и проверяем.
+            env[f"GIT_CONFIG_KEY_{n}"] = "safe.directory"
+            env[f"GIT_CONFIG_VALUE_{n}"] = str(root)
+            n += 1
+        env["GIT_CONFIG_COUNT"] = str(n)
         yield env
 
 
-#: На время checkout фильтры отключаются: `filter.<drv>.process` и `.smudge` исполняют
-#: команды, выбранные атрибутами ревьюируемого репозитория.
-_PROBE_NEUTRALIZE = ("-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
-                     "-c", "filter.lfs.required=false")
+#: `worktree add` делает checkout и исполняет smudge/process-фильтры, ВЫБРАННЫЕ атрибутами
+#: ревьюируемого репозитория. Гасить их поимённо нельзя: драйвер может называться как угодно,
+#: а имя приходит из `.gitattributes` проверяемой стороны. Поэтому перед checkout мы
+#: ПЕРЕЧИСЛЯЕМ активные драйверы из конфига и падаем, если хоть один задан.
+def _active_filter_drivers(root: Path) -> list[str]:
+    """Только `smudge`/`process`: ИМЕННО их исполняет checkout. `clean`-конфигурации
+    checkout не запускает, и блокировать по ним — отказ в функции без выигрыша в
+    безопасности (находка ревью 09.08.2026, G26)."""
+    r = _prepush_git("config", "--get-regexp", r"^filter\..*\.(process|smudge)$",
+                     cwd=root)
+    if r.returncode not in (0, 1):        # 1 = совпадений нет, это норма
+        raise TrustedGitError("не перечислить filter-драйверы — probe небезопасен")
+    names = []
+    for line in r.stdout.splitlines():
+        key = line.split(None, 1)[0] if line.strip() else ""
+        parts = key.split(".")
+        if len(parts) >= 3:
+            names.append(".".join(parts[1:-1]))
+    return sorted(set(names))
 
 
 def _probe_git(root: Path, env: dict, *args: str):
@@ -478,7 +517,7 @@ def _probe_git(root: Path, env: dict, *args: str):
     for k, v in env.items():
         if k.startswith("GIT_CONFIG_"):
             base_env[k] = v
-    return subprocess.run([git, *_GIT_NEUTRALIZE, *_PROBE_NEUTRALIZE, *args], cwd=root,
+    return subprocess.run([git, *_GIT_NEUTRALIZE, *args], cwd=root,
                           capture_output=True, text=True, env=base_env)
 
 
@@ -491,7 +530,27 @@ def probe_worktree(root: Path, base: str, sha: str, tree: str):
     # исполнялся бы до интеграционных тестов. Плюс раньше сюда уезжало полное окружение
     # вызывающего (PATH/loader). Оба закрыты: доверенный бинарь, аллоулист, нейтрализация,
     # и фильтры отключены явно на время checkout.
-    with hookless_env() as env:
+    with hookless_env(root) as env:
+        # Фильтры — не единственный путь исполнения при checkout: `worktree add` запускает
+        # хук post-checkout, а partial clone тянет недостающие объекты через promisor-remote
+        # с ВНЕШНИМ transport-helper'ом. Хуки гасит core.hooksPath=/dev/null в _GIT_NEUTRALIZE;
+        # promisor гасить нечем — на нём падаем закрыто (G27).
+        partial = _prepush_git("config", "--get-regexp",
+                               r"^(extensions\.partialclone|remote\..*\.promisor)$", cwd=root)
+        if partial.returncode not in (0, 1):
+            raise TrustedGitError("не проверить partial-clone конфигурацию — probe небезопасен")
+        if partial.returncode == 0 and partial.stdout.strip():
+            raise RuntimeError(
+                "репозиторий — partial clone (promisor): checkout probe дотянул бы недостающие "
+                "объекты внешним transport-helper'ом правами гейта. Интеграционная проверка "
+                "остановлена.")
+        drivers = _active_filter_drivers(root)
+        if drivers:
+            raise RuntimeError(
+                "в репозитории заданы исполняемые при checkout filter-драйверы ("
+                + ", ".join(drivers) + "): checkout "
+                "probe исполнил бы их команды правами гейта. Интеграционная проверка "
+                "остановлена — уберите драйверы или отключите integration-гейт осознанно.")
         _probe_git(root, env, "worktree", "prune")
         ct = _probe_git(root, env, "commit-tree", tree, "-p", base, "-p", sha,
                         "-m", "integration probe")

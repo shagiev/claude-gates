@@ -27,13 +27,15 @@ except ImportError:            # PyYAML может отсутствовать в
 try:
     from codex_review_gate import (is_code_path, _trusted_git, TrustedGitError,
                                    _trusted_git_bin, _trusted_home, _GIT_ENV_ALLOW,
-                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS)
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
+                                   _bootstrap_git, _has_git_marker)
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
                                    TrustedGitError, _trusted_git_bin, _trusted_home,
                                    _GIT_ENV_ALLOW, _GIT_SAFE_ENV, _GIT_NEUTRALIZE,
-                                   _TRUSTED_PATH_DIRS)
+                                   _TRUSTED_PATH_DIRS, _bootstrap_git,
+                                   _has_git_marker)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -77,13 +79,25 @@ def _repo_root() -> Path:
     """Корень репозитория, а НЕ cwd. `begin`/`mark`, запущенные из подкаталога, писали
     бухгалтерию в <subdir>/.claude/, а git запускает pre-commit из корня и там её не находил:
     коммит блокировался «цепочка не подтверждена», хотя все проходы были выполнены и отмечены,
-    и оператор шёл за LADDER_SKIP. Вне git-репо поведение прежнее (cwd)."""
-    try:
-        out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, check=True).stdout.strip()
-    except (subprocess.CalledProcessError, OSError):
-        return Path.cwd()
-    return Path(out) if out else Path.cwd()
+    и оператор шёл за LADDER_SKIP. Вне git-репо поведение прежнее (cwd).
+
+    Корень ищется доверенным bootstrap-git и обязан СОДЕРЖАТЬ cwd: голый `git rev-parse`
+    подменяется PATH-шимом на второй, чистый репозиторий, после чего все доверенные операции
+    добросовестно изучают ЧУЖОЙ корень, не находят staged-кода и выдают non-code освобождение
+    без аудита (находка ревью 09.08.2026). Если маркер `.git` рядом есть, а корень не
+    разрешился — падаем, а не откатываемся на cwd."""
+    cwd = Path.cwd().resolve()
+    r = _bootstrap_git("rev-parse", "--show-toplevel", cwd=cwd)
+    if r is None or r.returncode != 0 or not r.stdout.strip():
+        if _has_git_marker(cwd):
+            raise TrustedGitError("маркер .git есть, но корень репозитория не разрешился — "
+                                  "решения лесенки принимать не на чем")
+        return cwd
+    root = Path(r.stdout.strip()).resolve()
+    if root != cwd and root not in cwd.parents:
+        raise TrustedGitError(f"git выдал корень {root}, не содержащий текущий каталог {cwd} — "
+                              "похоже на подмену git; решения лесенки не принимаются")
+    return root
 
 # Правило одно на все проходы, поэтому печатается один раз, а не копией в каждой строке.
 _RUNNER_RULE = (
@@ -535,8 +549,14 @@ def _effective_epoch(root: Path) -> "str | None":
 
 
 def _is_ancestor(root: Path, sha: str, ancestor_of: str) -> bool:
-    r = subprocess.run(["git", "merge-base", "--is-ancestor", sha, ancestor_of],
-                       cwd=root, capture_output=True)
+    """Через доверенный слой и fail-closed. Голый `git` тут был прямым fail-open: при любом
+    заданном `ladder.epoch_sha` PATH-шим с exit 0 объявлял ЛЮБОЙ коммит древним, и все
+    непокрытые лесенкой коммиты молча получали освобождение (находка ревью 09.08.2026)."""
+    # Не через _git_out: exit 1 здесь — легитимный ответ «не предок», а не сбой.
+    r = _trusted_git("merge-base", "--is-ancestor", sha, ancestor_of, cwd=root)
+    if r is None or r.returncode not in (0, 1):
+        raise TrustedGitError("доверенный git недоступен — эпоху не проверить, освобождение "
+                              "не выдаётся")
     return r.returncode == 0
 
 
