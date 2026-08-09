@@ -357,12 +357,36 @@ def test_certification_corpus_requires_policy_id(tmp_path, monkeypatch):
         cr.load_corpus()
 
 
+def _fake_git(cmd):
+    """Вход ревьюеров строится из СЫРЫХ blob'ов (ls-tree + cat-file), а не `git diff`:
+    `.gitattributes` с `-diff` иначе опустошал бы дифф для обоих обязательных ревьюеров.
+    Тесты адаптеров подменяют subprocess.run целиком, поэтому им нужен байтовый фейк."""
+    if not cmd or "git" not in str(cmd[0]):
+        return None
+    if "rev-parse" in cmd and str(cmd[-1]).endswith("^{tree}"):
+        oid = ("t" if str(cmd[-1]).startswith("HEAD~") else "u") * 40
+        return SimpleNamespace(returncode=0, stdout=oid + "\n", stderr="")
+    if "rev-parse" in cmd and str(cmd[-1]).endswith("^{commit}"):
+        oid = ("c" if str(cmd[-1]).startswith("HEAD~") else "d") * 40
+        return SimpleNamespace(returncode=0, stdout=oid + "\n", stderr="")
+    if "ls-tree" in cmd:
+        oid = ("b" if str(cmd[-1]).startswith("d") else "a") * 40
+        return SimpleNamespace(returncode=0, stdout=f"100644 blob {oid}\tm.py\0".encode(),
+                               stderr=b"")
+    if "cat-file" in cmd:
+        return SimpleNamespace(returncode=0,
+                               stdout=b"new\n" if cmd[-1].startswith("b") else b"old\n",
+                               stderr=b"")
+    return None
+
+
 def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
 
     def fake_run(cmd, **_kwargs):
-        if len(cmd) > 1 and cmd[1] == "diff":      # git резолвится абсолютным путём (F19)
-            return SimpleNamespace(returncode=0, stdout="diff", stderr="")
+        fake = _fake_git(cmd)                      # git резолвится абсолютным путём (F19)
+        if fake is not None:
+            return fake
         assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "opus"
         # F15: инструментов нет — дифф целиком в промпте, а HOME несёт креды
         assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
@@ -397,7 +421,10 @@ def test_claude_failure_diagnostic_is_redacted(monkeypatch):
 
     def fake_run(cmd, **_kwargs):
         # git закреплён абсолютным путём (F19), поэтому опознаём по подкоманде
-        if len(cmd) > 1 and cmd[1] == "diff":
+        fake = _fake_git(cmd)
+        if fake is not None:
+            return fake
+        if False:
             return SimpleNamespace(returncode=0, stdout="diff", stderr="")
         return SimpleNamespace(returncode=1, stdout="", stderr=f"token={secret}")
 
@@ -413,8 +440,9 @@ def test_claude_actual_model_mismatch_blocks(monkeypatch):
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
 
     def fake_run(cmd, **_kwargs):
-        if cmd[:2] == ["git", "diff"]:
-            return SimpleNamespace(returncode=0, stdout="diff", stderr="")
+        fake = _fake_git(cmd)
+        if fake is not None:
+            return fake
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps({
@@ -652,7 +680,7 @@ def test_default_portable_enters_real_dispatch_and_both_adapters(
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
                 "is_error": False, "result": _CLEAN,
                 "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
-        return SimpleNamespace(returncode=0, stdout="diff", stderr="")
+        return _fake_git(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(g, "_exec_companion", fake_companion)
     monkeypatch.setattr(g.subprocess, "run", fake_run)
@@ -707,7 +735,7 @@ def test_claude_model_mismatch_redacts_secret_in_model_key(monkeypatch, tmp_path
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
     secret = "sk-ant-LEAKEDSECRET0123456789ABCDEF"
-    monkeypatch.setattr(g.subprocess, "run", lambda cmd, **kw: SimpleNamespace(
+    monkeypatch.setattr(g.subprocess, "run", lambda cmd, **kw: _fake_git(cmd) or SimpleNamespace(
         returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN, "modelUsage": {secret: {"inputTokens": 1}}})))
     cert = _cert("claude", "opus", "blocking")
@@ -1081,13 +1109,16 @@ def test_f19_git_env_overrides_cannot_forge_reviewer_input(monkeypatch):
     def fake_run(cmd, **kwargs):
         seen["argv"] = list(cmd)
         seen["env"] = kwargs.get("env") or {}
-        return SimpleNamespace(returncode=0, stdout="real diff", stderr="")
+        fake = _fake_git(cmd)
+        if fake is None:
+            pytest.fail(f"неожиданный вызов: {cmd}")
+        return fake
 
-    monkeypatch.setattr(g, "_trusted_git", _REAL_TRUSTED_GIT)   # нужен НАСТОЯЩИЙ хардненинг
+    monkeypatch.setattr(g, "_trusted_git", _REAL_TRUSTED_GIT)                # НАСТОЯЩИЙ слой
+    monkeypatch.setattr(g, "_trusted_git_bytes", g._REAL_TRUSTED_GIT_BYTES)  # НАСТОЯЩИЙ слой
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     text, err = g._diff_text("HEAD~1", "HEAD")
-    assert text == "real diff" and not err
-    assert "--no-ext-diff" in seen["argv"] and "--no-textconv" in seen["argv"]
+    assert not err and "-old" in text and "+new" in text, text
     assert not any(k.startswith("GIT_") and k not in g._GIT_SAFE_ENV for k in seen["env"]), \
         "GIT_*-оверрайды вызывающего доехали до git"
     assert seen["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
@@ -1106,3 +1137,37 @@ def test_f19_head_resolution_uses_trusted_git(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     assert g.git_head() == "deadbeef"
     assert calls and calls[0][0] != "git", "HEAD резолвится голым git из PATH вызывающего"
+
+
+@pytest.mark.parametrize("bad", [None, "nonzero"])
+@pytest.mark.parametrize("fn", ["git_head", "diff_sha256", "working_tree_clean"])
+def test_f22_no_fallback_to_untrusted_git(monkeypatch, fn, bad):
+    """Ветки fail-closed F22 обязаны входиться тестом: восстановленный фолбэк на голый git
+    должен ЛОМАТЬ этот тест, иначе дыра вернётся незамеченной."""
+    def fake_trusted(*_a, **_kw):
+        if bad is None:
+            return None
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(g, "_trusted_git", fake_trusted)
+    monkeypatch.setattr(g, "_trusted_git_bytes", fake_trusted)
+    monkeypatch.setattr(g.subprocess, "run",
+                        lambda *a, **k: pytest.fail("фолбэк на недоверенный git недопустим"))
+    with pytest.raises(g.TrustedGitError):
+        if fn == "git_head":
+            g.git_head()
+        elif fn == "diff_sha256":
+            g.diff_sha256("HEAD~1", "HEAD")
+        else:
+            g.working_tree_clean()
+
+
+def test_repo_root_discovery_rejects_root_not_containing_cwd(monkeypatch, tmp_path):
+    """Шим возвращал ЧУЖОЙ чистый корень, и весь закреплённый git работал не с тем деревом."""
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    start = tmp_path / "work"
+    start.mkdir()
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=str(other) + "\n", stderr=""))
+    assert g._detect_repo_root(start) is None, "корень, не содержащий cwd, обязан отвергаться"

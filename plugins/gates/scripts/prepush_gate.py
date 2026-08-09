@@ -22,13 +22,89 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+#: Транспорты, запрещённые для сетевой операции. `ext::` исполняет ПРОИЗВОЛЬНУЮ команду —
+#: это RCE, а не выбор источника. Значение, начинающееся с `-`, инжектит опцию в argv.
+#: Локальные пути и `file://` НЕ запрещаем: они не исполняют код, а «remote указывает на
+#: подконтрольный локальный репозиторий» — та же граница, что R-ARTIFACT-PROVENANCE
+#: (владелец машины), и запрет ломал бы легитимные локальные bare-репозитории.
+_FORBIDDEN_REMOTE_PREFIXES = ("ext::", "-")
+
+
+def _fetch_remote_allowed(url: str) -> bool:
+    low = (url or "").strip().lower()
+    return bool(low) and not low.startswith(_FORBIDDEN_REMOTE_PREFIXES)
+
+
+def _prepush_fetch(root: "Path", remote: str, branch: str, timeout: int):
+    """Сетевая операция — ОТДЕЛЬНЫЙ адаптер: `protocol.*.allow=never` несовместим с fetch по
+    построению, поэтому транспорт разрешается явно и URL валидируется. Всё остальное
+    (абсолютный бинарь, аллоулист окружения, нейтрализация исполняемых конфигов) — как в слое."""
+    git = _trusted_git_bin()
+    if git is None:
+        raise TrustedGitError("доверенный git недоступен — fetch не выполнить безопасно")
+    url = _prepush_git("remote", "get-url", remote, cwd=root)
+    if url.returncode != 0:
+        # remote неизвестен/не читается — это ДОСТУПНОСТЬ, а не безопасность: пусть решает
+        # существующая политика on_fetch_failure (по умолчанию блок, скип аудируется).
+        return subprocess.CompletedProcess([], 128, "", f"remote {remote!r} не читается")
+    if not _fetch_remote_allowed(url.stdout.strip()):
+        # А это уже безопасность: `ext::` исполняет произвольную команду.
+        raise TrustedGitError(
+            f"remote {remote!r} использует запрещённый транспорт (`ext::` исполняет "
+            "произвольную команду) — сетевая операция отклонена")
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    env["HOME"] = str(_trusted_home())
+    env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    env.update({k: v for k, v in _GIT_SAFE_ENV.items()})
+    # убираем ПАРУ `-c protocol.allow=never` целиком: одиночный висячий `-c` съедал
+    # следующий аргумент как значение конфига, и `fetch` переставал быть подкомандой
+    pairs = list(zip(_GIT_NEUTRALIZE[::2], _GIT_NEUTRALIZE[1::2]))
+    neutralize = tuple(x for flag, val in pairs if val != "protocol.allow=never"
+                       for x in (flag, val))
+    # Проверки URL НЕДОСТАТОЧНО: git исполняет `remote.<name>.uploadpack` как КОМАНДУ на
+    # локальном транспорте, а `remote.<name>.vcs` и `core.gitProxy` дают то же самое другими
+    # путями. Воспроизведено ревью 09.08.2026 на системном git: `remote.probe.uploadpack`
+    # исполнилась при обычном pre-push fetch правами хука. Гасим все три и жёстко закрепляем
+    # upload-pack: неотразимая часть — именно КОМАНДА, а не адрес.
+    # `--upload-pack` из командной строки перебивает `remote.<name>.uploadpack` (замерено
+    # 09.08.2026), поэтому дублировать его через `-c` не нужно — иначе git ругается на два
+    # значения. А вот `remote.<name>.vcs` гасить ПУСТЫМ значением нельзя: git тогда ищет
+    # helper `git-remote-` и fetch ломается. Поэтому vcs — ОТКЛОНЯЕМ, как filter-драйверы.
+    vcs = _prepush_git("config", "--get", f"remote.{remote}.vcs", cwd=root)
+    if vcs.returncode == 0 and vcs.stdout.strip():
+        raise TrustedGitError(
+            f"remote {remote!r} задаёт vcs={vcs.stdout.strip()!r} — git исполнит внешний "
+            "transport-helper; сетевая операция отклонена")
+    exec_conf = ("-c", "core.gitProxy=")
+    return subprocess.run([git, *neutralize, *exec_conf, "fetch", "--quiet",
+                           "--upload-pack", "git-upload-pack", "--end-of-options",
+                           remote, branch],
+                          cwd=root, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def _prepush_git(*args: str, cwd: "Path | None" = None):
+    """Локальные чтения pre-push — через доверенный слой. Голый git позволял шиму отдать
+    `rev-list --count` = "0" и пропустить интеграционные проверки без аудита."""
+    r = _trusted_git(*args, cwd=cwd)
+    if r is None:
+        raise TrustedGitError("доверенный git недоступен — pre-push не может принять решение")
+    return r
+
+
+
 try:
     from codex_review_gate import (GATE_CONFIG_NAME, _config_section_at_ref,
+                                   _trusted_git, _trusted_git_bin, _GIT_ENV_ALLOW,
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
+                                   _trusted_home, TrustedGitError,
                                    _deploy_section_hash, _run_empirical, redact_secrets)
     from ladder_gate import _audit_line
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (GATE_CONFIG_NAME, _config_section_at_ref,  # type: ignore
+                                   _trusted_git, _trusted_git_bin, _GIT_ENV_ALLOW,
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
+                                   _trusted_home, TrustedGitError,
                                    _deploy_section_hash, _run_empirical, redact_secrets)
     from ladder_gate import _audit_line                                       # type: ignore
 
@@ -150,8 +226,8 @@ def default_base_ref(root: "Path | None" = None) -> str:
     git о фактической основной ветке remote'а, и только если он не знает — падаем на литерал."""
     if root is None:
         return _DEFAULT_BASE_REF
-    r = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                       cwd=root, capture_output=True, text=True)
+    r = _prepush_git("symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+                       cwd=root)
     ref = r.stdout.strip()
     return ref if r.returncode == 0 and "/" in ref else _DEFAULT_BASE_REF
 
@@ -241,21 +317,20 @@ def _resolve_remote_name(root: Path, remote: str) -> "str | None":
     """argv[0] у pre-push — имя remote ЛИБО URL (`git push https://… feature`). Для URL
     пространство `refs/remotes/<remote>/…` не существует, и детектор пересоздания молча
     не срабатывал (ревью 2026-07-26). Возвращает имя настроенного remote либо None."""
-    names = subprocess.run(["git", "remote"], cwd=root, capture_output=True, text=True)
+    names = _prepush_git("remote", cwd=root)
     configured = [n for n in names.stdout.split() if n]
     if remote in configured:
         return remote
     for name in configured:
-        url = subprocess.run(["git", "remote", "get-url", name], cwd=root,
-                             capture_output=True, text=True).stdout.strip()
+        url = _prepush_git("remote", "get-url", name, cwd=root).stdout.strip()
         if url and url == remote:
             return name
     return None
 
 
 def _tracking_ref_exists(root: Path, remote: str, branch: str) -> bool:
-    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "--end-of-options",
-                        f"refs/remotes/{remote}/{branch}"], cwd=root, capture_output=True)
+    r = _prepush_git("rev-parse", "--verify", "--quiet", "--end-of-options",
+                        f"refs/remotes/{remote}/{branch}", cwd=root)
     return r.returncode == 0
 
 
@@ -331,8 +406,8 @@ def self_weaken_verdict(root: Path, remote_sha: str, remote: str, branch: str,
 def predict_merge(root: Path, base: str, sha: str) -> MergeResult:
     """`merge-tree --write-tree` — предсказание БЕЗ касания рабочего дерева.
     «Неизвестно» ≠ «чисто» (И3)."""
-    r = subprocess.run(["git", "merge-tree", "--write-tree", "--end-of-options", base, sha],
-                       cwd=root, capture_output=True, text=True)
+    r = _prepush_git("merge-tree", "--write-tree", "--end-of-options", base, sha,
+                       cwd=root)
     if r.returncode == 0:
         first = r.stdout.strip().splitlines()
         oid = first[0].strip() if first else ""
@@ -367,8 +442,7 @@ def _git_common_dir(root: Path) -> Path:
     """`.git` — НЕ всегда каталог: в связанном worktree и в submodule это файл, поэтому путь
     пробы нельзя строить как `root/.git/...` (ревью 2026-07-26: `worktree add` там падает,
     оператор получает блок с непонятным сообщением)."""
-    r = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=root,
-                       capture_output=True, text=True)
+    r = _prepush_git("rev-parse", "--git-common-dir", cwd=root)
     if r.returncode != 0 or not r.stdout.strip():
         return root / ".git"
     p = Path(r.stdout.strip())
@@ -376,7 +450,7 @@ def _git_common_dir(root: Path) -> Path:
 
 
 @contextlib.contextmanager
-def hookless_env():
+def hookless_env(root: "Path | None" = None):
     """Хуки в пробе НЕ изолированы сами по себе: `core.hooksPath` наследуется из общего конфига
     (измерено). Без этого вложенный `git commit` в тест-команде запустил бы наши pre/post-commit
     против дерева-пробы и записал бы ledger для висячего SHA (И6).
@@ -384,52 +458,121 @@ def hookless_env():
     Указываем на РЕАЛЬНО пустой каталог, а не на «магически несуществующий» путь: так
     «хуков здесь нет» — факт, а не допущение о названии (ревью 2026-07-26)."""
     with tempfile.TemporaryDirectory(prefix="gates-probe-hooks-") as empty:
+        # ⛔ Унаследованные GIT_CONFIG_* НЕ переносятся. Раньше они дополнялись, и это давало
+        # ровно ту дыру, ради которой probe и обвешан проверками: `GIT_CONFIG_COUNT=1` +
+        # `filter.evil.smudge` вызывающего доезжали до `worktree add`, тогда как перечисление
+        # драйверов идёт через `_trusted_git`, который их снимает. Проверка видела пустоту, а
+        # checkout исполнял команду (воспроизведено ревью 09.08.2026). Конфигурация checkout
+        # обязана состоять ТОЛЬКО из наших записей — иначе проверять нечего.
         env = dict(os.environ)
-        # Унаследованные GIT_CONFIG_* НЕ затираем, а дополняем: `GIT_CONFIG_COUNT=1` поверх
-        # чужих записей терял, например, внедрённый safe.directory. И снимаем
-        # GIT_CONFIG_PARAMETERS — иначе `-c core.hooksPath=...` родителя пересиливает нас,
-        # и хуки в пробе всё-таки срабатывают (ревью 2026-07-26, нарушение И6).
         env.pop("GIT_CONFIG_PARAMETERS", None)
-        try:
-            n = int(env.get("GIT_CONFIG_COUNT", "0"))
-        except ValueError:
-            n = 0
-        env[f"GIT_CONFIG_KEY_{n}"] = "core.hooksPath"
-        env[f"GIT_CONFIG_VALUE_{n}"] = empty
-        env["GIT_CONFIG_COUNT"] = str(n + 1)
+        for k in [k for k in env if k.startswith("GIT_CONFIG_")]:
+            env.pop(k, None)
+        env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
+        env["GIT_CONFIG_VALUE_0"] = empty
+        n = 1
+        if root is not None:
+            # `safe.directory` раньше приезжал из окружения вызывающего вместе со всем
+            # остальным. Он нужен по делу (иначе git откажется работать с каталогом), поэтому
+            # выставляется НАМИ и только для того корня, который мы же и проверяем.
+            env[f"GIT_CONFIG_KEY_{n}"] = "safe.directory"
+            env[f"GIT_CONFIG_VALUE_{n}"] = str(root)
+            n += 1
+        env["GIT_CONFIG_COUNT"] = str(n)
         yield env
+
+
+#: `worktree add` делает checkout и исполняет smudge/process-фильтры, ВЫБРАННЫЕ атрибутами
+#: ревьюируемого репозитория. Гасить их поимённо нельзя: драйвер может называться как угодно,
+#: а имя приходит из `.gitattributes` проверяемой стороны. Поэтому перед checkout мы
+#: ПЕРЕЧИСЛЯЕМ активные драйверы из конфига и падаем, если хоть один задан.
+def _active_filter_drivers(root: Path) -> list[str]:
+    """Только `smudge`/`process`: ИМЕННО их исполняет checkout. `clean`-конфигурации
+    checkout не запускает, и блокировать по ним — отказ в функции без выигрыша в
+    безопасности (находка ревью 09.08.2026, G26)."""
+    r = _prepush_git("config", "--get-regexp", r"^filter\..*\.(process|smudge)$",
+                     cwd=root)
+    if r.returncode not in (0, 1):        # 1 = совпадений нет, это норма
+        raise TrustedGitError("не перечислить filter-драйверы — probe небезопасен")
+    names = []
+    for line in r.stdout.splitlines():
+        key = line.split(None, 1)[0] if line.strip() else ""
+        parts = key.split(".")
+        if len(parts) >= 3:
+            names.append(".".join(parts[1:-1]))
+    return sorted(set(names))
+
+
+def _probe_git(root: Path, env: dict, *args: str):
+    """Мутирующие операции probe — абсолютный бинарь, аллоулист окружения, нейтрализация.
+    Отдельно от `_trusted_git`, потому что нуждается в GIT_CONFIG_* из hookless_env."""
+    git = _trusted_git_bin()
+    if git is None:
+        raise TrustedGitError("доверенный git недоступен — probe не построить")
+    base_env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    base_env["HOME"] = str(_trusted_home())
+    base_env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    base_env.update(_GIT_SAFE_ENV)
+    # GIT_CONFIG_* из hookless_env — это НАШИ значения (пустой hooksPath), не вызывающего
+    for k, v in env.items():
+        if k.startswith("GIT_CONFIG_"):
+            base_env[k] = v
+    return subprocess.run([git, *_GIT_NEUTRALIZE, *args], cwd=root,
+                          capture_output=True, text=True, env=base_env)
 
 
 @contextlib.contextmanager
 def probe_worktree(root: Path, base: str, sha: str, tree: str):
     """Материализует смерженное дерево в отдельный worktree. Рабочее дерево пользователя
     не трогается (И1). Уборка best-effort + prune на старте (И7: SIGKILL `finally` не выполнит)."""
-    with hookless_env() as env:
-        subprocess.run(["git", "worktree", "prune"], cwd=root, capture_output=True, env=env)
-        ct = subprocess.run(["git", "commit-tree", tree, "-p", base, "-p", sha,
-                             "-m", "integration probe"], cwd=root, capture_output=True,
-                            text=True, env=env)
+    # `worktree add` делает CHECKOUT, то есть запускает smudge/process-фильтры, выбранные
+    # атрибутами и локальным конфигом РЕВЬЮИРУЕМОГО репозитория — код проверяемой стороны
+    # исполнялся бы до интеграционных тестов. Плюс раньше сюда уезжало полное окружение
+    # вызывающего (PATH/loader). Оба закрыты: доверенный бинарь, аллоулист, нейтрализация,
+    # и фильтры отключены явно на время checkout.
+    with hookless_env(root) as env:
+        # Фильтры — не единственный путь исполнения при checkout: `worktree add` запускает
+        # хук post-checkout, а partial clone тянет недостающие объекты через promisor-remote
+        # с ВНЕШНИМ transport-helper'ом. Хуки гасит core.hooksPath=/dev/null в _GIT_NEUTRALIZE;
+        # promisor гасить нечем — на нём падаем закрыто (G27).
+        partial = _prepush_git("config", "--get-regexp",
+                               r"^(extensions\.partialclone|remote\..*\.promisor)$", cwd=root)
+        if partial.returncode not in (0, 1):
+            raise TrustedGitError("не проверить partial-clone конфигурацию — probe небезопасен")
+        if partial.returncode == 0 and partial.stdout.strip():
+            raise RuntimeError(
+                "репозиторий — partial clone (promisor): checkout probe дотянул бы недостающие "
+                "объекты внешним transport-helper'ом правами гейта. Интеграционная проверка "
+                "остановлена.")
+        drivers = _active_filter_drivers(root)
+        if drivers:
+            raise RuntimeError(
+                "в репозитории заданы исполняемые при checkout filter-драйверы ("
+                + ", ".join(drivers) + "): checkout "
+                "probe исполнил бы их команды правами гейта. Интеграционная проверка "
+                "остановлена — уберите драйверы или отключите integration-гейт осознанно.")
+        _probe_git(root, env, "worktree", "prune")
+        ct = _probe_git(root, env, "commit-tree", tree, "-p", base, "-p", sha,
+                        "-m", "integration probe")
         if ct.returncode != 0 or not ct.stdout.strip():
             raise RuntimeError("commit-tree не удался: "
                                f"{redact_secrets(ct.stderr.strip())[:300]}")
         commit = ct.stdout.strip()
         path = _git_common_dir(root) / "gates-probe" / f"{os.getpid()}-{sha[:8]}"
-        r = subprocess.run(["git", "worktree", "add", "-q", "--detach", str(path), commit],
-                           cwd=root, capture_output=True, text=True, env=env)
+        r = _probe_git(root, env, "worktree", "add", "-q", "--detach", str(path), commit)
         if r.returncode != 0:
             raise RuntimeError("worktree add не удался: "
                                f"{redact_secrets(r.stderr.strip())[:300]}")
         try:
             yield path, env
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(path)],
-                           cwd=root, capture_output=True, env=env)
+            _probe_git(root, env, "worktree", "remove", "--force", str(path))
 
 
 def worktree_snapshot(root: Path) -> str:
     """Снимок ОТСЛЕЖИВАЕМЫХ изменений рабочего дерева — контроль побочного эффекта (И1).
     Записи в gitignored пути (кэши) намеренно не видны: остаток §9.2."""
-    r = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True)
+    r = _prepush_git("status", "--porcelain", cwd=root)
     return hashlib.sha256(r.stdout.encode()).hexdigest()
 
 
@@ -479,8 +622,8 @@ def _onboarded(root: Path) -> bool:
     на импорте и из хука/tmp-репо непригодна (та же причина, что у `_audit_line`)."""
     if (root / GATE_CONFIG_NAME).exists():
         return True
-    return subprocess.run(["git", "cat-file", "-e", f"HEAD:{GATE_CONFIG_NAME}"],
-                          cwd=root, capture_output=True).returncode == 0
+    return _prepush_git("cat-file", "-e", f"HEAD:{GATE_CONFIG_NAME}",
+                          cwd=root).returncode == 0
 
 
 def main(argv: list[str], stdin_text: "str | None" = None, root: "Path | None" = None) -> int:
@@ -553,9 +696,7 @@ def _fetch_base(root: Path, cfg: IntegrationConfig, fetched: dict) -> "str | Non
     if key in fetched:
         return fetched[key]
     try:
-        r = subprocess.run(["git", "fetch", "--quiet", "--end-of-options", remote, branch],
-                           cwd=root,
-                           capture_output=True, text=True, timeout=cfg.fetch_timeout)
+        r = _prepush_fetch(root, remote, branch, cfg.fetch_timeout)
         reason = None if r.returncode == 0 else (
             redact_secrets(r.stderr.strip())[:300] or "git fetch не удался")
     except subprocess.TimeoutExpired:
@@ -581,8 +722,8 @@ def _check_integration(root: Path, line: PushRef, cfg: IntegrationConfig, fetche
                           f"reason={reason!r} — слияние НЕ проверялось (конфигурируемый обход)")
         print(report_fetch_failed(cfg.on_fetch_failure, reason), file=sys.stderr)
         return 0                        # шаги отставания/слияния/тестов НЕ выполняются (И3)
-    behind = subprocess.run(["git", "rev-list", "--count", f"{line.local_sha}..{cfg.base_ref}"],
-                            cwd=root, capture_output=True, text=True)
+    behind = _prepush_git("rev-list", "--count", f"{line.local_sha}..{cfg.base_ref}",
+                            cwd=root)
     if behind.returncode != 0:
         # И3: сбой сравнения — «неизвестно», а не «есть что интегрировать, разберёмся ниже».
         print(f"[prepush] ✗ {line.local_ref}: не удалось сравнить с {cfg.base_ref} "
@@ -605,8 +746,7 @@ def _check_integration(root: Path, line: PushRef, cfg: IntegrationConfig, fetche
         print(f"[prepush] ✗ {line.local_ref}: предсказание слияния не удалось "
               f"({merged.detail}) — «неизвестно» не значит «чисто»", file=sys.stderr)
         return 2
-    base_sha = subprocess.run(["git", "rev-parse", "--end-of-options", cfg.base_ref], cwd=root,
-                              capture_output=True, text=True).stdout.strip()
+    base_sha = _prepush_git("rev-parse", "--end-of-options", cfg.base_ref, cwd=root).stdout.strip()
     _audit_line(root, f"integration ok ref={line.local_ref} sha={line.local_sha[:12]} "
                       f"base={cfg.base_ref} base_sha={base_sha[:12]} — конфликтов нет")
     if not cfg.merge_test_command:

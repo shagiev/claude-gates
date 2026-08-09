@@ -232,16 +232,58 @@ def test_f3_blocking_dup_onto_carried_root_reopens_it(led):
     assert g.convergence_decision(L)[0] in ("block", "escalate")
 
 
-def test_f11_resolved_by_user_requires_human_terminal(led, monkeypatch):
-    """Эскалация не должна держаться на дисциплине агента: `resolved-by-user` мгновенно
-    снимает блокирующую находку и вызывается тем же входом, что и остальные адъюдикации."""
+def test_f11_resolved_by_user_needs_explicit_confirmation(led, monkeypatch):
+    """Эскалация не должна сниматься «по инерции». Требование ТЕРМИНАЛА отменено 09.08.2026:
+    оно не держало нарушителя (агент выделяет PTY) и выгоняло человека из рабочего окружения —
+    под Claude Code даже `!` идёт без tty. Взамен — явное заявление, видимое в аудите."""
     L = g.load_findings_ledger("b")
     g.merge_round(L, [("critical", "Money leak")])
     monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
     with pytest.raises(g.AdjudicationError) as exc:
-        g.adjudicate(L, "F1", "resolved-by-user", "агент решил за человека")
-    assert "терминал" in str(exc.value)
+        g.adjudicate(L, "F1", "resolved-by-user", "снято по инерции")
+    assert "--operator-confirmed" in str(exc.value)
     assert L["findings"]["F1"]["status"] == "open"
-    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
-    g.adjudicate(L, "F1", "resolved-by-user", "решение человека")
+
+    g.adjudicate(L, "F1", "resolved-by-user", "решение человека", operator_confirmed=True)
     assert L["findings"]["F1"]["status"] == "resolved-by-user"
+
+
+def test_operator_confirmation_is_recorded_in_audit(led, tmp_path, monkeypatch):
+    """Флаг — не барьер, а заявление: его след в аудите и есть вся защита."""
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: False)
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("critical", "Money leak")])
+    g.adjudicate(L, "F1", "resolved-by-user", "владелец принял риск", operator_confirmed=True)
+    log = (tmp_path / "a.log").read_text()
+    assert "HUMAN-APPROVAL F1" in log
+    assert "via=operator-confirmed-flag" in log, "способ подтверждения обязан быть в аудите"
+
+
+def test_reason_file_keeps_human_command_short(led, tmp_path, monkeypatch, capsys):
+    """`resolved-by-user` требует терминала — значит человек набирает руками. Перенабор
+    длинной причины был трением без пользы: текст пишет агент, человек подтверждает решение."""
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("critical", "Money leak")])
+    g.save_findings_ledger(L)
+    reason = tmp_path / "why.txt"
+    reason.write_text("Решение владельца: возражение закрыто по существу в abc1234.\n")
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    assert g.main(["adjudicate", "F1", "resolved-by-user", "--reason-file", str(reason)]) == 0
+    saved = g.load_findings_ledger(None)["findings"]["F1"]
+    assert saved["status"] == "resolved-by-user"
+    assert "по существу в abc1234" in saved["reason"]
+
+
+def test_reason_file_missing_or_empty_is_rejected(led, tmp_path, monkeypatch):
+    """Причина обязательна: пустой файл не должен превращаться в пустое обоснование."""
+    L = g.load_findings_ledger("b")
+    g.merge_round(L, [("critical", "Money leak")])
+    g.save_findings_ledger(L)
+    monkeypatch.setattr(g.sys.stdin, "isatty", lambda: True)
+    empty = tmp_path / "empty.txt"
+    empty.write_text("   \n")
+    assert g.main(["adjudicate", "F1", "resolved-by-user", "--reason-file", str(empty)]) == 1
+    assert g.main(["adjudicate", "F1", "resolved-by-user",
+                   "--reason-file", str(tmp_path / "nope.txt")]) == 1
+    assert g.load_findings_ledger(None)["findings"]["F1"]["status"] == "open"

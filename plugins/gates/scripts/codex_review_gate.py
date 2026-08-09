@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import glob
+import difflib
+import functools
 import hashlib
+import io
 import json
 import os
 import re
@@ -338,21 +341,83 @@ HARD_CODE_PATH_COMPONENTS = (
 _DEFAULT_HARD_CAP = 8
 
 
+_BOOTSTRAP_GIT_DIRS = ("/usr/local/bin/git", "/opt/homebrew/bin/git", "/usr/bin/git", "/bin/git")
+_BOOTSTRAP_ENV_ALLOW = ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+
+
+def _bootstrap_git(*args: str, cwd: "str | Path") -> "subprocess.CompletedProcess | None":
+    """git для стадии инициализации: слой ещё не определён, но правила те же — абсолютный
+    бинарь, аллоулист окружения (loader-переменные не доезжают), нейтрализованный конфиг."""
+    git = next((c for c in _BOOTSTRAP_GIT_DIRS
+                if os.path.isfile(c) and os.access(c, os.X_OK)), None)
+    if git is None:
+        return None
+    env = {k: v for k, v in os.environ.items() if k in _BOOTSTRAP_ENV_ALLOW}
+    env["HOME"] = os.path.expanduser("~")
+    env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        return subprocess.run([git, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                               "-c", "log.showSignature=false", "-c", "gpg.program=/nonexistent",
+                               *args],
+                              cwd=str(cwd), capture_output=True, text=True, env=env)
+    except OSError:
+        return None
+
+
+def _has_git_marker(start: Path) -> bool:
+    """Наличие репозитория доказывается ФАЙЛОВОЙ проверкой, а не кодом возврата git:
+    иначе «git недоступен» неотличимо от «мы не в репозитории», и хуки молча выключаются."""
+    try:
+        cur = start.resolve()
+    except OSError:
+        return False
+    for cand in (cur, *cur.parents):
+        if (cand / ".git").exists():
+            return True
+    return False
+
+
 def _detect_repo_root(cwd: "Path | None" = None) -> "Path | None":
     """git rev-parse --show-toplevel от cwd (скрипт живёт в кэше плагина — __file__ бесполезен).
     None = не git-репо/сбой git: хуки → exit 0, явные гейты → явная ошибка (fail-closed)."""
+    # Голый git тут подменял САМ РЕПОЗИТОРИЙ: шим возвращал чужой чистый корень, и весь
+    # дальнейший закреплённый git честно работал не с тем деревом — обход слоем глубже,
+    # чем подмена диапазона (находка ревью 08.08.2026).
+    # Bootstrap: разрешение корня происходит ДО определения остальных хелперов, поэтому
+    # доверенный git собирается здесь же — из фиксированных системных каталогов и с
+    # окружением без GIT_*-оверрайдов.
+    start = Path(cwd) if cwd is not None else Path.cwd()
+    git = None
+    for cand in ("/usr/local/bin/git", "/opt/homebrew/bin/git", "/usr/bin/git", "/bin/git"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            git = cand
+            break
+    if git is None:
+        return None
+    # Аллоулист, а не «всё кроме GIT_*»: LD_PRELOAD/DYLD_INSERT_LIBRARIES внедряют код в
+    # git с фиксированным путём и подделывают вывод ещё ДО того, как слой установлен.
+    env = {k: v for k, v in os.environ.items()
+           if k in ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")}
+    env["HOME"] = str(_trusted_home()) if "_trusted_home" in globals() else os.path.expanduser("~")
+    env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
     try:
-        cmd = ["git"]
-        if cwd is not None:
-            cmd.extend(["-C", str(cwd)])
-        cmd.extend(["rev-parse", "--show-toplevel"])
-        r = subprocess.run(cmd,
-                           capture_output=True, text=True)
+        r = subprocess.run([git, "rev-parse", "--show-toplevel"], cwd=str(start),
+                           capture_output=True, text=True, env=env)
     except OSError:
         return None
     if r.returncode != 0 or not r.stdout.strip():
         return None
-    return Path(os.path.realpath(r.stdout.strip()))
+    root = Path(os.path.realpath(r.stdout.strip()))
+    try:                       # результат обязан СОДЕРЖАТЬ каталог, от которого искали
+        start.resolve().relative_to(root)
+    except (ValueError, OSError):
+        return None
+    return root
 
 
 def _onboarded(root: Path) -> bool:
@@ -360,9 +425,21 @@ def _onboarded(root: Path) -> bool:
     временное удаление worktree-файла не должно отключать хуки)."""
     if (root / GATE_CONFIG_NAME).exists():
         return True
-    r = subprocess.run(["git", "cat-file", "-e", f"HEAD:{GATE_CONFIG_NAME}"],
-                       cwd=root, capture_output=True)
-    return r.returncode == 0
+    # Голый `cat-file -e` через PATH вызывающего: шим возвращал ненулевой код, проект считался
+    # НЕ онбордженным, и хуки выходили 0 — тот самый opt-in fail-open, который HEAD-проверка
+    # и должна закрывать. Отсутствие доказывается УСПЕШНЫМ ls-tree с пустым выводом.
+    r = _bootstrap_git("ls-tree", "--name-only", "HEAD", "--", GATE_CONFIG_NAME, cwd=root)
+    if r is not None and r.returncode == 0:
+        return bool(r.stdout.strip())
+    # Репозиторий БЕЗ КОММИТОВ (свежий `git init`) — законное «не онбординат»: HEAD ещё не
+    # существует, но это не поломка. Отличаем по валидной символической ссылке при
+    # отсутствующем объекте; иначе (повреждение, нет бинаря) — «нечитаемо» → блокируем.
+    sym = _bootstrap_git("symbolic-ref", "-q", "HEAD", cwd=root)
+    ver = _bootstrap_git("rev-parse", "--verify", "-q", "HEAD", cwd=root)
+    if (sym is not None and sym.returncode == 0
+            and ver is not None and ver.returncode != 0):
+        return False                      # unborn-not-onboarded: хуки не вмешиваются
+    return True                           # unreadable: считаем онбордженным и блокируем
 
 
 def _read_gate_config(root: Path) -> "dict | None":
@@ -464,7 +541,7 @@ def _set_hook_repo_context(root: Path) -> None:
     LEDGER_DIR = Path(ledger_override) if ledger_override else REPO_ROOT / "logs" / "review_ledger"
     LAST_DEPLOYED = REPO_ROOT / ".claude" / ".last-deployed-sha"
     LAST_REVIEWED = REPO_ROOT / ".claude" / ".last-reviewed-sha"
-    DEPLOY_PIN = REPO_ROOT / ".claude" / ".deploy-section-pin"
+    DEPLOY_PIN = _gate_state_dir() / "deploy-section-pin"
     findings_override = os.environ.get("CODEX_FINDINGS_DIR")
     FINDINGS_DIR = (Path(findings_override) if findings_override
                     else REPO_ROOT / "logs" / "review_findings")
@@ -768,23 +845,75 @@ def git_head() -> str:
     if r is None or r.returncode != 0:
         raise TrustedGitError("доверенный git недоступен — HEAD не разрешить безопасно")
     return r.stdout.strip()
-    return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-                          check=True).stdout.strip()
 
 
 def diff_sha256(base: str, head: str = "HEAD") -> str:
     # head явно (R2-F2): check_reviewed биндит всё к захваченному head_before, а не к «HEAD»,
     # который мог сдвинуться конкурентным коммитом за время гейта.
-    _r = _trusted_git("diff", "--no-ext-diff", "--no-textconv", f"{base}..{head}")
-    if _r is None or _r.returncode != 0:
-        raise TrustedGitError("доверенный git недоступен — дифф-хэш не посчитать безопасно")
-    return hashlib.sha256(_r.stdout.encode()).hexdigest()
-    diff = subprocess.run(["git", "diff", f"{base}..{head}"], capture_output=True, text=True,
-                          check=True).stdout
-    return hashlib.sha256(diff.encode()).hexdigest()
+    # Хэш считается по ТОМУ ЖЕ тексту, что уходит ревьюерам (_diff_text из сырых blob'ов).
+    # Иначе `.gitattributes -diff` опустошил бы вход ревьюера, а хэш-биндинг это заверил.
+    text, why = _diff_text(base, head)
+    if text is None:
+        raise TrustedGitError(f"дифф-хэш не посчитать безопасно: {why}")
+    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def working_tree_clean() -> bool:
+    # `status` НЕ является предикатом безопасности: он сравнивает ПРЕОБРАЗОВАННОЕ
+    # представление. Локальный clean/process-фильтр (`.gitattributes`, `.git/info/attributes`)
+    # отдаёт закоммиченное содержимое, тогда как в дереве лежат другие байты — именно те, что
+    # уедут актуатором; `assume-unchanged`/`skip-worktree` прячут изменение вовсе.
+    # Поэтому сверяем СЫРЫЕ байты с деревом коммита.
+    head = _trusted_git("rev-parse", "--verify", "-q", "HEAD")
+    if head is None or head.returncode != 0:
+        raise TrustedGitError("доверенный git недоступен — чистоту дерева не проверить")
+    tree = _trusted_git("ls-tree", "-r", "-z", head.stdout.strip())
+    if tree is None or tree.returncode != 0:
+        raise TrustedGitError("не прочитать дерево коммита — чистоту не проверить")
+    committed: dict[str, tuple[str, str]] = {}
+    for entry in tree.stdout.split("\0"):
+        if not entry.strip():
+            continue
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3 or not path:
+            raise TrustedGitError("ls-tree изменил формат — чистоту не проверить")
+        committed[path] = (parts[0], parts[2])       # режим, blob-хэш
+    for path, (mode, blob) in committed.items():
+        full = Path(REPO_ROOT) / path
+        if mode == "120000":                          # симлинк: содержимое blob'а — ЦЕЛЬ ссылки
+            try:
+                target = os.readlink(full).encode()
+            except OSError:
+                return False                          # не симлинк или исчез
+            digest = hashlib.sha1(b"blob %d\0" % len(target) + target).hexdigest()
+            if digest != blob:
+                return False
+            continue
+        if mode == "160000":                          # подмодуль: сверяем ЗАПИСАННЫЙ коммит
+            if not full.is_dir():
+                return False                          # подмодуль не инициализирован/удалён
+            sub = _trusted_git("rev-parse", "--verify", "-q", "HEAD", cwd=full)
+            if sub is None or sub.returncode != 0:
+                raise TrustedGitError(f"не прочитать HEAD подмодуля {path!r}")
+            if sub.stdout.strip() != blob:
+                return False                          # подмодуль на другом коммите
+            continue
+        if not full.is_file():
+            return False                              # удалён или заменён
+        actual_mode = "100755" if os.access(full, os.X_OK) else "100644"
+        if actual_mode != mode:
+            return False                              # изменён исполняемый бит
+        h = _trusted_git("hash-object", "--no-filters", "--", str(full))
+        if h is None or h.returncode != 0:
+            raise TrustedGitError("не посчитать хэш файла — чистоту не проверить")
+        if h.stdout.strip() != blob:
+            return False                              # СЫРЫЕ байты разошлись с коммитом
+    # untracked (не игнорируемые) файлы: их отсутствие подтверждает, что состав дерева тот же
+    st = _trusted_git("status", "--porcelain", "--untracked-files=all")
+    if st is None or st.returncode != 0:
+        raise TrustedGitError("доверенный git недоступен — чистоту дерева не проверить")
+    return not st.stdout.strip()
     out = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True,
                          check=True).stdout
     return out.strip() == ""
@@ -811,10 +940,109 @@ LAST_DEPLOYED = (REPO_ROOT / ".claude" / ".last-deployed-sha") if REPO_ROOT else
 LAST_REVIEWED = (REPO_ROOT / ".claude" / ".last-reviewed-sha") if REPO_ROOT else None   # SHA, одобренный check-reviewed
 
 
-def _record_reviewed(head_sha: str) -> None:
+#: Семейства обязательной blocking-пары (§3 дизайна панели): Codex/openai + Claude/anthropic.
+#: Baseline ревью двигается, только когда обе семьи реально отработали по этому head.
+MANDATORY_PANEL_FAMILIES = ("openai", "anthropic")
+
+def _gate_state_dir() -> "Path | None":
+    """Состояние гейта живёт ВНЕ проверяемого репозитория.
+
+    Пока baseline лежал в `.claude/`, им управляла та же сторона, чей код проверяют: ветка,
+    принёсшая `.claude/.gate-review-baseline` со значением HEAD, делала диапазон ПУСТЫМ —
+    оба обязательных ревьюера получали пустую дельту, честно её одобряли, и это «evidence
+    пустого диапазона» позволяло сдвинуть baseline на HEAD, навсегда исключив весь
+    предшествующий payload из ревью (находка security-прохода 09.08.2026). Никакая проверка
+    содержимого этого не лечит: файл — вход решения, и он обязан быть вне досягаемости.
+
+    Ключ каталога — sha256 от абсолютного пути корня: разные клоны одного проекта ведут
+    независимую бухгалтерию, как и раньше.
+    """
+    if REPO_ROOT is None:
+        return None
+    # HOME берётся из БД пользователей (`_trusted_home`), а не из окружения: `XDG_STATE_HOME`
+    # и `HOME` вызывающего — ровно тот вход, из-за которого слой и написан. Иначе состояние
+    # гейта переехало бы из репозитория атакующего в каталог атакующего.
+    base = _trusted_home() / ".local" / "state"
+    key = hashlib.sha256(str(REPO_ROOT.resolve()).encode()).hexdigest()[:16]
+    state = (base / "claude-gates" / key).resolve()
+    # Доверенный HOME сам по себе гарантии не даёт: если репозиторий укоренён в домашнем
+    # каталоге (или выше `~/.local/state`), состояние снова оказывается ВНУТРИ проверяемого
+    # дерева, и ветка может принести собственный `review-baseline` — та самая атака, ради
+    # которой состояние и выносили (security-проход 09.08.2026). Молча выбирать другое
+    # место нельзя: оно тоже было бы под контролем репозитория. Падаем закрыто.
+    root = REPO_ROOT.resolve()
+    if state == root or root in state.parents:
+        raise TrustedGitError(
+            f"состояние гейта ({state}) оказалось внутри проверяемого репозитория ({root}): "
+            "решения о покрытии ревью нельзя принимать по файлу, которым управляет "
+            "проверяемая сторона. Вынеси репозиторий из домашнего каталога.")
+    return state
+
+
+#: baseline ревью, принадлежащий ГЕЙТУ, — вне рабочего дерева (см. `_gate_state_dir`).
+GATE_BASELINE = (_gate_state_dir() / "review-baseline") if REPO_ROOT else None
+
+#: Evidence панели: ЧТО именно позволило сдвинуть baseline ревью. Отдельно от
+#: `.last-reviewed-sha`, потому что тот пишется и при аварийном `CODEX_REVIEW_SKIP` (G25b).
+PANEL_EVIDENCE = (_gate_state_dir() / "panel-evidence.json") if REPO_ROOT else None
+
+
+def _record_reviewed(head_sha: str, evidence: "dict | None" = None) -> None:
     # деплой-рецепт сверит захваченный SHA с этим → задеплоено ровно то, что одобрено
     LAST_REVIEWED.parent.mkdir(parents=True, exist_ok=True)
     LAST_REVIEWED.write_text(head_sha + "\n")
+    if PANEL_EVIDENCE is None:
+        return
+    # Skip/деградация НЕ оставляют evidence: baseline ревью тогда не двигается, и пропущенный
+    # диапазон остаётся в области следующего ревью (иначе он не был бы отревьюен НИКОГДА).
+    if evidence is None:
+        PANEL_EVIDENCE.unlink(missing_ok=True)
+        return
+    PANEL_EVIDENCE.parent.mkdir(parents=True, exist_ok=True)
+    PANEL_EVIDENCE.write_text(json.dumps(evidence, ensure_ascii=False, indent=2))
+
+
+def _panel_evidence_ok(head_sha: str, baseline: "str | None" = None,
+                       diff_sha: "str | None" = None) -> "tuple[bool, str]":
+    """Есть ли доказательство, что по ЭТОМУ head отработал КАЖДЫЙ обязательный блокирующий
+    ревьюер. Только это даёт право сдвинуть baseline ревью (G25b).
+
+    Связка включает baseline и diff-хэш: иначе честный evidence одного диапазона
+    переигрывался бы на другом (находка ревью 09.08.2026). Ряд обязан нести сертификацию и
+    фактическую модель — «строка blocking/ok» доказательством не является.
+
+    ⚠️ Граница: файл лежит в репозитории и его может переписать тот же пользователь. Это
+    прежний остаток «владелец машины — доверенная сторона»; неподделываемость требует
+    подписи внешним сервисом и вынесена в Фазу 2 (R-EVIDENCE-SELFSIGNED).
+    """
+    if PANEL_EVIDENCE is None or not PANEL_EVIDENCE.is_file():
+        return (False, "нет evidence панели (аварийный skip либо ревью не проводилось)")
+    try:
+        data = json.loads(PANEL_EVIDENCE.read_text())
+    except (OSError, ValueError):
+        return (False, "evidence панели нечитаем")
+    if not isinstance(data, dict) or data.get("head_sha") != head_sha:
+        return (False, "evidence панели относится к другому коммиту")
+    if baseline is not None and data.get("baseline_sha") != baseline:
+        return (False, "evidence панели относится к другому baseline")
+    if data.get("baseline_sha") == head_sha:
+        # Пустой диапазон ревьюеры одобряют честно — смотреть нечего. Сдвиг baseline по
+        # такому «одобрению» исключил бы весь предшествующий код из будущих ревью.
+        return (False, "диапазон пуст (baseline == head) — ревьюеры не видели кода")
+    if diff_sha is not None and data.get("diff_sha256") != diff_sha:
+        return (False, "evidence панели относится к другому диффу")
+    rows = data.get("reviewers")
+    if not isinstance(rows, list):
+        return (False, "evidence панели без списка ревьюеров")
+    families = {r.get("family") for r in rows
+                if isinstance(r, dict) and r.get("role") == "blocking"
+                and r.get("status") == "ok" and r.get("certification_id")
+                and r.get("actual_models")}
+    missing = set(MANDATORY_PANEL_FAMILIES) - families
+    if missing:
+        return (False, f"в evidence нет успешного blocking-ревьюера семейств: "
+                       f"{', '.join(sorted(missing))}")
+    return (True, "")
 
 
 def resolve_baseline() -> str | None:
@@ -825,10 +1053,16 @@ def resolve_baseline() -> str | None:
     env = os.environ.get("CODEX_DEPLOY_BASELINE")
     if env and env.strip():
         return env.strip()
-    if LAST_DEPLOYED is not None and LAST_DEPLOYED.exists():
-        sha = LAST_DEPLOYED.read_text().strip()
+    # ГЕЙТОВЫЙ маркер, а не `.last-deployed-sha`: тот писал деплой-рецепт, то есть baseline
+    # ревью принадлежал недоверенной стороне, и любой записанный туда SHA исключал
+    # предшествующий диапазон из ВСЕХ будущих ревью (находка ревью 09.08.2026).
+    if GATE_BASELINE is not None and GATE_BASELINE.exists():
+        sha = GATE_BASELINE.read_text().strip()
         if sha:
             return sha
+    # Фолбэка на `.claude/.last-deployed-sha` НЕТ: его писал деплой-рецепт, и он был вторым
+    # входом недоверенной стороны в решение о покрытии. Установка ДО миграции получает
+    # fail-closed «baseline неизвестен» и задаёт его один раз через CODEX_DEPLOY_BASELINE.
     return None
 
 
@@ -1172,7 +1406,8 @@ def merge_round(led: dict, blocking_findings: "list[tuple]",
         fnd[new_fid()] = rec_new
 
 
-def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
+def adjudicate(led: dict, fid: str, status: str, reason: str,
+               operator_confirmed: bool = False) -> None:
     """Классификация Claude по стоп-политике. Guards (ML-C1): critical не residual;
     причина обязательна; resolved-by-user — только решение человека (можно всё)."""
     f = (led.get("findings") or {}).get(fid)
@@ -1183,17 +1418,24 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
     if not reason.strip():
         raise AdjudicationError("причина обязательна (аудит)")
     # F11: `resolved-by-user` мгновенно снимает блокирующую находку и вызывается ТЕМ ЖЕ
-    # агентом, что пишет код, через тот же вход. Требование TTY отсекает дефолтный
-    # неинтерактивный вызов, но ДОКАЗАТЕЛЬСТВОМ участия человека НЕ является: агент может
-    # выделить PTY (проверено ревью). Механическое разделение «агент/человек» на одной машине
-    # требует внеполосного подписанного одноразового подтверждения — остаток R-HUMAN-APPROVAL.
-    # Поэтому вторая половина защиты — громкость: решение попадает в аудит с пометкой и
-    # session id, чтобы подделанное одобрение было видно постфактум.
-    if status == "resolved-by-user" and not sys.stdin.isatty():
+    # агентом, что пишет код, через тот же вход.
+    #
+    # Требование TTY было ОТМЕНЕНО по боевому опыту 09.08.2026. Оно не давало гарантии (агент
+    # выделяет PTY — проверено ревью, остаток R-HUMAN-APPROVAL), но выгоняло человека из
+    # рабочего окружения: под Claude Code даже `!`-команда идёт без tty, то есть оператору
+    # приходилось открывать отдельный терминал. Препятствие, которое не держит нарушителя и
+    # мешает добросовестному, — плохой размен.
+    #
+    # Взамен — ЯВНОЕ ЗАЯВЛЕНИЕ: `--operator-confirmed`. Оно тоже не доказывает участие
+    # человека, но снимает случайность (флаг нельзя проставить «по инерции») и оставляет в
+    # аудите отдельную метку с указанием способа, по которой снятие находки видно постфактум.
+    if status == "resolved-by-user" and not (sys.stdin.isatty() or operator_confirmed):
         raise AdjudicationError(
-            "`resolved-by-user` — решение ЧЕЛОВЕКА и принимается только из интерактивного "
-            "терминала. Неинтерактивный вызов отклонён: иначе автор кода снимал бы "
-            "блокирующую находку сам. Набери команду вручную.")
+            "`resolved-by-user` — решение ЧЕЛОВЕКА. Подтверди явно:\n"
+            "  adjudicate <Fid> resolved-by-user --operator-confirmed \"причина\"\n"
+            "  (или --reason-file <путь>, чтобы не набирать длинный текст)\n"
+            "Флаг — не барьер, а ЗАЯВЛЕНИЕ: оно пишется в аудит отдельной меткой, поэтому "
+            "снятие находки агентом видно постфактум (остаток R-HUMAN-APPROVAL).")
     sev_known = f.get("severity") in KNOWN_SEVERITIES
     if status == "residual-failsafe" and (f.get("severity") == "critical" or not sev_known):
         raise AdjudicationError(
@@ -1217,9 +1459,11 @@ def adjudicate(led: dict, fid: str, status: str, reason: str) -> None:
     led["last_adj_ts"] = _time.time()
     led["needs_review_round"] = True   # Codex должен УВИДЕТЬ адъюдикацию (спор F3-2: кэш
     if status == "resolved-by-user":
-        audit(f"HUMAN-APPROVAL {fid} [{f.get('severity')}] session={_env_session()} "
-              f"reason={f['reason']!r} — блокирующая находка снята решением человека; "
-              "признак TTY не является доказательством (остаток R-HUMAN-APPROVAL)")
+        how = "tty" if sys.stdin.isatty() else "operator-confirmed-flag"
+        audit(f"HUMAN-APPROVAL {fid} [{f.get('severity')}] session={_env_session()} via={how} "
+              f"reason={f['reason']!r} — блокирующая находка снята решением человека. "
+              "Ни TTY, ни флаг НЕ доказывают участие человека (остаток R-HUMAN-APPROVAL): "
+              "это заявление, оставляющее след для последующей проверки")
     audit(f"adjudicate {fid} → {status}: {f['reason']!r}")   # позволял allow без его раунда)
 
 
@@ -1266,8 +1510,12 @@ def convergence_decision(led: dict) -> "tuple[str, str]":
         if (d >= thr and f.get("status") == "open") or d >= 3:
             return ("escalate",
                     f"[codex-gate] ⚖️ ЭСКАЛАЦИЯ: спор по {k} «{f.get('title', '')[:60]}» "
-                    f"(disputes={d}, severity={f.get('severity')}). Нужно решение человека: "
-                    f"`adjudicate {k} resolved-by-user \"...\"` | fix | аварийный SKIP.")
+                    f"(disputes={d}, severity={f.get('severity')}). Нужно решение человека — "
+                    f"набери в терминале:\n"
+                    f"  bash .githooks/gates-run codex_review_gate.py adjudicate {k} "
+                    f"resolved-by-user --reason-file <путь>\n"
+                    f"  (или ... resolved-by-user \"$(pbpaste)\" — текст из буфера)\n"
+                    f"  Альтернативы: fix | аварийный SKIP.")
     for k, f in opens.items():
         if int(f.get("carry_count") or 0) >= 2:   # анти-гниение: 2 серии подряд → человек
             return ("escalate",
@@ -1329,20 +1577,20 @@ def _config_section_at_ref(root: Path, ref: str, section: str) -> "tuple[str, di
 
     NB: парс-слой НЕ переиспользует _read_gate_config: тому нужен ref-bound blob и
     ТРЁХСТАТУСНЫЙ исход, а _read_gate_config читает worktree и коллапсирует в dict|None."""
-    ls = subprocess.run(["git", "ls-tree", ref, "--", GATE_CONFIG_NAME],
-                        cwd=root, capture_output=True, text=True)
-    if ls.returncode != 0:
+    # Голый git здесь давал ТИХОЕ ослабление: шим с успехом и пустым выводом делал
+    # настроенные секции `absent`, и эмпирический гейт возвращал успех как «не сконфигурировано».
+    ls = _trusted_git("ls-tree", ref, "--", GATE_CONFIG_NAME, cwd=root)
+    if ls is None or ls.returncode != 0:
         return ("unreadable", None)             # дерево/ref не прочитано — доказательства нет
     if not ls.stdout.strip():
         return ("absent", None)                 # дерево прочитано, пути нет — ДОКАЗАНО absent
-    blob = subprocess.run(["git", "cat-file", "blob", f"{ref}:{GATE_CONFIG_NAME}"],
-                         cwd=root, capture_output=True)
-    if blob.returncode != 0:
+    blob = _trusted_git("cat-file", "blob", f"{ref}:{GATE_CONFIG_NAME}", cwd=root)
+    if blob is None or blob.returncode != 0:
         return ("unreadable", None)             # путь есть, но объект не читается
     if yaml is None:
         return ("unreadable", None)             # нет PyYAML при наличии файла — не подтвердить
     try:
-        data = yaml.safe_load(blob.stdout.decode())
+        data = yaml.safe_load(blob.stdout)   # слой отдаёт text=True
     except (yaml.YAMLError, UnicodeError):
         return ("unreadable", None)
     if not isinstance(data, dict):
@@ -1364,8 +1612,6 @@ def _empirical_config(root: Path, ref: str) -> "tuple[str, str | None, int]":
     if not (isinstance(cmd, str) and cmd.strip()):
         return ("absent", None, d)              # секция без валидной команды — доказанно не opt-in
     return ("enabled", cmd.strip(), _valid_positive_int(sec.get("timeout_s", d), d))  # S9
-
-
 def _run_empirical(cmd: str, timeout_s: int, root: Path,
                    cwd: "Path | None" = None, env: "dict | None" = None) -> "tuple[str, str]":
     """Прогон тест-команды. ('pass'|'fail'|'timeout'|'error', хвост вывода). Любой не-'pass' →
@@ -1409,6 +1655,21 @@ VERDICT_DIR = Path(_verdict_env) if _verdict_env else (
     (REPO_ROOT / "logs" / "review_verdicts") if REPO_ROOT else None)
 
 
+# ═══════ Локальная Фаза 2: интерфейс к inframon (спека 2026-07-23-inframon-interface) ═══════
+# Ф1: authoritative baseline через deploy.baseline_command (pin одобренной секции — анти-
+# self-hiding); Ф2: машиночитаемый вердикт деплой-гейта для внешнего guard'а (inframon).
+_DEFAULT_BASELINE_TIMEOUT = 30
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+#: Pin авторизует `deploy.baseline_command` — команду, назначающую границу ревью. Пока он
+#: лежал в `.claude/`, атакующий коммитил и команду, и подходящий под неё pin: сверка
+#: проходила, baseline становился HEAD, диапазон — пустым, и коммит исключал себя из ревью
+#: (security-проход 09.08.2026). Место — вне репозитория, рядом с остальным состоянием гейта.
+DEPLOY_PIN = (_gate_state_dir() / "deploy-section-pin") if REPO_ROOT else None
+_verdict_env = os.environ.get("CODEX_VERDICT_DIR")
+VERDICT_DIR = Path(_verdict_env) if _verdict_env else (
+    (REPO_ROOT / "logs" / "review_verdicts") if REPO_ROOT else None)
+
+
 def _deploy_section_hash(sec: dict) -> str:
     return hashlib.sha256(json.dumps(sec, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -1433,15 +1694,69 @@ def _write_pin(value: str) -> None:
     _atomic_write_json(DEPLOY_PIN, {"pin": value, "ts": datetime.now(timezone.utc).isoformat()})
 
 
+
+
 def _run_baseline_command(cmd: str, timeout_s: int) -> "str | None":
-    """Прогон baseline_command (argv, без shell — как test_command). Полный 40-hex SHA после
-    strip; всё прочее (fail/timeout/мусор) → None (fail-closed у вызывающего, НЕ фолбэк)."""
+    """Прогон baseline_command. Полный 40-hex SHA после strip; всё прочее → None (fail-closed
+    у вызывающего, НЕ фолбэк).
+
+    ⛔ ФОРМА ЗАКРЫТА: ровно ОДИН абсолютный путь к исполняемому файлу ВНЕ репозитория, БЕЗ
+    аргументов. Свободная команда непроверяема — три раунда security-ревью подряд обходили
+    лексические проверки: `./ops/sha`, затем `/bin/sh ops/sha`, затем
+    `/bin/sh -c 'cd "$HOME"; cd src; cd repo; sh sha'`, где ни один аргумент не похож на путь.
+    Урок тот же, что с переменными окружения и filter-драйверами: перечислять опасное
+    бесполезно, работает только аллоулист формы. Шеллы и интерпретаторы исключены структурно.
+    Кому нужна логика — пишет адаптер-обёртку ВНЕ проверяемого дерева.
+    """
     try:
         argv = shlex.split(cmd)
-        if not argv:
-            return None
-        r = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
-                          timeout=timeout_s)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    if len(argv) != 1:
+        print("[codex-gate] ✗ deploy.baseline_command принимает РОВНО один аргумент — "
+              "абсолютный путь к исполняемому адаптеру без параметров. Команда с аргументами "
+              "непроверяема: интерпретатор дотянется до кода репозитория любыми средствами "
+              "(`sh -c 'cd …; sh script'`). Оберни логику в скрипт ВНЕ репозитория.",
+              file=sys.stderr)
+        return None
+    exe = Path(argv[0])
+    if not exe.is_absolute():
+        print(f"[codex-gate] ✗ deploy.baseline_command должен задаваться АБСОЛЮТНЫМ путём "
+              f"(получено {argv[0]!r}).", file=sys.stderr)
+        return None
+    root = REPO_ROOT.resolve() if REPO_ROOT else None
+    try:
+        real = exe.resolve()
+    except (OSError, ValueError):
+        return None
+    # И лексический путь, И цель симлинка: `<repo>/shim -> /bin/echo` иначе прошёл бы проверку
+    # цели, а исполнялся бы изменяемый симлинк.
+    if root is not None and any(pp == root or root in pp.parents for pp in (exe, real)):
+        print(f"[codex-gate] ✗ deploy.baseline_command ({exe}) ссылается ВНУТРЬ проверяемого "
+              "репозитория: границу ревью нельзя назначать кодом, который сам в неё попадает.",
+              file=sys.stderr)
+        return None
+    if real.is_dir() or not os.access(str(real), os.X_OK):
+        print(f"[codex-gate] ✗ deploy.baseline_command ({real}) не исполняемый файл.",
+              file=sys.stderr)
+        return None
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    env["HOME"] = str(_trusted_home())
+    env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    # stdin=DEVNULL обязателен: `/bin/sh` — валидный «один абсолютный исполняемый файл без
+    # аргументов», и с унаследованным stdin он становится диспетчером. Репозиторный Makefile
+    # пайпил бы в `check-reviewed` шелл-код, который тот исполнял бы правами гейта.
+    # cwd — КОРЕНЬ ФС, а не каталог состояния и не временный каталог. Состояние: payload
+    # дописал бы туда `review-baseline` и подделал «гейт уже ревьюил этот head». Временный:
+    # `TemporaryDirectory()` уважает `TMPDIR` ВЫЗЫВАЮЩЕГО, и репозиторный Makefile ставил
+    # его внутрь репозитория — после чего инструмент вроде `rake`, ищущий конфиг вверх по
+    # дереву, подхватывал `Rakefile` проверяемой стороны (security-проход 09.08.2026).
+    # `/` не выбирается никем и не пишется: относительные записи и поиск вверх бесполезны.
+    try:
+        r = subprocess.run([str(real)], cwd=os.sep, capture_output=True, text=True,
+                           timeout=timeout_s, env=env, stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
     if r.returncode != 0:
@@ -2322,12 +2637,23 @@ def _trusted_git_bin() -> "str | None":
 #: Переменные, которыми git подменяет ВЫВОД, не трогая ни бинарь, ни репозиторий:
 #: внешний diff-драйвер/textconv может выйти нулём без вывода, и оба обязательных ревьюера
 #: получат пустой «чистый» дифф. Плюс подмена конфигов и путей.
-_GIT_OVERRIDE_PREFIXES = ("GIT_",)
+_GIT_ENV_ALLOW = ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+#: `-c`-флаги, снимающие исполняемые и подсказывающие пути локального конфига
+_GIT_NEUTRALIZE = tuple(x for pair in (
+    ("-c", "log.showSignature=false"), ("-c", "gpg.program=/nonexistent"),
+    ("-c", "gpg.ssh.program=/nonexistent"), ("-c", "core.pager=cat"),
+    ("-c", "core.editor=/nonexistent"), ("-c", "core.sshCommand=/nonexistent"),
+    ("-c", "core.askPass=/nonexistent"), ("-c", "credential.helper="),
+    ("-c", "diff.external="), ("-c", "core.fsmonitor=false"),
+    ("-c", "core.hooksPath=/dev/null"), ("-c", "protocol.allow=never"),
+) for x in pair)
 _GIT_SAFE_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                 "GIT_NO_REPLACE_OBJECTS": "1",
                  "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
 
-def _trusted_git(*args: str) -> "subprocess.CompletedProcess | None":
+def _trusted_git(*args: str, cwd: "str | Path | None" = None
+                 ) -> "subprocess.CompletedProcess | None":
     """git из доверенного каталога, в санированном окружении и без внешних diff-драйверов.
 
     Закрепить один бинарь мало: `GIT_EXTERNAL_DIFF`/`diff.external` подменяют ВЫВОД, а голый
@@ -2337,24 +2663,218 @@ def _trusted_git(*args: str) -> "subprocess.CompletedProcess | None":
     git = _trusted_git_bin()
     if git is None:
         return None
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(_GIT_OVERRIDE_PREFIXES)}
+    # Аллоулист (тот же, что в bootstrap): денилист «всё кроме GIT_*» пропускал loader-инъекции
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    env["HOME"] = str(_trusted_home())
     env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
     env.update(_GIT_SAFE_ENV)
     try:
-        return subprocess.run([git, *args], cwd=REPO_ROOT, capture_output=True, text=True,
-                              env=env)
+        # Локальный .git/config отключить нельзя — он часть репозитория. Исполняемые пути
+        # нейтрализуются явно: иначе `log.showSignature` + `gpg.program` запускают код
+        # репозитория ПРАВАМИ ГЕЙТА, а fsmonitor подсовывает устаревший stat-кэш.
+        return subprocess.run([git, *_GIT_NEUTRALIZE, *args],
+                              cwd=str(cwd) if cwd else REPO_ROOT,
+                              capture_output=True, text=True, env=env)
     except OSError:
         return None
 
 
+def _trusted_git_bytes(*args: str, cwd: "str | Path | None" = None
+                       ) -> "subprocess.CompletedProcess | None":
+    """Тот же доверенный слой, но БЕЗ декодирования вывода.
+
+    Текстовый режим непригоден там, где важны сами байты: `cat-file blob` на бинарнике
+    либо падает на невалидном UTF-8, либо (при другой локали процесса) декодируется и
+    кодируется обратно в ДРУГИЕ байты — и артефакт молча перестаёт быть равен
+    отревьюенному дереву, сохранив «успешный» sha256 (находка ревью 09.08.2026).
+    """
+    git = _trusted_git_bin()
+    if git is None:
+        return None
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    env.update(_GIT_SAFE_ENV)
+    try:
+        return subprocess.run([git, *_GIT_NEUTRALIZE, *args],
+                              cwd=str(cwd) if cwd else REPO_ROOT,
+                              capture_output=True, env=env)
+    except OSError:
+        return None
+
+
+#: Ссылка на неподменённую реализацию: тесты хардненинга обязаны проверять НАСТОЯЩИЙ слой,
+#: а conftest подменяет `_trusted_git_bytes` привычной формой ради остальных фейков.
+_REAL_TRUSTED_GIT_BYTES = _trusted_git_bytes
+_REAL_TRUSTED_GIT_FOR_TESTS = _trusted_git
+
+
+def _tree_entries(commit: str) -> "dict[str, tuple[str, str]] | None":
+    """path -> (mode, oid) для всего дерева коммита. Байтовый разбор, без атрибутов."""
+    r = _trusted_git_bytes("ls-tree", "-r", "-z", commit)
+    if r is None or r.returncode != 0:
+        return None
+    out: "dict[str, tuple[str, str]]" = {}
+    for entry in r.stdout.split(b"\0"):
+        if not entry.strip():
+            continue
+        meta, _, path = entry.partition(b"\t")
+        parts = meta.split()
+        if len(parts) < 3 or not path:
+            return None
+        mode, otype, oid = parts[0].decode(), parts[1].decode(), parts[2].decode()
+        # ⚠️ Не-blob записи НЕ отбрасываются: `commit` — это gitlink (подмодуль), и его пропуск
+        # делал сдвиг указателя ПОЛНОСТЬЮ невидимым для обоих обязательных ревьюеров
+        # (воспроизведено 09.08.2026: `git diff` печатал оба OID, наш вход — пустоту).
+        # `-r` разворачивает деревья, поэтому `tree` здесь не встречается.
+        if otype not in ("blob", "commit"):
+            continue
+        out[path.decode("utf-8", "surrogateescape")] = (mode, oid, otype)
+    return out
+
+
+def _delta_path(path: str) -> str:
+    """Обратимое экранирование пути: разные байты обязаны давать разный текст (G23).
+    Непечатаемое и сам `\\` уходят в `\\xNN`, поэтому склейка двух разных путей в один
+    текст невозможна."""
+    out = []
+    for ch in path:
+        out.append(ch if ch.isprintable() and ch != "\\" else "\\x%02x" % ord(ch))
+    return "".join(out)
+
+
+def _delta_lines(raw: bytes) -> "list[str]":
+    lines = raw.decode("utf-8").splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n\\ No newline at end of file\n"
+    return lines
+
+
+def _entry_repr(e: "tuple[str, str, str] | None") -> str:
+    if e is None:
+        return "-"
+    mode, oid, otype = e
+    kind = {"100644": "file", "100755": "exec", "120000": "link", "160000": "gitlink"}.get(
+        mode, otype)
+    return f"{mode} {kind} {oid}"
+
+
+def _blob_bytes(oid: str) -> "bytes | None":
+    r = _trusted_git_bytes("cat-file", "blob", oid)
+    if r is None or r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def _resolve_commit(rev: str) -> "str | None":
+    """Ревизия → неизменяемый OID коммита. `CODEX_DEPLOY_BASELINE` принимает произвольное
+    выражение, и подвижная ссылка между вызовами разводила хэш и вход ревьюеров (находка
+    ревью 09.08.2026): хэш покрывал B1..H, ревьюеры видели B2..H."""
+    r = _trusted_git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    if r is None or r.returncode != 0 or not r.stdout.strip():
+        return None
+    return r.stdout.strip()
+
+
+#: (base_oid, head_oid) -> пути, чьё содержимое ревьюеры увидеть НЕ МОГЛИ (бинарь/не-UTF-8).
+_BINARY_CHANGES: "dict[tuple[str, str], list[str]]" = {}
+
+
+@functools.lru_cache(maxsize=8)
+def _diff_text_cached(base_oid: str, head_oid: str) -> "tuple[str | None, str]":
+    return _diff_text_build(base_oid, head_oid)
+
+
+def binary_changes(base: str, head: str) -> "list[str]":
+    """Пути с бинарным изменением в диапазоне. Заполняется ПРИ СБОРКЕ дельты, поэтому
+    описывает ровно то, что было (не)показано ревьюерам, а не пересчитанное задним числом."""
+    b_oid, h_oid = _resolve_commit(base), _resolve_commit(head)
+    if b_oid is None or h_oid is None:
+        return []
+    if (b_oid, h_oid) not in _BINARY_CHANGES:
+        _diff_text_cached(b_oid, h_oid)
+    return _BINARY_CHANGES.get((b_oid, h_oid), [])
+
+
 def _diff_text(base: str, head: str) -> "tuple[str | None, str]":
-    r = _trusted_git("diff", "--no-ext-diff", "--no-textconv", f"{base}..{head}")
-    if r is None:
-        return (None, "доверенный git не найден — вход ревьюеров не получить безопасно")
-    if r.returncode != 0:
-        return (None, f"не получить дифф: git exit={r.returncode}")
-    return (r.stdout, "")
+    """Единая точка: резолв в OID + ОДИН построенный текст на пару коммитов. Ровно он уходит
+    и в `diff_sha256`, и каждому ревьюеру — иначе биндинг заверяет не то, что судили."""
+    b_oid, h_oid = _resolve_commit(base), _resolve_commit(head)
+    if b_oid is None or h_oid is None:
+        bad = base if b_oid is None else head
+        return (None, f"ревизия {bad!r} не резолвится в коммит — вход ревьюеров не построить")
+    return _diff_text_cached(b_oid, h_oid)
+
+
+def _diff_text_build(base: str, head: str) -> "tuple[str | None, str]":
+    """Вход ревьюеров строится ИЗ СЫРЫХ BLOB'ов, а не `git diff`.
+
+    `git diff` подчиняется `.gitattributes` проверяемого репозитория: строка `*.py -diff`
+    (или `diff=binary`) заставляет git вернуть «Binary files differ» вместо кода — оба
+    обязательных ревьюера получили бы пустышку и одобрили непрочитанный payload.
+    `--no-textconv`/`--no-ext-diff` этого НЕ отменяют: они гасят внешние программы, а не
+    сам атрибут. Поэтому сравниваем деревья сами; бинарность определяем по содержимому.
+    """
+    base_tree, head_tree = _tree_entries(base), _tree_entries(head)
+    if base_tree is None or head_tree is None:
+        return (None, "не прочитать деревья коммитов — вход ревьюеров не построить")
+    # Конверт с OID ДЕРЕВЬЕВ обязателен (G23). Без него два разных перехода неотличимы, если
+    # различаются только НЕизменившиеся записи: B1={a:X,c:C}→H1={a:Y,c:C} и
+    # B2={a:X,c:D}→H2={a:Y,c:D} дают один и тот же блок для `a`, а `c` в дельту не попадает.
+    trees = []
+    for rev in (base, head):
+        r = _trusted_git("rev-parse", f"{rev}^{{tree}}")
+        if r is None or r.returncode != 0 or not r.stdout.strip():
+            return (None, f"не прочитать дерево {rev} — вход ревьюеров не построить")
+        trees.append(r.stdout.strip())
+    chunks = [f"--- gates-delta base-tree:{trees[0]} head-tree:{trees[1]} ---"]
+    binaries: "list[str]" = []
+    _BINARY_CHANGES[(base, head)] = binaries
+    for path in sorted(set(base_tree) | set(head_tree)):
+        b, h = base_tree.get(path), head_tree.get(path)
+        if b == h:
+            continue
+        if b is None:
+            status = "A"
+        elif h is None:
+            status = "D"
+        elif b[2] != h[2] or (b[0] == "120000") != (h[0] == "120000"):
+            status = "T"                       # typechange: файл↔симлинк↔подмодуль
+        else:
+            status = "M"
+        chunks.append("--- gates-delta ---")
+        chunks.append(f"status: {status}\npath: {_delta_path(path)}\n"
+                      f"old: {_entry_repr(b)}\nnew: {_entry_repr(h)}")
+        # gitlink: содержимого нет, значим САМ указатель — он уже в old/new, но печатается
+        # явно, чтобы ревьюер не искал его глазами среди метаданных.
+        if (b and b[0] == "160000") or (h and h[0] == "160000"):
+            chunks.append(f"submodule {b[1] if b else '-'} -> {h[1] if h else '-'}")
+            continue
+        b_raw = b"" if b is None else _blob_bytes(b[1])
+        h_raw = b"" if h is None else _blob_bytes(h[1])
+        if b_raw is None or h_raw is None:
+            return (None, f"не прочитать blob для {path} — вход ревьюеров неполон")
+        if b_raw == h_raw:
+            continue                           # изменился только режим — он уже в заголовке
+        if b"\0" in b_raw or b"\0" in h_raw:
+            # sha256 обеих сторон: один размер НЕ должен схлопывать разное содержимое (G24)
+            chunks.append(f"binary {len(b_raw)} sha256:{hashlib.sha256(b_raw).hexdigest()} -> "
+                          f"{len(h_raw)} sha256:{hashlib.sha256(h_raw).hexdigest()}")
+            binaries.append(path)
+            continue
+        try:
+            # Без завершающего \n difflib склеивает соседние строки в одну («-x.txt+/etc/passwd»),
+            # и граница между старым и новым значением теряется — для символической ссылки это
+            # ровно то место, где ревьюер должен видеть подмену цели.
+            b_lines = _delta_lines(b_raw)
+            h_lines = _delta_lines(h_raw)
+        except UnicodeDecodeError:
+            chunks.append(f"binary {len(b_raw)} sha256:{hashlib.sha256(b_raw).hexdigest()} -> "
+                          f"{len(h_raw)} sha256:{hashlib.sha256(h_raw).hexdigest()} (не UTF-8)")
+            binaries.append(path)
+            continue
+        chunks.append("".join(difflib.unified_diff(
+            b_lines, h_lines, fromfile=f"a/{_delta_path(path)}",
+            tofile=f"b/{_delta_path(path)}")).rstrip("\n"))
+    return ("\n".join(chunks) + "\n", "")
 
 
 def run_codex_review_text(diff_text: str, *, role: str = "blocking",
@@ -2630,6 +3150,31 @@ def check_reviewed_cli() -> int:
     baseline, rc_b = _resolve_baseline_gate(head_before)   # inframon Ф1: pin/authoritative/легаси
     if rc_b:
         return 2
+    # ЗАКРЕПЛЯЕМ baseline в неизменяемый OID сразу и один раз. `CODEX_DEPLOY_BASELINE`
+    # принимает символическое выражение, а каждый потребитель (хэш, детектор бинарей, каждый
+    # ревьюер, ledger, evidence) резолвил его ЗАНОВО: конкурентный `git update-ref` между
+    # вызовами давал хэш по B..H, проверку бинарей по H..H и ревью снова по B..H
+    # (security-проход 09.08.2026). Дальше по коду ходит только OID.
+    if baseline is not None:
+        pinned = _resolve_commit(baseline)
+        if pinned is None:
+            print(f"[codex-gate] ✗ baseline {baseline!r} не резолвится в коммит — деплой "
+                  "остановлен (подвижная ссылка не может быть границей ревью).",
+                  file=sys.stderr)
+            return 2
+        baseline = pinned
+        # Второй барьер к тому же классу: baseline == HEAD делает диапазон ПУСТЫМ — лесенка,
+        # детектор бинарей и оба ревьюера видят пустоту, а артефакт содержит всё дерево.
+        # Легитимен только один случай: гейт САМ уже отревьюил этот head (его маркер).
+        if baseline == head_before:
+            own = (GATE_BASELINE.read_text().strip()
+                   if GATE_BASELINE is not None and GATE_BASELINE.exists() else "")
+            if own != head_before:
+                print("[codex-gate] ✗ baseline совпал с HEAD — диапазон ревью пуст, а выкатке "
+                      "подлежит всё дерево. Источник baseline указывает на текущий HEAD, и "
+                      "гейт этот коммит не ревьюил. Деплой остановлен.", file=sys.stderr)
+                audit(f"empty-range-block head={head_before} baseline={baseline}")
+                return 2
     ladder_skip = os.environ.get("LADDER_SKIP") == "1"
     codex_skip = skip_requested()
     empirical_skip = os.environ.get("EMPIRICAL_SKIP") == "1"
@@ -2643,9 +3188,12 @@ def check_reviewed_cli() -> int:
             return 2
         # baseline должен быть предком HEAD, иначе baseline..HEAD не покрывает реальный дельту
         # (протухший/кросс-машинный/rollback SHA) — Codex P2, fail-closed.
-        anc = subprocess.run(["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
-                             capture_output=True, text=True)
-        if anc.returncode != 0:
+        # Голый git + текущий HEAD давали обход: шим, возвращающий 0, делал предком ЛЮБОЙ
+        # baseline. Взяв no-op потомка с тем же деревом, вызывающий получал пустой диапазон —
+        # лесенка и оба ревьюера одобряли «нет изменений», а артефакт собирался из HEAD.
+        # Сверяем через слой и против ЗАХВАЧЕННОГО head_before, а не ambient HEAD.
+        anc = _trusted_git("merge-base", "--is-ancestor", baseline, head_before)
+        if anc is None or anc.returncode != 0:
             print(f"[codex-gate] ✗ baseline {baseline[:12]} не предок HEAD (протухший/кросс-машинный) "
                   "— задай верный CODEX_DEPLOY_BASELINE. Деплой остановлен.", file=sys.stderr)
             return 2
@@ -2697,7 +3245,9 @@ def check_reviewed_cli() -> int:
 
     # --- CODEX часть (прежняя логика; теперь ПОСЛЕ ladder+empirical — CODEX_REVIEW_SKIP их не пропускает) ---
     if codex_skip:
-        _record_reviewed(head_before)   # осознанный skip — задеплоенный SHA тоже фиксируем (R2-F2)
+        # Осознанный skip фиксирует SHA (R2-F2), но НЕ оставляет evidence панели: baseline
+        # ревью двигать нечем, и пропущенный диапазон остаётся в области следующего ревью.
+        _record_reviewed(head_before, None)
         audit("CODEX_REVIEW_SKIP=1 — деплой-ревью ПРОПУЩЕНО")
         print("[codex-gate] ⚠️ CODEX_REVIEW_SKIP=1 — деплой-ревью ПРОПУЩЕНО (см. audit). "
               "При активном инциденте актуатора: сначала kill-switch проекта, "
@@ -2710,6 +3260,22 @@ def check_reviewed_cli() -> int:
         return 0
     head = head_before                        # R2-F2: биндим ledger/reviewed к захваченному SHA
     diff_sha = diff_sha256(baseline, head_before)
+    # Бинарное изменение ревьюеры увидеть НЕ МОГУТ: во вход попадают только размер и sha256,
+    # а в артефакт — все байты целиком. Одобрение непрозрачного хэша засчитывалось за полное
+    # ревью и двигало baseline — это прямое нарушение «отревьюено ≡ выкачено»
+    # (security-проход 09.08.2026). Обход есть, но он громкий и evidence не оставляет.
+    binaries = binary_changes(baseline, head_before)
+    allow_binary = os.environ.get("GATES_ALLOW_BINARY", "").strip() == "1"
+    if binaries and not allow_binary:
+        shown = ", ".join(binaries[:5]) + (" …" if len(binaries) > 5 else "")
+        print(f"[codex-gate] ✗ в диапазоне есть бинарные изменения ({shown}) — их содержимое "
+              "ни один ревьюер не видит, а в артефакт они уезжают целиком. Деплой остановлен.\n"
+              "  Осознанный обход: GATES_ALLOW_BINARY=1 (аудируется; baseline ревью при этом "
+              "НЕ двигается, диапазон остаётся в области следующего ревью).", file=sys.stderr)
+        audit(f"binary-changes-block head={head_before} paths={binaries[:20]}")
+        return 2
+    if binaries:
+        audit(f"GATES_ALLOW_BINARY=1 — бинарь пропущен без ревью содержимого: {binaries[:20]}")
     raw_provider = os.environ.get("REVIEW_PROVIDER")
     raw_profile = "portable" if raw_provider is None else raw_provider.strip().casefold()
     portable_profile = raw_profile in _PORTABLE_PROFILES
@@ -2754,7 +3320,21 @@ def check_reviewed_cli() -> int:
             print(msg_c, file=sys.stderr)
             return 2
         else:
-            _record_reviewed(head)
+            # Evidence панели по кэшу НЕ восстанавливается. Кэш лежит в `logs/`, который
+            # игнорируется git'ом, поэтому проверка чистоты дерева его не видит: подброшенный
+            # ledger давал allow без запуска ревьюеров, а гейт затем сам повышал его до
+            # доверенного evidence и двигал baseline (security-проход 09.08.2026).
+            # Теперь evidence пишет ТОЛЬКО фактический прогон панели; кэш ускоряет решение,
+            # но baseline по нему не двигается — диапазон остаётся в области следующего ревью.
+            # НО и не уничтожается: деплой мог прерваться между реальным прогоном панели и
+            # finalize-deploy, а повторная попытка идёт по кэшу и панель уже не запускает —
+            # затирание оставило бы baseline неподвижным навсегда. Сохраняем только evidence,
+            # проверенный по ЭТОМУ head, baseline и diff-хэшу: подброшенный кэш его не создаст.
+            if not _panel_evidence_ok(head, baseline, diff_sha)[0]:
+                _record_reviewed(head, None)
+            else:
+                LAST_REVIEWED.parent.mkdir(parents=True, exist_ok=True)
+                LAST_REVIEWED.write_text(head + "\n")
             l_st, e_st, c_st = _verdict_statuses("cached")
             if _write_deploy_verdict(head, baseline, diff_sha, l_st, e_st, c_st,
                                      requested_reviewers):
@@ -2775,12 +3355,17 @@ def check_reviewed_cli() -> int:
     # Ф3: КАЖДЫЙ запрошенный провайдер ревьюит один и тот же дифф в ОДНОМ прогоне; второй проход
     # выполняется ДАЖЕ при blocking у первого (union за один раунд — адъюдикация разом, EARS-14b).
     results, failures, supplemental_advisory = [], [], []
+    panel_rows: "list[dict]" = []          # фактические прогоны — evidence для baseline (G25b)
     if portable_profile:
         for cert in portable_certs:
             run = run_certified_reviewer(cert, baseline, head)
             actual = ",".join(run.actual_models) or run.requested_model
             audit(f"review-run role={run.role} provider={run.provider} actual={actual} "
                   f"family={run.family} certification={run.certification_id} status={run.status}")
+            panel_rows.append({"role": run.role, "provider": run.provider,
+                               "family": run.family, "status": run.status,
+                               "actual_models": list(run.actual_models),
+                               "certification_id": run.certification_id})
             if run.status != "ok" or run.verdict is None:
                 failures.append((run.provider, actual, run.detail))
                 print(f"[codex-gate] ✗ {run.role} ревьюер {run.provider} ({actual}) "
@@ -2842,7 +3427,9 @@ def check_reviewed_cli() -> int:
             # Кэшируем только полностью чистый run. Иначе следующий deploy обязан заново
             # получить supplemental artifact, чтобы advisory не исчезла из audit/verdict.
             write_ledger(head, diff_sha, baseline, verdict, requested_reviewers)   # кэш
-        _record_reviewed(head)
+        _record_reviewed(head, {"head_sha": head, "diff_sha256": diff_sha,
+                                "baseline_sha": baseline,
+                                "reviewers": panel_rows} if not binaries else None)
         for sev, title, prov in advisory:      # совещательные — с пометкой провайдера
             print(f"    [{sev}] ({prov}) {title}", file=sys.stderr)
         l_st, e_st, c_st = _verdict_statuses("allow")
@@ -3415,21 +4002,243 @@ def gate_bash_cli(hook_json: str) -> int:
         "NB: эвристика частичная (см. остаток R1-5).")
 
 
+def _cli_opts(argv: "list[str]") -> "dict[str, str]":
+    """`--key value` → dict. Общий разбор для check-decision/check-artifact/finalize-deploy."""
+    return {a[2:]: argv[i + 1] for i, a in enumerate(argv)
+            if a.startswith("--") and i + 1 < len(argv)}
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[0] if argv else ""
     if cmd == "check-reviewed":
         return check_reviewed_cli()
+    if cmd == "verify-deployable":
+        # §2.2b/§2.5: гейт САМ строит неизменяемый артефакт из отревьюенного коммита и
+        # подтверждает чистоту ТОЛЬКО для него. Проверять «чисто ли рабочее дерево» и надеяться,
+        # что актуатор отправит именно его, — обещание, которое нечем подкрепить: команда
+        # деплоя произвольна. Здесь связь есть по построению: манифест равен дереву коммита.
+        if not _require_repo():
+            return 2
+        try:
+            head = git_head()
+            if not working_tree_clean():
+                print("[codex-gate] ✗ рабочее дерево грязное — артефакт строится из коммита, "
+                      "но расхождение означает, что выкатывают не то, что ревьюили",
+                      file=sys.stderr)
+                return 2
+        except TrustedGitError as exc:
+            print(f"[codex-gate] ✗ {exc}", file=sys.stderr)
+            return 2
+        reviewed = LAST_REVIEWED.read_text().strip() if LAST_REVIEWED.exists() else ""
+        if reviewed != head:
+            print(f"[codex-gate] ✗ HEAD {head[:12]} не совпадает с одобренным ревью "
+                  f"{reviewed[:12] or '(нет)'} — артефакт строить не из чего", file=sys.stderr)
+            return 2
+        out_dir = _sterile_mkdtemp("gates-artifact-")
+        if out_dir is None:
+            print("[codex-gate] ✗ не создать каталог артефакта вне ревьюируемого репозитория",
+                  file=sys.stderr)
+            return 2
+        # `git archive` НЕ даёт побайтового манифеста дерева: `export-ignore`/`export-subst`
+        # из `.gitattributes` или `.git/info/attributes` выбрасывают и переписывают файлы, то
+        # есть содержимым артефакта управляет непроверенное состояние репозитория. Собираем tar
+        # сами из дерева коммита: `ls-tree -r -z` + сырые blob'ы через `cat-file`.
+        tar = Path(out_dir) / f"{head[:12]}.tar"
+        listing = _trusted_git_bytes("ls-tree", "-r", "-z", head)
+        if listing is None or listing.returncode != 0:
+            print("[codex-gate] ✗ не прочитать дерево коммита — артефакт не собрать",
+                  file=sys.stderr)
+            return 2
+        import tarfile
+        entries = 0
+        try:
+            with tarfile.open(tar, "w", format=tarfile.PAX_FORMAT) as tf:
+                for entry in listing.stdout.split(b"\0"):
+                    if not entry.strip():
+                        continue
+                    meta_b, _, path_b = entry.partition(b"\t")
+                    meta, path = meta_b.decode(), path_b.decode("utf-8", "surrogateescape")
+                    parts = meta.split()
+                    if len(parts) < 3 or not path:
+                        print("[codex-gate] ✗ ls-tree изменил формат — артефакт не собрать",
+                              file=sys.stderr)
+                        return 2
+                    mode, otype, oid = parts[0], parts[1], parts[2]
+                    if otype == "commit":               # gitlink
+                        # Раньше подмодуль молча выбрасывался, а сообщение утверждало «собран
+                        # из отревьюенного коммита»: актуатор получал дерево БЕЗ vendor/ и,
+                        # в зависимости от поведения, удалял или оставлял устаревший код.
+                        print(f"[codex-gate] ✗ в дереве есть подмодуль ({path}) — семантика его "
+                              "выкатки не определена, артефакт не собирается", file=sys.stderr)
+                        return 2
+                    if otype != "blob":
+                        continue
+                    data = _blob_bytes(oid)
+                    if data is None:
+                        print(f"[codex-gate] ✗ не прочитать blob {oid[:12]} для {path}",
+                              file=sys.stderr)
+                        return 2
+                    info = tarfile.TarInfo(path)
+                    if mode == "120000":                # симлинк: цель — содержимое blob'а
+                        info.type, info.linkname = tarfile.SYMTYPE, data.decode(
+                            "utf-8", "surrogateescape")
+                        info.size = 0
+                        tf.addfile(info)
+                    else:
+                        info.mode = 0o755 if mode == "100755" else 0o644
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
+                    entries += 1
+        except (OSError, tarfile.TarError) as exc:
+            print(f"[codex-gate] ✗ не собрать артефакт: {type(exc).__name__}", file=sys.stderr)
+            return 2
+        if entries == 0:
+            print("[codex-gate] ✗ артефакт пуст — дерево коммита не прочитано", file=sys.stderr)
+            return 2
+        digest = hashlib.sha256(tar.read_bytes()).hexdigest()
+        audit(f"verify-deployable head={head} artifact={tar} sha256={digest}")
+        print(f"[codex-gate] ✓ артефакт построен из отревьюенного коммита {head[:12]}")
+        print(f"[codex-gate] ВЫКАТЫВАЙ ИМЕННО ЕГО — иначе гарантия не действует "
+              f"(остаток R-ACTUATOR-HANDOFF)", file=sys.stderr)
+        print(f"GATES_ARTIFACT={tar}")
+        print(f"GATES_ARTIFACT_SHA256={digest}")
+        print(f"GATES_ARTIFACT_HEAD={head}")     # ИМЕННО он пишется в .last-deployed-sha
+        return 0
+    if cmd in ("check-artifact", "finalize-deploy"):
+        # check-artifact  — ПЕРЕД актуатором: подмена артефакта после сборки должна ловиться
+        #                   до того, как неотревьюенный payload уедет, а не после.
+        # finalize-deploy — двигает baseline РЕВЬЮ. Раньше его писал рецепт (недоверенная
+        #                   сторона) в .last-deployed-sha, и любой записанный туда SHA
+        #                   исключал предшествующий диапазон из всех будущих ревью.
+        if not _require_repo():
+            return 2
+        opts = _cli_opts(argv)
+        art, want, digest = opts.get("artifact"), opts.get("head"), opts.get("sha256")
+        if not art or not want or not digest:
+            print("[codex-gate] ✗ нужны --artifact <tar> --head <sha> --sha256 <digest>. "
+                  "Старый рецепт деплоя не мигрирован: обнови Makefile из шаблона плагина "
+                  "(gates-init показывает актуальный).", file=sys.stderr)
+            return 2
+        try:
+            actual = hashlib.sha256(Path(art).read_bytes()).hexdigest()
+        except OSError as exc:
+            print(f"[codex-gate] ✗ артефакт {art} не прочитан: {type(exc).__name__}",
+                  file=sys.stderr)
+            return 2
+        if actual != digest:
+            print(f"[codex-gate] ✗ артефакт ИЗМЕНИЛСЯ после сборки (sha256 {actual[:12]} вместо "
+                  f"{digest[:12]}) — выкатка остановлена", file=sys.stderr)
+            audit(f"artifact-mismatch head={want} expected={digest} actual={actual}")
+            return 2
+        if cmd == "check-artifact":
+            return 0
+        try:
+            cur = git_head()
+        except TrustedGitError as exc:
+            print(f"[codex-gate] ✗ {exc}", file=sys.stderr)
+            return 2
+        if cur != want:
+            print(f"[codex-gate] ✗ HEAD ({cur[:12]}) не совпадает с коммитом артефакта "
+                  f"({want[:12]}) — baseline ревью не двигается", file=sys.stderr)
+            return 2
+        # Порядок важен: сначала «есть ли вообще право двигать baseline», и только потом
+        # ревалидация решения. Иначе аварийный деплой с открытой находкой падал ПОСЛЕ того,
+        # как payload уже уехал: автоматика читала это как неуспех и могла повторить
+        # неидемпотентный актуатор, хотя намерением было «выкатить, baseline не двигать»
+        # (находка финального код-ревью 09.08.2026).
+        ok, why = _panel_evidence_ok(want)
+        if ok:
+            # Между check-decision и финализацией (во время deploy-payload и verify-deployed)
+            # конкурентная сессия могла записать open-находку или адъюдикацию. Сдвинуть
+            # baseline по устаревшему allow значит вывести уже заблокированный диапазон
+            # из-под будущих ревью.
+            with findings_lock():
+                led_f = load_findings_ledger(None)
+                if led_f is None:
+                    print("[codex-gate] ✗ findings-ledger повреждён — baseline не двигается",
+                          file=sys.stderr)
+                    return 2
+                if led_f.get("needs_review_round"):
+                    ok, why = False, "появились непоказанные адъюдикации"
+                else:
+                    decision_f, msg_f = convergence_decision(led_f)
+                    if decision_f != "allow":
+                        ok, why = False, f"решение устарело за время выкатки: {msg_f}"
+                if ok and (not LAST_REVIEWED.is_file()
+                           or LAST_REVIEWED.read_text().strip() != want):
+                    ok, why = False, "отметка ревью разошлась с коммитом артефакта"
+                if ok:
+                    ok, why = _panel_evidence_ok(want, baseline=led_f.get("baseline_sha"))
+                if ok:
+                    GATE_BASELINE.parent.mkdir(parents=True, exist_ok=True)
+                    GATE_BASELINE.write_text(want + "\n")
+        if not ok:
+            # ЭТО и есть G25b: отметка «отревьюено» + allow даёт и аварийный CODEX_REVIEW_SKIP,
+            # который панель не запускал. Сдвинуть по ней baseline — потерять покрытие НАВСЕГДА.
+            print(f"[codex-gate] ✗ baseline ревью НЕ сдвинут: {why}. Диапазон остаётся в "
+                  "области следующего ревью — это и есть защита от потери покрытия.",
+                  file=sys.stderr)
+            audit(f"baseline-not-advanced head={want} reason={why}")
+            return 0                           # деплой состоялся; двигать baseline нечем
+        audit(f"baseline-advanced head={want} artifact={art} sha256={digest}")
+        print(f"[codex-gate] ✓ baseline ревью сдвинут на {want[:12]} (evidence панели полон)")
+        return 0
     if cmd == "check-decision":                # быстрая ревалидация решения (deploy-lock, F3):
         if not _require_repo():
             return 2
-        if skip_requested():                   # F5: аварийный CODEX_REVIEW_SKIP жив и здесь
-            audit("CODEX_REVIEW_SKIP=1 — check-decision пропущен (аварийный контур)")
+        # ⚠️ Порядок важен: skip снимает ТОЛЬКО решение ревью, но не привязку к захваченному
+        # коммиту. Проверка раньше стояла до разбора --head, и аварийный контур заодно
+        # возвращал старым рецептам право писать собственный baseline (находка ревью 09.08.2026).
+        want_skip = _cli_opts(argv).get("head")
+        if skip_requested():
+            if not want_skip:
+                print("[codex-gate] ✗ даже с CODEX_REVIEW_SKIP нужен --head <sha артефакта>: "
+                      "skip снимает решение ревью, а не привязку выкатки к коммиту.",
+                      file=sys.stderr)
+                return 2
+            try:
+                cur_skip = git_head()
+            except TrustedGitError as exc:
+                print(f"[codex-gate] ✗ {exc}", file=sys.stderr)
+                return 2
+            if cur_skip != want_skip:
+                print(f"[codex-gate] ✗ HEAD сдвинулся с {want_skip[:12]} на {cur_skip[:12]} — "
+                      "выкатка остановлена (skip этого не снимает)", file=sys.stderr)
+                return 2
+            audit(f"CODEX_REVIEW_SKIP=1 — check-decision пропущен head={want_skip}")
             return 0
         _dis = review_disabled_reason(_env_session())
         if _dis is not None:                   # Ф2: выключенный ревьюер блокирует и здесь
             _disabled_banner(_dis)
             print("[codex-gate] ✗ ревьюер выключен — выкатка остановлена (`review-enable` или "
                   "аварийный CODEX_REVIEW_SKIP=1).", file=sys.stderr)
+            return 2
+        # Артефакт собран для ОДНОГО захваченного HEAD. Между verify-deployable и выкаткой
+        # конкурентный коммит мог сдвинуть HEAD и .last-reviewed-sha — и Makefile записал бы
+        # в .last-deployed-sha НОВЫЙ sha, хотя уехал старый артефакт, испортив baseline
+        # следующего ревью (находка ревью 09.08.2026). Поэтому решение проверяется НЕ «вообще»,
+        # а привязанным к тому же коммиту.
+        want = _cli_opts(argv).get("head")
+        if not want:
+            print("[codex-gate] ✗ check-decision требует --head <sha артефакта>. Рецепт деплоя "
+                  "не мигрирован: без привязки к захваченному коммиту конкурентный коммит "
+                  "разводит артефакт и решение. Обнови Makefile из шаблона плагина.",
+                  file=sys.stderr)
+            return 2
+        try:
+            cur = git_head()
+        except TrustedGitError as exc:
+            print(f"[codex-gate] ✗ {exc}", file=sys.stderr)
+            return 2
+        if cur != want:
+            print(f"[codex-gate] ✗ HEAD сдвинулся с {want[:12]} на {cur[:12]} после сборки "
+                  "артефакта — выкатка остановлена (иначе baseline сдвинулся бы на "
+                  "невыкаченный код)", file=sys.stderr)
+            return 2
+        seen = LAST_REVIEWED.read_text().strip() if LAST_REVIEWED.is_file() else ""
+        if seen != want:
+            print(f"[codex-gate] ✗ отметка ревью ({seen[:12] or 'нет'}) не совпадает с "
+                  f"коммитом артефакта {want[:12]} — выкатка остановлена", file=sys.stderr)
             return 2
         with findings_lock():                  # перечитать серию ПРЯМО перед rsync — конкурентная
             led = load_findings_ledger(None)   # сессия могла записать open/адъюдикацию после allow
@@ -3461,9 +4270,34 @@ def main(argv: list[str]) -> int:
     if cmd == "adjudicate":                    # adjudicate <Fid> <status> "<причина>"
         if not _require_repo():
             return 2
+        args_a = argv[1:]
+        # `--operator-confirmed` — явное заявление оператора вместо требования терминала
+        # (см. adjudicate: tty не держал нарушителя, но выгонял человека из рабочего окружения).
+        # `--reason-file` избавляет от перенабора длинного текста: обоснование пишет агент,
+        # человек подтверждает РЕШЕНИЕ.
+        operator_confirmed = "--operator-confirmed" in args_a
+        if operator_confirmed:
+            args_a = [a for a in args_a if a != "--operator-confirmed"]
+        if "--reason-file" in args_a:
+            i = args_a.index("--reason-file")
+            path = args_a[i + 1] if i + 1 < len(args_a) else ""
+            try:
+                reason_text = Path(path).read_text().strip()
+            except OSError as exc:
+                print(f"[codex-gate] не прочитать --reason-file {path!r}: "
+                      f"{type(exc).__name__}", file=sys.stderr)
+                return 1
+            if not reason_text:
+                print("[codex-gate] --reason-file пуст: причина обязательна (аудит)",
+                      file=sys.stderr)
+                return 1
+            args_a = args_a[:i] + args_a[i + 2:] + [reason_text]
+        argv = [cmd, *args_a]
         if len(argv) < 4:
             print("usage: adjudicate <Fid> fixed|residual-failsafe|refuted|resolved-by-user"
-                  "|open \"причина\"", file=sys.stderr)
+                  "|open \"причина\"\n"
+                  "       adjudicate <Fid> <status> --reason-file <путь>   "
+                  "(чтобы не перенабирать длинный текст)", file=sys.stderr)
             return 1
         with findings_lock():
             led = load_findings_ledger(None)
@@ -3471,7 +4305,8 @@ def main(argv: list[str]) -> int:
                 print("findings-ledger повреждён", file=sys.stderr)
                 return 2
             try:
-                adjudicate(led, argv[1], argv[2], argv[3])
+                adjudicate(led, argv[1], argv[2], argv[3],
+                           operator_confirmed=operator_confirmed)
             except AdjudicationError as e:
                 print(f"[codex-gate] {e}", file=sys.stderr)
                 return 2

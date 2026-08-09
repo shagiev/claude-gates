@@ -916,21 +916,34 @@ def test_resolved_by_user_is_terminal(led):      # решение человек
     assert g.convergence_decision(L)[0] == "allow"          # решение терминально
 
 
-def test_check_decision_cli(led, monkeypatch, capsys):       # ревалидация перед rsync
+def test_check_decision_cli(led, monkeypatch, capsys, tmp_path):       # ревалидация перед rsync
+    # --head обязателен: он и есть handshake версии рецепта (см. test ниже).
+    head = g.git_head()
+    monkeypatch.setattr(g, "git_head", lambda: head)
     L = g.load_findings_ledger("b")
     g.merge_round(L, [("high", "Late finding")])
     g.save_findings_ledger(L)
-    assert g.main(["check-decision"]) == 2                   # open → устарело → блок
+    assert g.main(["check-decision", "--head", head]) == 2   # open → устарело → блок
     with g.findings_lock():
         L = g.load_findings_ledger(None)
         g.adjudicate(L, "F1", "fixed", "проверено")          # §6c: refuted для high запрещён
         g.save_findings_ledger(L)
-    assert g.main(["check-decision"]) == 2                   # адъюдикация не показана Codex
+    assert g.main(["check-decision", "--head", head]) == 2   # адъюдикация не показана Codex
     with g.findings_lock():
         L = g.load_findings_ledger(None)
         g.merge_round(L, [])                                 # раунд показал
         g.save_findings_ledger(L)
-    assert g.main(["check-decision"]) == 0                   # сошлись → ок
+    marker = tmp_path / ".last-reviewed-sha"
+    marker.write_text(head + "\n")
+    monkeypatch.setattr(g, "LAST_REVIEWED", marker)
+    assert g.main(["check-decision", "--head", head]) == 0   # сошлись → ок
+
+
+def test_check_decision_without_head_fails_closed(led, capsys):
+    """Старый рецепт (без --head) обязан ломаться ГРОМКО: без привязки к захваченному коммиту
+    конкурентный коммит разводит артефакт и решение, и baseline уезжает на невыкаченный код."""
+    assert g.main(["check-decision"]) == 2
+    assert "не мигрирован" in capsys.readouterr().err
 
 
 def test_resolved_by_user_not_reopenable(led):   # F3 d=5: финальность человека
@@ -984,7 +997,12 @@ def test_check_decision_honors_emergency_skip(led, monkeypatch):   # F5: ML6-п�
     g.save_findings_ledger(L)
     monkeypatch.setenv("CODEX_REVIEW_SKIP", "1")
     monkeypatch.setattr(g, "AUDIT_LOG", g.FINDINGS_DIR / "a.log")
-    assert g.main(["check-decision"]) == 0
+    head = g.git_head()
+    monkeypatch.setattr(g, "git_head", lambda: head)
+    assert g.main(["check-decision", "--head", head]) == 0
+    # ...но привязку к коммиту skip НЕ снимает: иначе аварийный контур заодно возвращал бы
+    # старым рецептам право писать собственный baseline (находка ревью 09.08.2026).
+    assert g.main(["check-decision"]) == 2
 
 
 def test_structurally_corrupt_ledger_fail_closed(led):   # F7

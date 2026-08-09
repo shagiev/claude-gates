@@ -760,7 +760,10 @@ def test_set_hook_repo_context_updates_all_repo_derived_paths(repo):
     assert g.LEDGER_DIR == repo / "logs" / "review_ledger"
     assert g.LAST_DEPLOYED == repo / ".claude" / ".last-deployed-sha"
     assert g.LAST_REVIEWED == repo / ".claude" / ".last-reviewed-sha"
-    assert g.DEPLOY_PIN == repo / ".claude" / ".deploy-section-pin"
+    # Состояние, ВЛИЯЮЩЕЕ НА РЕШЕНИЕ, живёт вне репозитория: pin авторизует команду,
+    # назначающую границу ревью, и лёжа в `.claude/` позволял ветке исключить себя из ревью.
+    assert g.DEPLOY_PIN == g._gate_state_dir() / "deploy-section-pin"
+    assert repo.resolve() not in g.DEPLOY_PIN.parents
     assert g.FINDINGS_DIR == repo / "logs" / "review_findings"
     assert g.VERDICT_DIR == repo / "logs" / "review_verdicts"
 

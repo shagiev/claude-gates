@@ -25,10 +25,17 @@ except ImportError:            # PyYAML может отсутствовать в
 # уже в sys.path (тесты через conftest, запуск обоих скриптов из одного каталога), фолбэк —
 # при запуске как голый скрипт из произвольного cwd.
 try:
-    from codex_review_gate import is_code_path
+    from codex_review_gate import (is_code_path, _trusted_git, TrustedGitError,
+                                   _trusted_git_bin, _trusted_home, _GIT_ENV_ALLOW,
+                                   _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
+                                   _bootstrap_git, _has_git_marker)
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from codex_review_gate import is_code_path  # type: ignore[no-redef]
+    from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
+                                   TrustedGitError, _trusted_git_bin, _trusted_home,
+                                   _GIT_ENV_ALLOW, _GIT_SAFE_ENV, _GIT_NEUTRALIZE,
+                                   _TRUSTED_PATH_DIRS, _bootstrap_git,
+                                   _has_git_marker)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -72,13 +79,25 @@ def _repo_root() -> Path:
     """Корень репозитория, а НЕ cwd. `begin`/`mark`, запущенные из подкаталога, писали
     бухгалтерию в <subdir>/.claude/, а git запускает pre-commit из корня и там её не находил:
     коммит блокировался «цепочка не подтверждена», хотя все проходы были выполнены и отмечены,
-    и оператор шёл за LADDER_SKIP. Вне git-репо поведение прежнее (cwd)."""
-    try:
-        out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, check=True).stdout.strip()
-    except (subprocess.CalledProcessError, OSError):
-        return Path.cwd()
-    return Path(out) if out else Path.cwd()
+    и оператор шёл за LADDER_SKIP. Вне git-репо поведение прежнее (cwd).
+
+    Корень ищется доверенным bootstrap-git и обязан СОДЕРЖАТЬ cwd: голый `git rev-parse`
+    подменяется PATH-шимом на второй, чистый репозиторий, после чего все доверенные операции
+    добросовестно изучают ЧУЖОЙ корень, не находят staged-кода и выдают non-code освобождение
+    без аудита (находка ревью 09.08.2026). Если маркер `.git` рядом есть, а корень не
+    разрешился — падаем, а не откатываемся на cwd."""
+    cwd = Path.cwd().resolve()
+    r = _bootstrap_git("rev-parse", "--show-toplevel", cwd=cwd)
+    if r is None or r.returncode != 0 or not r.stdout.strip():
+        if _has_git_marker(cwd):
+            raise TrustedGitError("маркер .git есть, но корень репозитория не разрешился — "
+                                  "решения лесенки принимать не на чем")
+        return cwd
+    root = Path(r.stdout.strip()).resolve()
+    if root != cwd and root not in cwd.parents:
+        raise TrustedGitError(f"git выдал корень {root}, не содержащий текущий каталог {cwd} — "
+                              "похоже на подмену git; решения лесенки не принимаются")
+    return root
 
 # Правило одно на все проходы, поэтому печатается один раз, а не копией в каждой строке.
 _RUNNER_RULE = (
@@ -131,9 +150,8 @@ def _gate_config(root: Path) -> "dict | None":
 def _config_blob(root: Path, ref: str) -> "bytes | None":
     """Содержимое .codex-gate.yaml в index (ref='' → ':<path>') или коммите (ref='HEAD').
     None = файла там нет / git-сбой (консервативно «не совпало» у вызывающего)."""
-    r = subprocess.run(["git", "show", f"{ref}:{GATE_CONFIG_NAME}"], cwd=root,
-                       capture_output=True)
-    return r.stdout if r.returncode == 0 else None
+    r = _trusted_git("show", f"{ref}:{GATE_CONFIG_NAME}", cwd=root)
+    return r.stdout.encode() if (r is not None and r.returncode == 0) else None
 
 
 def _worktree_config_bytes(root: Path) -> "bytes | None":
@@ -183,20 +201,41 @@ def compute_tree(root: Path) -> str:
         tmp_index = Path(td) / "index"
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = str(tmp_index)
-        subprocess.run(["git", "add", "-A", "--", "."],
-                       cwd=root, env=env, check=True, capture_output=True)
-        subprocess.run(["git", "rm", "--cached", "--ignore-unmatch", "-q", "--",
-                        *_BOOKKEEPING_PATHS],
-                       cwd=root, env=env, check=True, capture_output=True)
-        r = subprocess.run(["git", "write-tree"], cwd=root, env=env, check=True,
-                           capture_output=True, text=True)
+        # `git add` ЗАПУСКАЕТ clean-фильтры репозитория (`.gitattributes`), поэтому дерево
+        # считалось бы от преобразованного содержимого, а не от того, что лежит на диске.
+        # Собираем индекс plumbing'ом: hash-object --no-filters + update-index --cacheinfo.
+        listing = _trusted_git("ls-files", "-c", "-o", "--exclude-standard", "-z", cwd=root)
+        if listing is None or listing.returncode != 0:
+            raise TrustedGitError("не перечислить файлы дерева — tree-хэш не посчитать")
+        skip = set(_BOOKKEEPING_PATHS)
+        for rel in listing.stdout.split("\0"):
+            if not rel or rel in skip:
+                continue
+            full = root / rel
+            if full.is_symlink():
+                mode = "120000"
+            elif full.is_file():
+                mode = "100755" if os.access(full, os.X_OK) else "100644"
+            else:
+                continue
+            h = _trusted_git("hash-object", "--no-filters", "-w", "--", rel, cwd=root)
+            if h is None or h.returncode != 0:
+                raise TrustedGitError(f"не посчитать хэш {rel!r} — tree-хэш не посчитать")
+            u = _git_mutate(root, env, "update-index", "--add", "--cacheinfo",
+                            f"{mode},{h.stdout.strip()},{rel}")
+            if u.returncode != 0:
+                raise TrustedGitError(f"update-index отверг {rel!r}")
+        r = _git_mutate(root, env, "write-tree")
+        if r.returncode != 0:
+            raise TrustedGitError("write-tree не удался — tree-хэш не посчитать")
         return r.stdout.strip()
 
 
 def index_tree(root: Path) -> str:
     """git write-tree РЕАЛЬНОГО индекса (для pre-commit — ровно то, что закоммитится)."""
-    r = subprocess.run(["git", "write-tree"], cwd=root, check=True,
-                       capture_output=True, text=True)
+    r = _git_mutate(root, None, "write-tree")
+    if r.returncode != 0:
+        raise TrustedGitError("write-tree реального индекса не удался")
     return r.stdout.strip()
 
 
@@ -317,9 +356,10 @@ def _audit_line(root: Path, msg: str) -> None:
 
 def changed_paths_staged(root: Path) -> list[str]:
     """Пути, застейдженные относительно HEAD (`git diff --cached --name-only`)."""
-    r = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=root, check=True,
-                       capture_output=True, text=True)
-    return [line for line in r.stdout.splitlines() if line]
+    # Голый git позволял шиму выйти нулём с ПУСТЫМ выводом: код-коммит выглядел
+    # не-кодовым, check_precommit возвращал 0 до проверки лесенки и без записи скипа.
+    out = _git_out(root, ["diff", "--cached", "--name-only"])
+    return [line for line in out.splitlines() if line]
 
 
 def commit_touches_code(paths: list[str]) -> bool:
@@ -404,8 +444,29 @@ def _write_ledger(root: Path, sha: str, payload: dict) -> None:
     tmp.replace(p)   # атомарная публикация
 
 
+def _git_mutate(root: Path, env: "dict | None", *args: str):
+    """Мутации индекса/дерева: абсолютный бинарь и санированное окружение, как в слое.
+    Отдельно от `_trusted_git`, потому что нуждается в GIT_INDEX_FILE."""
+    git = _trusted_git_bin()
+    if git is None:
+        raise TrustedGitError("доверенный git недоступен — индекс/дерево не построить")
+    base = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    base["HOME"] = str(_trusted_home())
+    base["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+    base.update(_GIT_SAFE_ENV)
+    if env and env.get("GIT_INDEX_FILE"):
+        base["GIT_INDEX_FILE"] = env["GIT_INDEX_FILE"]
+    return subprocess.run([git, *_GIT_NEUTRALIZE, *args], cwd=root,
+                          capture_output=True, text=True, env=base)
+
+
 def _git_out(root: Path, args: list[str]) -> str:
-    r = subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
+    """Все чтения лесенки — через доверенный слой. Голый git позволял шиму вернуть пустой
+    `rev-list baseline..HEAD`, и check_range одобрял диапазон без evidence и без аудита."""
+    r = _trusted_git(*args, cwd=root)
+    if r is None or r.returncode != 0:
+        raise TrustedGitError(f"доверенный git недоступен для {args[0]!r} — лесенка не может "
+                              "принять решение")
     return r.stdout.strip()
 
 
@@ -488,8 +549,14 @@ def _effective_epoch(root: Path) -> "str | None":
 
 
 def _is_ancestor(root: Path, sha: str, ancestor_of: str) -> bool:
-    r = subprocess.run(["git", "merge-base", "--is-ancestor", sha, ancestor_of],
-                       cwd=root, capture_output=True)
+    """Через доверенный слой и fail-closed. Голый `git` тут был прямым fail-open: при любом
+    заданном `ladder.epoch_sha` PATH-шим с exit 0 объявлял ЛЮБОЙ коммит древним, и все
+    непокрытые лесенкой коммиты молча получали освобождение (находка ревью 09.08.2026)."""
+    # Не через _git_out: exit 1 здесь — легитимный ответ «не предок», а не сбой.
+    r = _trusted_git("merge-base", "--is-ancestor", sha, ancestor_of, cwd=root)
+    if r is None or r.returncode not in (0, 1):
+        raise TrustedGitError("доверенный git недоступен — эпоху не проверить, освобождение "
+                              "не выдаётся")
     return r.returncode == 0
 
 

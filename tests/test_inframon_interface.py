@@ -2,6 +2,7 @@
 Ф1 authoritative baseline (B1-B12): pin секции deploy, no-fallback, env-переходы с аудитом.
 Ф2 вердикт деплой-гейта (V1-V8): delete-then-write под локом, скипы видимы."""
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,20 @@ def env(tmp_path, monkeypatch):
     # Эти тесты про запись вердикта, git им безразличен.
     monkeypatch.setattr(g, "git_head", lambda: HEAD_SHA)
     monkeypatch.setattr(g, "diff_sha256", lambda base, head=None: "d" * 64)
+    # ancestry теперь тоже идёт через доверенный слой (обход через шим закрыт), а REPO_ROOT
+    # здесь — не репозиторий: отвечаем успехом, эти тесты про запись вердикта
+    _real_tg = g._trusted_git
+    # baseline закрепляется в неизменяемый OID (подвижная ссылка не может быть границей
+    # ревью), поэтому `rev-parse ...^{commit}` тоже отвечаем сами: REPO_ROOT здесь не репозиторий.
+    def _tg(*a, **kw):
+        if a and a[0] == "merge-base":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if a and a[0] == "rev-parse" and str(a[-1]).endswith("^{commit}"):
+            return SimpleNamespace(returncode=0, stdout=str(a[-1])[:-len("^{commit}")] + "\n",
+                                   stderr="")
+        return _real_tg(*a, **kw)
+
+    monkeypatch.setattr(g, "_trusted_git", _tg)
     monkeypatch.setattr(g, "DEPLOY_PIN", tmp_path / ".deploy-section-pin")
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(g, "VERDICT_DIR", tmp_path / "verdicts")
@@ -46,7 +61,10 @@ def test_b1_env_only_used(env, monkeypatch):
 
 
 def test_b2_command_valid_sha_wins_over_file(env, monkeypatch):
-    sec = _sec(cmd=f"echo {H}")
+    adapter = env.parent / "b2-adapter"
+    adapter.write_text(f"#!/bin/sh\necho {H}\n")
+    adapter.chmod(0o755)
+    sec = _sec(cmd=str(adapter))
     _states(monkeypatch, ("enabled", sec))
     g._write_pin(g._deploy_section_hash(sec))                    # pin одобрен
     monkeypatch.setattr(g, "resolve_baseline", lambda: "stale-file-sha")
@@ -159,11 +177,86 @@ def test_removal_transition_via_env_audited(env, monkeypatch):
 
 def test_run_baseline_command_validation(env, monkeypatch):
     monkeypatch.setattr(g, "REPO_ROOT", env)
-    assert g._run_baseline_command(f"echo {H}", 10) == H
-    assert g._run_baseline_command(f"echo {H.upper()}", 10) == H   # регистр нормализуется
-    assert g._run_baseline_command("echo nope", 10) is None
-    assert g._run_baseline_command("false", 10) is None
+    # Адаптер — исполняемый файл ВНЕ репозитория, без аргументов (см. тест ниже).
+    adapter = env.parent / "adapter"
+    adapter.write_text(f"#!/bin/sh\necho {H}\n")
+    adapter.chmod(0o755)
+    assert g._run_baseline_command(str(adapter), 10) == H
+    adapter.write_text(f"#!/bin/sh\necho {H.upper()}\n")
+    assert g._run_baseline_command(str(adapter), 10) == H       # регистр нормализуется
+    adapter.write_text("#!/bin/sh\necho nope\n")
+    assert g._run_baseline_command(str(adapter), 10) is None
+    assert g._run_baseline_command("/usr/bin/false", 10) is None
     assert g._run_baseline_command("", 10) is None
+
+
+def test_baseline_command_form_is_closed(env, monkeypatch, capsys):
+    """Форма закрыта аллоулистом, а не проверками: РОВНО один абсолютный исполняемый файл вне
+    репозитория, без аргументов. Три раунда security-ревью подряд обходили лексические
+    проверки — последним шелл-пейлоадом, в котором ни один аргумент не похож на путь."""
+    monkeypatch.setattr(g, "REPO_ROOT", env)
+    (env / "ops").mkdir(parents=True, exist_ok=True)
+    script = env / "ops" / "deployed-sha"
+    script.write_text(f"#!/bin/sh\necho {H}\n")
+    script.chmod(0o755)
+
+    for cmd in ("/bin/sh ops/deployed-sha", f"/bin/sh {script}", f"/usr/bin/python3 {script}",
+                "/bin/sh -c 'cd \"$HOME\"; cd src; cd claude-gates; cd ops; sh deployed-sha'",
+                f"/bin/echo {H}"):
+        assert g._run_baseline_command(cmd, 10) is None, cmd
+        assert "РОВНО один аргумент" in capsys.readouterr().err, cmd
+
+    assert g._run_baseline_command("./ops/deployed-sha", 10) is None      # относительный
+    assert "АБСОЛЮТНЫМ" in capsys.readouterr().err
+    assert g._run_baseline_command(str(script), 10) is None               # внутри репозитория
+    assert "ВНУТРЬ проверяемого" in capsys.readouterr().err
+
+    # `/bin/sh` — валидный «один абсолютный файл без аргументов». С унаследованным stdin он
+    # становится диспетчером, а с cwd=каталог состояния — ещё и подделывает baseline-маркер.
+    import subprocess as _sp
+    state = env.parent / "state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setattr(g, "_gate_state_dir", lambda: state)
+    monkeypatch.setattr(g, "GATE_BASELINE", state / "review-baseline")
+    payload = f"printf %s {H} > review-baseline; printf %s {H}\n"
+    r, w = __import__("os").pipe()
+    __import__("os").write(w, payload.encode()); __import__("os").close(w)
+    old_stdin = _sp.sys.stdin if hasattr(_sp, "sys") else None
+    import os as _os
+    saved = _os.dup(0)
+    _os.dup2(r, 0)
+    try:
+        out = g._run_baseline_command("/bin/sh", 10)
+    finally:
+        _os.dup2(saved, 0); _os.close(saved); _os.close(r)
+    assert out is None, "шелл прочитал stdin и вернул подделанный baseline"
+    assert not (state / "review-baseline").exists(), "payload записал гейтовый маркер"
+
+    # cwd не должен выбираться вызывающим: `TemporaryDirectory()` уважает TMPDIR, и
+    # репозиторный Makefile ставил его внутрь репозитория — инструмент, ищущий конфиг вверх
+    # по дереву, подхватывал бы файл проверяемой стороны.
+    monkeypatch.setenv("TMPDIR", str(env))
+    probe = env.parent / "cwd-probe"
+    probe.write_text("#!/bin/sh\npwd\n")
+    probe.chmod(0o755)
+    monkeypatch.setattr(g.subprocess, "run", _sp.run)
+    seen = {}
+    real_run = _sp.run
+
+    def capture(argv, **kw):
+        seen["cwd"] = kw.get("cwd")
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(g.subprocess, "run", capture)
+    g._run_baseline_command(str(probe), 10)
+    assert seen["cwd"] == "/", f"cwd выбирается вызывающим: {seen['cwd']}"
+
+    # Симлинк ВНУТРИ репозитория, указывающий наружу: цель прошла бы проверку, а исполнялся
+    # бы изменяемый симлинк — значит отвергаем и по лексическому пути.
+    link = env / "gitshim"
+    link.symlink_to("/bin/echo")
+    assert g._run_baseline_command(str(link), 10) is None
+    assert "ВНУТРЬ проверяемого" in capsys.readouterr().err
 
 
 def test_section_hash_stable_ordering():
@@ -291,9 +384,13 @@ def test_b3_timeout_branch_really_times_out(env, monkeypatch):
     # code-R1 F3: подтверждаем вход именно в TimeoutExpired-ветку
     import subprocess as sp
     calls = {}
-    def fake_run(argv, cwd=None, capture_output=None, text=None, timeout=None):
+    def fake_run(argv, cwd=None, capture_output=None, text=None, timeout=None, env=None,
+                 stdin=None):
         calls["timeout"] = timeout
         raise sp.TimeoutExpired(argv, timeout)
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    assert g._run_baseline_command("sleep 5", 1) is None
+    sleeper = env.parent / "sleeper"
+    sleeper.write_text("#!/bin/sh\nsleep 5\n")
+    sleeper.chmod(0o755)
+    assert g._run_baseline_command(str(sleeper), 1) is None
     assert calls["timeout"] == 1                            # переданный baseline_timeout_s

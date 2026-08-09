@@ -5,9 +5,12 @@
 #   check-decision ПРЯМО перед выкаткой (rsync/push)
 #   запись .claude/.last-deployed-sha ТОЛЬКО после успешной пост-деплой верификации
 # NB: в Makefile каждый '$' шелла пишется как '$$'.
-# REVIEW_PROVIDER отсутствует → fail-closed `portable` (certified Gemini + mandatory Claude).
-# Временный explicit legacy: `REVIEW_PROVIDER=cursor make deploy` — слабее portable:
-# Cursor не аттестует actual model, Claude supplemental не запускается.
+# Панель ревьюеров — обязательная пара Codex+Claude; REVIEW_PROVIDER её НЕ понижает
+# (легаси-значения codex|cursor|both блокируют деплой). Аварийный выход — CODEX_REVIEW_SKIP=1.
+# ВАЖНО: выкатывать нужно АРТЕФАКТ из verify-deployable, а не рабочее дерево. Голые
+# `git rev-parse`/`git status` здесь не годятся: PATH-шим вернёт одобренный SHA и пустой
+# статус после подмены дерева. verify-deployable делает те же проверки доверенным git и
+# строит неизменяемый артефакт из отревьюенного коммита.
 
 setup-hooks:
 	@git config core.hooksPath .githooks
@@ -25,23 +28,49 @@ deploy: check-reviewed   # + твои проверки: check-committed test myp
 	fi; \
 	trap 'rmdir logs/.deploy.lock.d 2>/dev/null' EXIT; \
 	trap 'exit 130' INT TERM; \
-	REVIEWED_SHA=$$(git rev-parse HEAD); \
-	if [ ! -f .claude/.last-reviewed-sha ] || [ "$$REVIEWED_SHA" != "$$(cat .claude/.last-reviewed-sha)" ]; then \
-		echo "❌ HEAD ($$REVIEWED_SHA) != одобренного check-reviewed SHA — HEAD сдвинулся; прерываю"; \
+	ART=$$(bash .githooks/gates-run codex_review_gate.py verify-deployable) || exit 1; \
+	GATES_ARTIFACT=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT=//p'); \
+	REVIEWED_SHA=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT_HEAD=//p'); \
+	if [ -z "$$GATES_ARTIFACT" ] || [ -z "$$REVIEWED_SHA" ]; then \
+		echo "❌ verify-deployable не выдал артефакт — гарантия не действует, прерываю"; \
 		exit 1; \
 	fi; \
-	if [ -n "$$(git status --porcelain)" ] || [ "$$(git rev-parse HEAD)" != "$$REVIEWED_SHA" ]; then \
-		echo "❌ дерево изменилось после ревью (правка во время review) — прерываю до выкатки"; \
+	if ! bash .githooks/gates-run codex_review_gate.py check-decision --head "$$REVIEWED_SHA"; then \
+		echo "❌ решение ревью устарело либо HEAD сдвинулся после сборки артефакта — прерываю"; \
 		exit 1; \
 	fi; \
-	if ! bash .githooks/gates-run codex_review_gate.py check-decision; then \
-		echo "❌ решение ревью устарело (конкурентная находка/адъюдикация после allow) — прерываю"; \
+	ART_SHA=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT_SHA256=//p'); \
+	if ! bash .githooks/gates-run codex_review_gate.py check-artifact \
+			--artifact "$$GATES_ARTIFACT" --head "$$REVIEWED_SHA" --sha256 "$$ART_SHA"; then \
+		echo "❌ артефакт изменился после сборки — прерываю ДО выкатки"; \
 		exit 1; \
 	fi; \
-	echo "==> ЗДЕСЬ твоя выкатка (rsync/docker compose/ssh) и пост-деплой верификация"; \
-	echo "==> при УСПЕХЕ верификации зафиксируй baseline:"; \
-	printf '%s\n' "$$REVIEWED_SHA" > .claude/.last-deployed-sha; \
-	echo "==> baseline ревью обновлён: $$(cat .claude/.last-deployed-sha)"
+	$(MAKE) --no-print-directory deploy-payload GATES_ARTIFACT="$$GATES_ARTIFACT" || exit 1; \
+	$(MAKE) --no-print-directory verify-deployed GATES_ARTIFACT="$$GATES_ARTIFACT" \
+		GATES_HEAD="$$REVIEWED_SHA" GATES_ARTIFACT_SHA256="$$ART_SHA" || exit 1; \
+	bash .githooks/gates-run codex_review_gate.py finalize-deploy \
+		--artifact "$$GATES_ARTIFACT" --head "$$REVIEWED_SHA" --sha256 "$$ART_SHA" || exit 1; \
+	echo "✅ выкачен и проверен артефакт $$REVIEWED_SHA"
+
+# ── ОБЯЗАТЕЛЬНО переопредели оба таргета в своём Makefile ──────────────────────
+# Скелет НЕ выкатывает: пока они не заменены, `make deploy` ПАДАЕТ. Иначе цель
+# рапортовала бы успех и двигала baseline ревью на код, который никуда не уехал
+# (находка ревью 09.08.2026: команды были аргументами echo, а baseline всё равно сдвигался).
+# $(GATES_ARTIFACT) — tar, собранный ИЗ отревьюенного коммита, а не рабочее дерево.
+deploy-payload:
+	@echo "❌ deploy-payload не переопределён. Пример:"; \
+	echo "   deploy-payload:"; \
+	echo "   	mkdir -p build/payload && tar -xf \$$(GATES_ARTIFACT) -C build/payload"; \
+	echo "   	rsync -a --delete build/payload/ host:/srv/app/"; \
+	exit 1
+
+# $(GATES_HEAD) и $(GATES_ARTIFACT_SHA256) передаются сюда, чтобы healthcheck проверял
+# КОНКРЕТНУЮ версию на каждом хосте, а не «сервис вообще жив». Гейт правдивость этой проверки
+# не доказывает (остаток R-ACTUATOR-HANDOFF) — но baseline он двигает по СВОЕМУ evidence.
+verify-deployed:
+	@echo "❌ verify-deployed не переопределён: выкатку нельзя считать состоявшейся, не"; \
+	echo "   проверив версию $$(GATES_HEAD) на КАЖДОМ хосте (healthcheck)."; \
+	exit 1
 
 # Протокол сходимости (Фаза 1.6) — адъюдикация находок между раундами:
 #   bash .githooks/gates-run codex_review_gate.py findings

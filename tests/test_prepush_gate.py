@@ -501,7 +501,7 @@ def test_e2e_fetch_runs_once_for_two_refs(repo, monkeypatch):
     real = subprocess.run
 
     def spy(cmd, *a, **kw):
-        if isinstance(cmd, list) and cmd[:2] == ["git", "fetch"]:
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git") and "fetch" in cmd:
             calls.append(tuple(cmd))
         return real(cmd, *a, **kw)
 
@@ -596,7 +596,9 @@ def test_e2e_rev_list_failure_blocks(repo, monkeypatch, capsys):
     real = subprocess.run
 
     def spy(cmd, *a, **kw):
-        if isinstance(cmd, list) and cmd[:2] == ["git", "rev-list"]:
+        # слой зовёт АБСОЛЮТНЫЙ git с `-c`-флагами нейтрализации, поэтому подкоманду
+        # ищем в argv, а не по фиксированной позиции
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git") and "rev-list" in cmd:
             class R:
                 returncode, stdout, stderr = 128, "", "fatal: bad revision"
             return R()
@@ -653,17 +655,20 @@ def test_push_by_url_matching_configured_remote_is_resolved(repo):
     assert pg._resolve_remote_name(repo, url) == "origin"
 
 
-def test_hookless_env_appends_and_drops_inherited_parameters(monkeypatch):
-    """И6: `GIT_CONFIG_COUNT=1` поверх чужих записей терял внедрённый safe.directory, а
-    оставленный GIT_CONFIG_PARAMETERS пересиливал наш core.hooksPath."""
+def test_hookless_env_drops_every_inherited_git_config(monkeypatch, tmp_path):
+    """И6 + находка 09.08.2026: конфигурация checkout состоит ТОЛЬКО из наших записей.
+    Прежнее «дополняем чужие» сохраняло `safe.directory`, но заодно проносило в checkout
+    любой `filter.*.smudge` вызывающего — мимо перечисления драйверов, которое идёт через
+    доверенный слой. `safe.directory` теперь выставляем сами и только для своего корня."""
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "safe.directory")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/repo")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "filter.evil.smudge")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "sh -c 'touch /tmp/pwned'")
     monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/evil'")
-    with pg.hookless_env() as env:
-        assert env["GIT_CONFIG_COUNT"] == "2"
-        assert env["GIT_CONFIG_KEY_0"] == "safe.directory"     # чужая запись сохранена
-        assert env["GIT_CONFIG_KEY_1"] == "core.hooksPath"
+    with pg.hookless_env(tmp_path) as env:
+        keys = {env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+        assert keys == {"core.hooksPath", "safe.directory"}, keys
+        assert "filter.evil.smudge" not in keys
+        assert env["GIT_CONFIG_VALUE_1"] == str(tmp_path)
         assert "GIT_CONFIG_PARAMETERS" not in env
 
 
@@ -743,7 +748,7 @@ def test_git_calls_with_config_derived_refs_use_end_of_options(repo, monkeypatch
     real = subprocess.run
 
     def spy(cmd, *a, **kw):
-        if isinstance(cmd, list) and cmd[:1] == ["git"]:
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git"):
             seen.append(cmd)
         return real(cmd, *a, **kw)
 
@@ -751,6 +756,95 @@ def test_git_calls_with_config_derived_refs_use_end_of_options(repo, monkeypatch
     monkeypatch.setattr(pg.subprocess, "run", spy)
     _run(repo, feat)
     for name in ("fetch", "merge-tree", "rev-parse"):
-        calls = [c for c in seen if len(c) > 1 and c[1] == name]
+        calls = [c for c in seen if name in c]
         assert calls, f"вызов git {name} не состоялся — тест перестал проверять то, что заявляет"
         assert all("--end-of-options" in c for c in calls), f"git {name} без --end-of-options"
+
+
+# ── T16: пути исполнения при checkout (G18/G26/G27), проверка СЕНТИНЕЛОМ ─────────────────
+
+def _probe_with_trap(repo, arm_trap):
+    """Ловушка ставится ПОСЛЕ подготовки веток: иначе её срабатывание на служебных
+    `git checkout` самого теста читалось бы как исполнение внутри probe."""
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "app" / "f.py").write_text("x\n")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "feat")
+    head = _sha(repo)
+    _git(repo, "checkout", "-q", "main")
+    merged = pg.predict_merge(repo, base=_sha(repo), sha=head)
+    arm_trap()
+    with pg.probe_worktree(repo, base=_sha(repo), sha=head, tree=merged.tree):
+        pass
+
+
+def test_t16a_arbitrary_process_filter_never_executes(repo, tmp_path):
+    """Драйвер может называться КАК УГОДНО — имя приходит из `.gitattributes` проверяемой
+    стороны, поэтому гасить поимённо (как было с `filter.lfs.*`) бессмысленно."""
+    sentinel = tmp_path / "pwned"
+
+    def arm():
+        (repo / ".gitattributes").write_text("*.py filter=evil\n")
+        _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "attrs")
+        _git(repo, "config", "filter.evil.process", f"sh -c 'touch {sentinel}'")
+
+    with pytest.raises((RuntimeError, pg.TrustedGitError)):
+        _probe_with_trap(repo, arm)
+    assert not sentinel.exists(), "команда фильтра ИСПОЛНИЛАСЬ правами гейта"
+
+
+def test_t16b_clean_only_filter_keeps_probe_usable(repo):
+    """`clean` checkout не исполняет: блокировать по нему — отказ в функции без выигрыша в
+    безопасности. Гейт, который нельзя запустить на легитимном репозитории, выключают целиком."""
+    _probe_with_trap(repo, lambda: _git(repo, "config", "filter.lfs.clean", "cat"))
+
+
+def test_t16c_post_checkout_hook_never_executes(repo, tmp_path):
+    """Фильтры — не единственный путь исполнения: `worktree add` делает checkout и без
+    нейтрализации запустил бы хук репозитория правами гейта."""
+    sentinel = tmp_path / "hooked"
+
+    def arm():
+        hooks = repo / ".git" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        hook = hooks / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch {sentinel}\n")
+        hook.chmod(0o755)
+
+    _probe_with_trap(repo, arm)
+    assert not sentinel.exists(), "хук post-checkout исполнился правами гейта"
+
+
+def test_t16d_partial_clone_fails_closed(repo):
+    """Promisor тянет недостающие объекты ВНЕШНИМ transport-helper'ом — гасить нечем."""
+    with pytest.raises((RuntimeError, pg.TrustedGitError)):
+        _probe_with_trap(repo, lambda: _git(repo, "config", "extensions.partialClone", "origin"))
+
+
+def test_t16e_inherited_git_config_filter_never_reaches_checkout(repo, tmp_path, monkeypatch):
+    """Перечисление драйверов идёт через доверенный слой (он снимает GIT_CONFIG_* вызывающего),
+    а checkout раньше получал их дополнением — проверка видела пустоту, команда исполнялась."""
+    sentinel = tmp_path / "inherited-pwned"
+    (repo / ".gitattributes").write_text("*.py filter=evil\n")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "attrs")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "filter.evil.smudge")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", f"sh -c 'touch {sentinel}'")
+    _probe_with_trap(repo, lambda: None)
+    assert not sentinel.exists(), "GIT_CONFIG_* вызывающего доехал до checkout мимо проверки"
+
+
+def test_t16f_remote_uploadpack_is_not_executed_on_fetch(repo, tmp_path):
+    """URL-проверки мало: `remote.<name>.uploadpack` исполняется git'ом как КОМАНДА на
+    локальном транспорте. Воспроизведено ревью 09.08.2026 — гасим её, `vcs` и `core.gitProxy`."""
+    sentinel = tmp_path / "uploadpack-ran"
+    _git(repo, "config", "remote.origin.uploadpack", f"sh -c 'touch {sentinel}; false'")
+    pg._prepush_fetch(repo, "origin", "main", timeout=30)
+    assert not sentinel.exists(), "remote.uploadpack исполнился правами pre-push хука"
+
+
+def test_t16g_remote_vcs_transport_helper_is_rejected(repo):
+    """`remote.<name>.vcs` запускает внешний helper. Гасить пустым значением нельзя (git
+    начинает искать `git-remote-`), поэтому конфигурация отклоняется целиком."""
+    _git(repo, "config", "remote.origin.vcs", "evil")
+    with pytest.raises(pg.TrustedGitError):
+        pg._prepush_fetch(repo, "origin", "main", timeout=30)
