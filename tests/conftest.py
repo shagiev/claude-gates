@@ -61,8 +61,9 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # подменяют subprocess.run и опознают вызов по имени `git`, поэтому здесь _trusted_git
     # делегирует привычной форме — иначе пришлось бы переписывать все фейки, не проверяя
     # ничего нового. Сам хардненинг проверяется точечными тестами F19/F22.
-    monkeypatch.setattr(g, "_trusted_git", lambda *args: g.subprocess.run(
-        ["git", *args], cwd=g.REPO_ROOT, capture_output=True, text=True))
+    monkeypatch.setattr(g, "_trusted_git", lambda *args, cwd=None: g.subprocess.run(
+        ["git", *args], cwd=str(cwd) if cwd else g.REPO_ROOT,
+        capture_output=True, text=True))
     # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
     # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
     monkeypatch.setenv("REVIEW_PROVIDER", "portable")

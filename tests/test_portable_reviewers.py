@@ -1106,3 +1106,36 @@ def test_f19_head_resolution_uses_trusted_git(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     assert g.git_head() == "deadbeef"
     assert calls and calls[0][0] != "git", "HEAD резолвится голым git из PATH вызывающего"
+
+
+@pytest.mark.parametrize("bad", [None, "nonzero"])
+@pytest.mark.parametrize("fn", ["git_head", "diff_sha256", "working_tree_clean"])
+def test_f22_no_fallback_to_untrusted_git(monkeypatch, fn, bad):
+    """Ветки fail-closed F22 обязаны входиться тестом: восстановленный фолбэк на голый git
+    должен ЛОМАТЬ этот тест, иначе дыра вернётся незамеченной."""
+    def fake_trusted(*_a, **_kw):
+        if bad is None:
+            return None
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(g, "_trusted_git", fake_trusted)
+    monkeypatch.setattr(g.subprocess, "run",
+                        lambda *a, **k: pytest.fail("фолбэк на недоверенный git недопустим"))
+    with pytest.raises(g.TrustedGitError):
+        if fn == "git_head":
+            g.git_head()
+        elif fn == "diff_sha256":
+            g.diff_sha256("HEAD~1", "HEAD")
+        else:
+            g.working_tree_clean()
+
+
+def test_repo_root_discovery_rejects_root_not_containing_cwd(monkeypatch, tmp_path):
+    """Шим возвращал ЧУЖОЙ чистый корень, и весь закреплённый git работал не с тем деревом."""
+    other = tmp_path / "other-repo"
+    other.mkdir()
+    start = tmp_path / "work"
+    start.mkdir()
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=str(other) + "\n", stderr=""))
+    assert g._detect_repo_root(start) is None, "корень, не содержащий cwd, обязан отвергаться"

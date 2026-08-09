@@ -338,21 +338,83 @@ HARD_CODE_PATH_COMPONENTS = (
 _DEFAULT_HARD_CAP = 8
 
 
+_BOOTSTRAP_GIT_DIRS = ("/usr/local/bin/git", "/opt/homebrew/bin/git", "/usr/bin/git", "/bin/git")
+_BOOTSTRAP_ENV_ALLOW = ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+
+
+def _bootstrap_git(*args: str, cwd: "str | Path") -> "subprocess.CompletedProcess | None":
+    """git для стадии инициализации: слой ещё не определён, но правила те же — абсолютный
+    бинарь, аллоулист окружения (loader-переменные не доезжают), нейтрализованный конфиг."""
+    git = next((c for c in _BOOTSTRAP_GIT_DIRS
+                if os.path.isfile(c) and os.access(c, os.X_OK)), None)
+    if git is None:
+        return None
+    env = {k: v for k, v in os.environ.items() if k in _BOOTSTRAP_ENV_ALLOW}
+    env["HOME"] = os.path.expanduser("~")
+    env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        return subprocess.run([git, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                               "-c", "log.showSignature=false", "-c", "gpg.program=/nonexistent",
+                               *args],
+                              cwd=str(cwd), capture_output=True, text=True, env=env)
+    except OSError:
+        return None
+
+
+def _has_git_marker(start: Path) -> bool:
+    """Наличие репозитория доказывается ФАЙЛОВОЙ проверкой, а не кодом возврата git:
+    иначе «git недоступен» неотличимо от «мы не в репозитории», и хуки молча выключаются."""
+    try:
+        cur = start.resolve()
+    except OSError:
+        return False
+    for cand in (cur, *cur.parents):
+        if (cand / ".git").exists():
+            return True
+    return False
+
+
 def _detect_repo_root(cwd: "Path | None" = None) -> "Path | None":
     """git rev-parse --show-toplevel от cwd (скрипт живёт в кэше плагина — __file__ бесполезен).
     None = не git-репо/сбой git: хуки → exit 0, явные гейты → явная ошибка (fail-closed)."""
+    # Голый git тут подменял САМ РЕПОЗИТОРИЙ: шим возвращал чужой чистый корень, и весь
+    # дальнейший закреплённый git честно работал не с тем деревом — обход слоем глубже,
+    # чем подмена диапазона (находка ревью 08.08.2026).
+    # Bootstrap: разрешение корня происходит ДО определения остальных хелперов, поэтому
+    # доверенный git собирается здесь же — из фиксированных системных каталогов и с
+    # окружением без GIT_*-оверрайдов.
+    start = Path(cwd) if cwd is not None else Path.cwd()
+    git = None
+    for cand in ("/usr/local/bin/git", "/opt/homebrew/bin/git", "/usr/bin/git", "/bin/git"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            git = cand
+            break
+    if git is None:
+        return None
+    # Аллоулист, а не «всё кроме GIT_*»: LD_PRELOAD/DYLD_INSERT_LIBRARIES внедряют код в
+    # git с фиксированным путём и подделывают вывод ещё ДО того, как слой установлен.
+    env = {k: v for k, v in os.environ.items()
+           if k in ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")}
+    env["HOME"] = str(_trusted_home()) if "_trusted_home" in globals() else os.path.expanduser("~")
+    env["PATH"] = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
     try:
-        cmd = ["git"]
-        if cwd is not None:
-            cmd.extend(["-C", str(cwd)])
-        cmd.extend(["rev-parse", "--show-toplevel"])
-        r = subprocess.run(cmd,
-                           capture_output=True, text=True)
+        r = subprocess.run([git, "rev-parse", "--show-toplevel"], cwd=str(start),
+                           capture_output=True, text=True, env=env)
     except OSError:
         return None
     if r.returncode != 0 or not r.stdout.strip():
         return None
-    return Path(os.path.realpath(r.stdout.strip()))
+    root = Path(os.path.realpath(r.stdout.strip()))
+    try:                       # результат обязан СОДЕРЖАТЬ каталог, от которого искали
+        start.resolve().relative_to(root)
+    except (ValueError, OSError):
+        return None
+    return root
 
 
 def _onboarded(root: Path) -> bool:
@@ -360,9 +422,21 @@ def _onboarded(root: Path) -> bool:
     временное удаление worktree-файла не должно отключать хуки)."""
     if (root / GATE_CONFIG_NAME).exists():
         return True
-    r = subprocess.run(["git", "cat-file", "-e", f"HEAD:{GATE_CONFIG_NAME}"],
-                       cwd=root, capture_output=True)
-    return r.returncode == 0
+    # Голый `cat-file -e` через PATH вызывающего: шим возвращал ненулевой код, проект считался
+    # НЕ онбордженным, и хуки выходили 0 — тот самый opt-in fail-open, который HEAD-проверка
+    # и должна закрывать. Отсутствие доказывается УСПЕШНЫМ ls-tree с пустым выводом.
+    r = _bootstrap_git("ls-tree", "--name-only", "HEAD", "--", GATE_CONFIG_NAME, cwd=root)
+    if r is not None and r.returncode == 0:
+        return bool(r.stdout.strip())
+    # Репозиторий БЕЗ КОММИТОВ (свежий `git init`) — законное «не онбординат»: HEAD ещё не
+    # существует, но это не поломка. Отличаем по валидной символической ссылке при
+    # отсутствующем объекте; иначе (повреждение, нет бинаря) — «нечитаемо» → блокируем.
+    sym = _bootstrap_git("symbolic-ref", "-q", "HEAD", cwd=root)
+    ver = _bootstrap_git("rev-parse", "--verify", "-q", "HEAD", cwd=root)
+    if (sym is not None and sym.returncode == 0
+            and ver is not None and ver.returncode != 0):
+        return False                      # unborn-not-onboarded: хуки не вмешиваются
+    return True                           # unreadable: считаем онбордженным и блокируем
 
 
 def _read_gate_config(root: Path) -> "dict | None":
@@ -785,6 +859,10 @@ def diff_sha256(base: str, head: str = "HEAD") -> str:
 
 
 def working_tree_clean() -> bool:
+    _r = _trusted_git("status", "--porcelain")
+    if _r is None or _r.returncode != 0:
+        raise TrustedGitError("доверенный git недоступен — чистоту дерева не проверить")
+    return not _r.stdout.strip()
     out = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True,
                          check=True).stdout
     return out.strip() == ""
@@ -2322,12 +2400,23 @@ def _trusted_git_bin() -> "str | None":
 #: Переменные, которыми git подменяет ВЫВОД, не трогая ни бинарь, ни репозиторий:
 #: внешний diff-драйвер/textconv может выйти нулём без вывода, и оба обязательных ревьюера
 #: получат пустой «чистый» дифф. Плюс подмена конфигов и путей.
-_GIT_OVERRIDE_PREFIXES = ("GIT_",)
+_GIT_ENV_ALLOW = ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+#: `-c`-флаги, снимающие исполняемые и подсказывающие пути локального конфига
+_GIT_NEUTRALIZE = tuple(x for pair in (
+    ("-c", "log.showSignature=false"), ("-c", "gpg.program=/nonexistent"),
+    ("-c", "gpg.ssh.program=/nonexistent"), ("-c", "core.pager=cat"),
+    ("-c", "core.editor=/nonexistent"), ("-c", "core.sshCommand=/nonexistent"),
+    ("-c", "core.askPass=/nonexistent"), ("-c", "credential.helper="),
+    ("-c", "diff.external="), ("-c", "core.fsmonitor=false"),
+    ("-c", "core.hooksPath=/dev/null"), ("-c", "protocol.allow=never"),
+) for x in pair)
 _GIT_SAFE_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                 "GIT_NO_REPLACE_OBJECTS": "1",
                  "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
 
-def _trusted_git(*args: str) -> "subprocess.CompletedProcess | None":
+def _trusted_git(*args: str, cwd: "str | Path | None" = None
+                 ) -> "subprocess.CompletedProcess | None":
     """git из доверенного каталога, в санированном окружении и без внешних diff-драйверов.
 
     Закрепить один бинарь мало: `GIT_EXTERNAL_DIFF`/`diff.external` подменяют ВЫВОД, а голый
@@ -2337,13 +2426,18 @@ def _trusted_git(*args: str) -> "subprocess.CompletedProcess | None":
     git = _trusted_git_bin()
     if git is None:
         return None
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(_GIT_OVERRIDE_PREFIXES)}
+    # Аллоулист (тот же, что в bootstrap): денилист «всё кроме GIT_*» пропускал loader-инъекции
+    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+    env["HOME"] = str(_trusted_home())
     env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
     env.update(_GIT_SAFE_ENV)
     try:
-        return subprocess.run([git, *args], cwd=REPO_ROOT, capture_output=True, text=True,
-                              env=env)
+        # Локальный .git/config отключить нельзя — он часть репозитория. Исполняемые пути
+        # нейтрализуются явно: иначе `log.showSignature` + `gpg.program` запускают код
+        # репозитория ПРАВАМИ ГЕЙТА, а fsmonitor подсовывает устаревший stat-кэш.
+        return subprocess.run([git, *_GIT_NEUTRALIZE, *args],
+                              cwd=str(cwd) if cwd else REPO_ROOT,
+                              capture_output=True, text=True, env=env)
     except OSError:
         return None
 
