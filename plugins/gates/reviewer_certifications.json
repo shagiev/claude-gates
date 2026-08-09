@@ -73,6 +73,22 @@
       "certification_id": "cursor-grok-4.5-high-candidate-20260730",
       "status": "candidate",
       "attestation": "declared"
+    },
+    {
+      "provider": "claude",
+      "adapter": "claude-cli",
+      "requested_model": "fable",
+      "actual_models": [
+        "claude-fable-5"
+      ],
+      "family": "anthropic",
+      "roles": [
+        "arbiter"
+      ],
+      "certification_id": "claude-fable-5-arbiter-20260809",
+      "status": "candidate",
+      "attestation": "verified",
+      "note": "candidate до прогона сертификации на арбитражном корпусе: роль arbiter требует verified-аттестации, а `reviewer_certification` без allow_candidate candidate не отдаёт — значит арбитр НЕ вызывается и находки остаются открытыми (fail-closed)."
     }
   ]
 }

@@ -538,16 +538,16 @@ def _set_hook_repo_context(root: Path) -> None:
     AUDIT_LOG = REPO_ROOT / "logs" / "codex_review_audit.log"
     DESIGN_MARKER = REPO_ROOT / ".claude" / ".design-approved"
     ledger_override = os.environ.get("CODEX_LEDGER_DIR")
-    LEDGER_DIR = Path(ledger_override) if ledger_override else REPO_ROOT / "logs" / "review_ledger"
+    LEDGER_DIR = _state_override("CODEX_LEDGER_DIR", _gate_state_dir() / "review_ledger")
     LAST_DEPLOYED = REPO_ROOT / ".claude" / ".last-deployed-sha"
     LAST_REVIEWED = REPO_ROOT / ".claude" / ".last-reviewed-sha"
     DEPLOY_PIN = _gate_state_dir() / "deploy-section-pin"
     findings_override = os.environ.get("CODEX_FINDINGS_DIR")
-    FINDINGS_DIR = (Path(findings_override) if findings_override
-                    else REPO_ROOT / "logs" / "review_findings")
-    verdict_override = os.environ.get("CODEX_VERDICT_DIR")
-    VERDICT_DIR = (Path(verdict_override) if verdict_override
-                   else REPO_ROOT / "logs" / "review_verdicts")
+    FINDINGS_DIR = _state_override("CODEX_FINDINGS_DIR",
+                                   _gate_state_dir() / "review_findings")
+    # VERDICT_DIR — машиночитаемый вердикт для внешнего guard'а (inframon), а не вход решения
+    # гейта, поэтому дефолт остаётся в репозитории. Но оверрайд валидируется тем же правилом.
+    VERDICT_DIR = _state_override("CODEX_VERDICT_DIR", REPO_ROOT / "logs" / "review_verdicts")
 
 
 def _refresh_hook_repo_context(data: dict) -> "Path | None":
@@ -715,12 +715,58 @@ def _trusted_node_bin() -> "str | None":
     return None
 
 
-def _inside_repo(path: Path) -> bool:
-    try:
-        path.resolve().relative_to(Path(REPO_ROOT).resolve())
-        return True
-    except (ValueError, OSError):
+def _inside_repo(path: "Path | None", root: "Path | None" = None) -> bool:
+    """Указывает ли путь ВНУТРЬ репозитория — по идентичности ФС, а не по тексту.
+
+    Лексическое сравнение промахивается на регистронезависимой ФС (macOS): путь
+    `/USERS/.../claude-gates/logs` резолвится, сохраняя регистр, и ни `==`, ни `in parents`
+    не совпадают с `/Users/.../claude-gates`, хотя `os.path.samefile` подтверждает тот же
+    каталог (security-проход 09.08.2026). Несуществующий хвост сверяем по ближайшему
+    существующему предку. Любая ошибка → True (fail closed)."""
+    base = root or REPO_ROOT
+    if path is None or base is None:
         return False
+    try:
+        # ⚠️ Сам путь НЕ резолвим: симлинк ВНУТРИ репозитория, указывающий наружу, потерял бы
+        # свой лексический путь и прошёл бы проверку, а исполнялся бы изменяемый симлинк.
+        # Кому нужна и цель — передаёт её ОТДЕЛЬНЫМ вызовом (так делает _run_baseline_command).
+        base_r = Path(base).resolve()
+        probe = Path(path)
+        while not probe.exists():
+            if probe.parent == probe:
+                return True                   # дошли до корня ФС, ничего не существует
+            probe = probe.parent
+        if os.path.samefile(probe, base_r):
+            return True
+        for anc in probe.parents:
+            if os.path.samefile(anc, base_r):
+                return True
+            if anc.parent == anc:
+                break
+    except (OSError, ValueError):
+        return True                           # непонятный путь — считаем внутренним
+    return False
+
+
+def trusted_companion_candidates(paths: "list[str]") -> "list[str]":
+    """Кандидаты на роль companion для СЕРТИФИЦИРОВАННОГО прогона: ни лексический путь, ни
+    цель симлинка не внутри ревьюируемого репозитория; возвращается РЕЗОЛВНУТЫЙ файл.
+
+    `_inside_repo` намеренно не резолвит аргумент (иначе терялся бы лексический путь
+    симлинка), поэтому проверяем ОБА: симлинк в кэше, указывающий на скрипт внутри
+    ревьюируемого дерева, иначе поставлял бы проверяемому коду его собственного
+    проверяющего (регрессия, найденная security-раундом 4)."""
+    out = []
+    for m in paths:
+        cand = Path(m)
+        try:
+            real = cand.resolve(strict=True)
+        except OSError:
+            continue
+        if _inside_repo(cand) or _inside_repo(real) or not real.is_file():
+            continue
+        out.append(str(real))
+    return out
 
 
 def resolve_companion_cmd(*, allow_env_override: bool = True) -> list[str]:
@@ -749,7 +795,7 @@ def resolve_companion_cmd(*, allow_env_override: bool = True) -> list[str]:
     matches = sorted(glob.glob(str(
         home / ".claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
     if not allow_env_override:
-        matches = [m for m in matches if not _inside_repo(Path(m))]
+        matches = trusted_companion_candidates(matches)
     if not matches:
         raise FileNotFoundError("codex-companion.mjs не найден (установлен ли плагин openai-codex?)")
     if allow_env_override:
@@ -932,18 +978,6 @@ def audit(msg: str) -> None:
         f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
 
 
-# LEDGER_DIR перекрывается env CODEX_LEDGER_DIR (изоляция subprocess-тестов make check-reviewed)
-_ledger_env = os.environ.get("CODEX_LEDGER_DIR")
-LEDGER_DIR = Path(_ledger_env) if _ledger_env else (
-    (REPO_ROOT / "logs" / "review_ledger") if REPO_ROOT else None)
-LAST_DEPLOYED = (REPO_ROOT / ".claude" / ".last-deployed-sha") if REPO_ROOT else None
-LAST_REVIEWED = (REPO_ROOT / ".claude" / ".last-reviewed-sha") if REPO_ROOT else None   # SHA, одобренный check-reviewed
-
-
-#: Семейства обязательной blocking-пары (§3 дизайна панели): Codex/openai + Claude/anthropic.
-#: Baseline ревью двигается, только когда обе семьи реально отработали по этому head.
-MANDATORY_PANEL_FAMILIES = ("openai", "anthropic")
-
 def _gate_state_dir() -> "Path | None":
     """Состояние гейта живёт ВНЕ проверяемого репозитория.
 
@@ -971,13 +1005,54 @@ def _gate_state_dir() -> "Path | None":
     # которой состояние и выносили (security-проход 09.08.2026). Молча выбирать другое
     # место нельзя: оно тоже было бы под контролем репозитория. Падаем закрыто.
     root = REPO_ROOT.resolve()
-    if state == root or root in state.parents:
+    if _inside_repo(state, root):
         raise TrustedGitError(
             f"состояние гейта ({state}) оказалось внутри проверяемого репозитория ({root}): "
             "решения о покрытии ревью нельзя принимать по файлу, которым управляет "
             "проверяемая сторона. Вынеси репозиторий из домашнего каталога.")
     return state
 
+
+def _state_override(name: str, default: "Path | None") -> "Path | None":
+    """Env-оверрайд каталога состояния — только ВНЕ проверяемого репозитория.
+
+    Оверрайды существуют для изоляции тестов, но принимались буквально: вызов мог указать
+    их обратно в игнорируемый `logs/`, и репозиторий снова писал бы кэш ревью и записи
+    арбитра, то есть evidence собственной невиновности (security-проход 09.08.2026).
+    Внутрирепозиторный путь → падаем громко, а не тихо игнорируем: тихий откат на дефолт
+    скрыл бы от оператора, что его изоляция не действует."""
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return default
+    path = Path(raw).expanduser()
+    if REPO_ROOT is not None:
+        root = REPO_ROOT.resolve()
+        try:
+            real = path.resolve()
+        except (OSError, ValueError):
+            raise TrustedGitError(f"{name}={raw!r} не резолвится")
+        if not path.is_absolute() or _inside_repo(path, root) or _inside_repo(real, root):
+            raise TrustedGitError(
+                f"{name}={raw!r} указывает внутрь проверяемого репозитория: состояние ревью "
+                "нельзя доверять стороне, чей код проверяют")
+        return real          # канонический путь, а не симлинк: цель можно переставить потом
+    return path
+
+
+# LEDGER_DIR перекрывается env CODEX_LEDGER_DIR (изоляция subprocess-тестов make check-reviewed)
+# ⛔ ВНЕ репозитория. `logs/` игнорируется git'ом, поэтому проверка чистоты дерева его не
+# видит: подброшенный ledger давал `allow` без ревьюеров, а теперь ещё и нёс бы записи
+# арбитра и фактическую панель серии — то есть недоверенная сторона писала бы evidence
+# собственной невиновности (security-проход по арбитру 09.08.2026).
+LEDGER_DIR = _state_override(
+    "CODEX_LEDGER_DIR", (_gate_state_dir() / "review_ledger") if REPO_ROOT else None)
+LAST_DEPLOYED = (REPO_ROOT / ".claude" / ".last-deployed-sha") if REPO_ROOT else None
+LAST_REVIEWED = (REPO_ROOT / ".claude" / ".last-reviewed-sha") if REPO_ROOT else None   # SHA, одобренный check-reviewed
+
+
+#: Семейства обязательной blocking-пары (§3 дизайна панели): Codex/openai + Claude/anthropic.
+#: Baseline ревью двигается, только когда обе семьи реально отработали по этому head.
+MANDATORY_PANEL_FAMILIES = ("openai", "anthropic")
 
 #: baseline ревью, принадлежащий ГЕЙТУ, — вне рабочего дерева (см. `_gate_state_dir`).
 GATE_BASELINE = (_gate_state_dir() / "review-baseline") if REPO_ROOT else None
@@ -1135,7 +1210,7 @@ def read_valid_ledger(head_sha: str, diff_sha: str,
                     return None
                 role = r.get("role")
                 cert_id = r.get("certification_id")
-                if role in {"blocking", "supplemental"} and cert_id:
+                if role in {"blocking", "supplemental", "arbiter"} and cert_id:
                     policy_id, _certs = load_reviewer_certifications()
                     requested_model = r.get("requested_model")
                     if (not policy_id or r.get("policy_id") != policy_id
@@ -1174,10 +1249,73 @@ def _ladder_check(baseline: str) -> int:
 
 # CODEX_FINDINGS_DIR — изоляция make-субпроцесс-тестов (инцидент: block-стаб тест писал
 # находку фикстуры в БОЕВУЮ серию и архивировал её — тот же класс, что CODEX_LEDGER_DIR)
-_findings_env = os.environ.get("CODEX_FINDINGS_DIR")
-FINDINGS_DIR = Path(_findings_env) if _findings_env else (
-    (REPO_ROOT / "logs" / "review_findings") if REPO_ROOT else None)
-ADJ_STATUSES = {"fixed", "residual-failsafe", "refuted", "resolved-by-user", "open"}
+FINDINGS_DIR = _state_override(                                       # ВНЕ репозитория
+    "CODEX_FINDINGS_DIR", (_gate_state_dir() / "review_findings") if REPO_ROOT else None)
+ADJ_STATUSES = {"fixed", "residual-failsafe", "refuted", "resolved-by-user",
+                "resolved-by-arbiter", "open"}
+
+#: Единственный класс, где вердикт арбитра ТЕРМИНАЛЕН. Критерий допуска ровно один и он
+#: механический: исходный блокер остаётся активным при ЛЮБОМ вердикте арбитра, то есть
+#: безопасность не зависит от правильности классификации. `duplicate` ему удовлетворяет —
+#: блокирует оригинал; `fail-safe-overblock` НЕ удовлетворяет (снимается сам блокер, и всё
+#: держится на верности метки), поэтому он в ярусе предложений (дизайн §2.1, ред. 5).
+ARBITER_TERMINAL_CLASSES = ("duplicate",)
+
+#: Категории, где решение принадлежит человеку по существу, а не по удобству. Глобальное
+#: правило оператора («актуаторы и прод-мутации — с человеком в петле») сильнее любой
+#: экономии раундов.
+ARBITER_FORBIDDEN_CATEGORIES = ("money", "actuator", "destructive", "product", "threat-model")
+
+#: Классы яруса ПРЕДЛОЖЕНИЙ — тоже аллоулист. Ошибка отнесения сюда безвредна (закрыть
+#: находку в одиночку арбитр не может), но звать арбитра по неизвестно чему всё равно нельзя:
+#: категорию ставит ревьюер, и её отсутствие ничего не доказывает.
+ARBITER_PROPOSAL_CATEGORIES = ("fail-safe-overblock", "severity-calibration",
+                               "branch-existence")
+
+
+def provider_family(provider: str) -> str:
+    """Семейство по ИМЕНИ ПРОВАЙДЕРА (в находке хранится оно, а не имя модели).
+    Неизвестный провайдер → `unknown`, и это лишает вердикт арбитра терминальности:
+    неизвестная провенанс-цепочка не может давать право снимать чужую блокирующую находку."""
+    _policy, certs = load_reviewer_certifications()
+    for c in certs or ():
+        if c.provider == provider and c.family:
+            return c.family
+    return model_family(provider)
+
+
+def arbitrability(finding: dict) -> "tuple[str, str]":
+    """('terminal'|'proposal'|'human', причина).
+
+    Классифицирует ГЕЙТ по полям находки, а не сам арбитр: арбитр, решающий, что ему можно
+    решать, — это отсутствие ограничения. Отсутствие money-признаков НИКОГДА не трактуется
+    как доказательство их отсутствия: строгий список нужен только для терминального яруса,
+    а ярус предложений безопасен по построению (закрыть находку в одиночку там нельзя).
+    """
+    sev = str(finding.get("severity") or "").strip().casefold()
+    if sev not in KNOWN_SEVERITIES:
+        return ("human", f"severity {sev!r} не распознан — решает человек")
+    if sev == "critical":
+        return ("human", "critical решает человек")
+    cat = str(finding.get("category") or "").strip().casefold()
+    if cat in ARBITER_FORBIDDEN_CATEGORIES:
+        return ("human", f"категория {cat} — решение человека")
+    # Класс определяется по ТОЙ ЖЕ константе, что документирует правило: иначе список и
+    # поведение разъедутся, и «терминален только duplicate» останется лишь в комментарии.
+    if ("duplicate" in ARBITER_TERMINAL_CLASSES
+            and (finding.get("status") == "duplicate" or finding.get("dup_of"))):
+        return ("terminal", "duplicate: исходный блокер остаётся активным при любом вердикте")
+    # Аллоулист, а не дефолт: находка БЕЗ распознанной категории — «неизвестно», а не
+    # «безопасно». Ревьюер, недооценивший money-поверхность, метку не поставит, и дефолтный
+    # «proposal» звал бы арбитра по денежному вопросу (находка код-ревью 09.08.2026).
+    if cat in ARBITER_PROPOSAL_CATEGORIES:
+        return ("proposal", f"класс {cat}: вердикт становится предложением автору находки")
+    return ("human", "категория не распознана — арбитрабельность не доказана, решает человек")
+#: ⛔ Канала `ARB-OK` НЕТ. Он был: ревьюер подтверждал предложение арбитра строкой в своём
+#: ответе. Но ответ ревьюера порождён НЕДОВЕРЕННЫМ диффом, и инъекция в нём может заставить
+#: ревьюера выдать подтверждение — авторизация, переносимая по такому каналу, не авторизация
+#: (security-проход 09.08.2026). Предложение арбитра теперь принимает ЧЕЛОВЕК: разбор уже
+#: написан, от него нужно одно слово, а не собственное расследование.
 _PREFIX_RE = re.compile(r"^\[(DUP|DISPUTE):(F\d+)\]\s*(.*)$", re.IGNORECASE)
 
 
@@ -1228,7 +1366,8 @@ def load_findings_ledger(baseline: "str | None") -> "dict | None":
             or not (isinstance(led.get("baseline"), str) and led.get("baseline")):
         return None   # серия без baseline — сирота, применялась бы к любому деплою (спор F7-3)
     _VALID_STATUSES = ADJ_STATUSES | {"duplicate", "carried"}
-    _ADJUDICATED = {"fixed", "residual-failsafe", "refuted", "resolved-by-user"}
+    _ADJUDICATED = {"fixed", "residual-failsafe", "refuted", "resolved-by-user",
+                    "resolved-by-arbiter"}
     for f in led.get("findings", {}).values():
         if not isinstance(f, dict) or not isinstance(f.get("severity"), str) \
                 or f.get("status") not in _VALID_STATUSES:
@@ -1236,6 +1375,18 @@ def load_findings_ledger(baseline: "str | None") -> "dict | None":
         if f.get("status") in _ADJUDICATED and not (
                 isinstance(f.get("reason"), str) and f["reason"].strip()):
             return None   # адъюдикация без причины = обход аудита рукой в файле (спор F7-4)
+        if f.get("status") == "resolved-by-arbiter" and not (
+                (f.get("arbiter_verdict") == "duplicate-terminal"
+                 and isinstance(f.get("dup_of"), str) and f["dup_of"]
+                 and isinstance(f.get("arbiter_model"), str) and f["arbiter_model"])
+                or (f.get("arbiter_verdict") == "proposal-confirmed"
+                    and f.get("confirmed_by") == "operator"
+                    and isinstance(f.get("arbiter_proposal"), str) and f["arbiter_proposal"]
+                    and isinstance(f.get("arbiter_model"), str) and f["arbiter_model"])):
+            # Неполная запись не попадала бы ни в `opens`, ни под графовую проверку (та
+            # выбирала записи по НЕОБЯЗАТЕЛЬНОМУ маркеру) — и серия отдавала бы `allow` без
+            # открытого корня. Схема терминальной записи обязательна целиком.
+            return None
     if baseline and led.get("baseline") and led["baseline"] != baseline:
         arch = FINDINGS_DIR / "archive"
         arch.mkdir(parents=True, exist_ok=True)
@@ -1458,6 +1609,19 @@ def adjudicate(led: dict, fid: str, status: str, reason: str,
     import time as _time
     led["last_adj_ts"] = _time.time()
     led["needs_review_round"] = True   # Codex должен УВИДЕТЬ адъюдикацию (спор F3-2: кэш
+    if status == "resolved-by-arbiter":
+        # Предложение арбитра принимает ЧЕЛОВЕК: канал ревьюера форжится инъекцией в диффе.
+        # Выигрыш остаётся — разбор уже написан, от человека нужно решение, а не расследование.
+        if not f.get("arbiter_proposal"):
+            raise AdjudicationError(
+                f"{fid}: нет предложения арбитра — статус `resolved-by-arbiter` принимается "
+                "только как принятие уже вынесенного предложения (см. `arbitrate`)")
+        if not operator_confirmed:
+            raise AdjudicationError(
+                "принятие предложения арбитра — решение ЧЕЛОВЕКА. Подтверди явно:\n"
+                f"  adjudicate {fid} resolved-by-arbiter --operator-confirmed \"причина\"")
+        f["arbiter_verdict"] = "proposal-confirmed"
+        f["confirmed_by"] = "operator"
     if status == "resolved-by-user":
         how = "tty" if sys.stdin.isatty() else "operator-confirmed-flag"
         audit(f"HUMAN-APPROVAL {fid} [{f.get('severity')}] session={_env_session()} via={how} "
@@ -1493,9 +1657,78 @@ def apply_carry_over(led: dict) -> "list[str]":
     return carried
 
 
+def reconcile_arbiter_duplicates(led: dict) -> "tuple[bool, str]":
+    """Проверка + ПОЧИНКА инварианта дубликатов, сохраняемая на диск.
+
+    `convergence_decision` чинил запись только в памяти, а вызывающие сохраняли ledger ДО
+    него или не сохраняли вовсе: серия блокировалась безопасно, но на диске оставалась
+    терминально закрытой, и каждый следующий прогон повторял и снова терял починку —
+    штатная адъюдикация не сходилась (security-раунд 4)."""
+    ok, why = _arbiter_duplicates_ok(led.get("findings") or {})
+    if not ok:
+        _reopen_arbiter_duplicates(led.get("findings") or {}, why)
+        save_findings_ledger(led)
+    return (ok, why)
+
+
+def _reopen_arbiter_duplicates(fnd: dict, why: str) -> None:
+    """Переоткрывает ТОЛЬКО записи с невалидной СВОЕЙ цепочкой. Раньше одна битая пара
+    переоткрывала все терминальные дубликаты подряд, разрушая ещё живые связи и порождая
+    лишние блокирующие находки (находка финального код-ревью 09.08.2026)."""
+    for k, f in fnd.items():
+        if f.get("arbiter_verdict") != "duplicate-terminal":
+            continue
+        root = _dup_root(fnd, k)
+        if root is not None and root != k:
+            rf = fnd.get(root) or {}
+            if rf.get("status") == "open" and rf.get("severity") in SEVERITY_BLOCKING:
+                continue                     # эта связь жива — не трогаем
+        f["status"] = "open"
+        f["reason"] = f"переоткрыта: {why}"
+        # Активную связь надо ПОГАСИТЬ, иначе следующая проверка снова увидит маркер и снова
+        # переоткроет находку, а повторная арбитрация запрещена этим же маркером — серия не
+        # сходилась бы ничем, кроме правки ledger руками. Решение сохраняем в истории.
+        f.setdefault("arbiter_history", []).append({
+            "verdict": f.pop("arbiter_verdict"),
+            "model": f.get("arbiter_model", ""),
+            "dup_of": f.get("dup_of", ""),
+            "reopened_because": why,
+        })
+        f.pop("dup_of", None)
+
+
+def _arbiter_duplicates_ok(fnd: dict) -> "tuple[bool, str]":
+    """Каждая терминально закрытая арбитром `duplicate` обязана ПРЯМО СЕЙЧАС вести по
+    ациклической цепочке к ОТКРЫТОМУ блокирующему корню.
+
+    Разовой проверки в момент арбитрации мало: арбитр мог ошибочно связать F1 с несвязанной
+    F2, и после штатного закрытия F2 дефект F1 остался бы вообще без блокера (находка ревью
+    ред. 4). Поэтому инвариант перепроверяется перед каждым `allow`."""
+    for k, f in fnd.items():
+        # Отбор по СТАТУСУ: маркер `arbiter_verdict` необязателен, и запись без него
+        # проскакивала бы мимо проверки, оставаясь закрытой (находка код-ревью 09.08.2026).
+        # Форма записи обязательна по схеме загрузчика, поэтому отбор по verdict здесь
+        # безопасен: запись без него ledger просто не пройдёт.
+        if f.get("arbiter_verdict") != "duplicate-terminal":
+            continue
+        root = _dup_root(fnd, k)
+        if root is None or root == k:
+            return (False, f"{k}: ссылка дубликата битая, циклическая или на себя")
+        rf = fnd.get(root) or {}
+        if rf.get("status") != "open" or rf.get("severity") not in SEVERITY_BLOCKING:
+            return (False, f"{k}: корень {root} больше не открыт и не блокирует — находка "
+                           "переоткрывается")
+    return (True, "")
+
+
 def convergence_decision(led: dict) -> "tuple[str, str]":
     """('allow'|'block'|'escalate', message) — машинное правило спеки §4."""
     fnd = led.get("findings") or {}
+    ok_dup, why_dup = _arbiter_duplicates_ok(fnd)
+    if not ok_dup:
+        _reopen_arbiter_duplicates(fnd, why_dup)   # починка в памяти; персист — reconcile_*
+        return ("block", f"[codex-gate] ✗ инвариант дубликатов арбитра нарушен ({why_dup}). "
+                         "Зависимые находки переоткрыты — адъюдицируй заново.")
     opens = {k: f for k, f in fnd.items() if f.get("status") == "open"}
     for k, f in fnd.items():
         d = int(f.get("disputes") or 0)
@@ -1548,12 +1781,26 @@ def _adjudication_prompt_block() -> str:
         return ""
     lines = []
     for k, f in sorted(led["findings"].items()):
-        if f.get("status") in ("residual-failsafe", "refuted", "fixed", "resolved-by-user"):
+        if f.get("status") in ("residual-failsafe", "refuted", "fixed", "resolved-by-user",
+                               "resolved-by-arbiter"):
             lines.append(f"{k} [{f.get('severity')}] «{f.get('title', '')[:80]}» → "
                          f"{f['status']}: {f.get('reason', '')[:120]}")
+    # Предложения арбитра — отдельный блок: автор находки обязан ЯВНО согласиться или нет,
+    # иначе «предложение» ничем не отличалось бы от тихого закрытия (дизайн §2.3, правило 2).
+    proposals = [f"{k} [{f.get('severity')}] «{f.get('title', '')[:80]}» → ARBITER PROPOSES "
+                 f"{f['arbiter_proposal']}"
+                 for k, f in sorted((led.get("findings") or {}).items())
+                 if f.get("arbiter_proposal") and f.get("status") == "open"]
+    prop_block = (
+        " ARBITER PROPOSALS awaiting YOUR confirmation (a neutral third model reviewed these "
+        "findings blind): " + " | ".join(proposals) +
+        ". These proposals are ADVISORY and are decided by a human, not by you — you cannot "
+        "close them. If you still consider a finding valid, report it again with the SAME title "
+        "and new reasoning so the human sees your objection alongside the arbiter's argument."
+        if proposals else "")
     if not lines:
-        return ""
-    return (" PREVIOUSLY ADJUDICATED FINDINGS (agreed history of this deploy series): "
+        return prop_block
+    return (prop_block + " PREVIOUSLY ADJUDICATED FINDINGS (agreed history of this deploy series): "
             + " | ".join(lines) +
             ". If you AGREE with an adjudication — do NOT report that finding again. "
             "If your finding restates an OPEN or FIXED item Fx, prefix its title with [DUP:Fx]. "
@@ -1648,13 +1895,6 @@ def _run_empirical(cmd: str, timeout_s: int, root: Path,
 # Ф1: authoritative baseline через deploy.baseline_command (pin одобренной секции — анти-
 # self-hiding); Ф2: машиночитаемый вердикт деплой-гейта для внешнего guard'а (inframon).
 _DEFAULT_BASELINE_TIMEOUT = 30
-_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
-DEPLOY_PIN = (REPO_ROOT / ".claude" / ".deploy-section-pin") if REPO_ROOT else None
-_verdict_env = os.environ.get("CODEX_VERDICT_DIR")
-VERDICT_DIR = Path(_verdict_env) if _verdict_env else (
-    (REPO_ROOT / "logs" / "review_verdicts") if REPO_ROOT else None)
-
-
 # ═══════ Локальная Фаза 2: интерфейс к inframon (спека 2026-07-23-inframon-interface) ═══════
 # Ф1: authoritative baseline через deploy.baseline_command (pin одобренной секции — анти-
 # self-hiding); Ф2: машиночитаемый вердикт деплой-гейта для внешнего guard'а (inframon).
@@ -1665,9 +1905,11 @@ _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 #: проходила, baseline становился HEAD, диапазон — пустым, и коммит исключал себя из ревью
 #: (security-проход 09.08.2026). Место — вне репозитория, рядом с остальным состоянием гейта.
 DEPLOY_PIN = (_gate_state_dir() / "deploy-section-pin") if REPO_ROOT else None
-_verdict_env = os.environ.get("CODEX_VERDICT_DIR")
-VERDICT_DIR = Path(_verdict_env) if _verdict_env else (
-    (REPO_ROOT / "logs" / "review_verdicts") if REPO_ROOT else None)
+# VERDICT_DIR — машиночитаемый вердикт для внешнего guard'а (inframon), а не вход решения
+# гейта, поэтому дефолт остаётся в репозитории. Но оверрайд валидируется тем же правилом,
+# что ledger'ы: иначе он оставался бы единственным непроверяемым путём (находка код-ревью).
+VERDICT_DIR = _state_override(
+    "CODEX_VERDICT_DIR", (REPO_ROOT / "logs" / "review_verdicts") if REPO_ROOT else None)
 
 
 def _deploy_section_hash(sec: dict) -> str:
@@ -1733,7 +1975,7 @@ def _run_baseline_command(cmd: str, timeout_s: int) -> "str | None":
         return None
     # И лексический путь, И цель симлинка: `<repo>/shim -> /bin/echo` иначе прошёл бы проверку
     # цели, а исполнялся бы изменяемый симлинк.
-    if root is not None and any(pp == root or root in pp.parents for pp in (exe, real)):
+    if root is not None and any(_inside_repo(pp, root) for pp in (exe, real)):
         print(f"[codex-gate] ✗ deploy.baseline_command ({exe}) ссылается ВНУТРЬ проверяемого "
               "репозитория: границу ревью нельзя назначать кодом, который сам в неё попадает.",
               file=sys.stderr)
@@ -1968,6 +2210,9 @@ _GEMINI_THINKING_BUDGET = 16_384
 _GEMINI_MAX_OUTPUT_TOKENS = 65_536
 _GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 _CLAUDE_REQUESTED_MODEL = "opus"
+#: Арбитр — ТРЕТЬЯ модель, отличная от обоих членов панели (правило 1 §2.3). Семейство у неё
+#: общее с Claude, поэтому терминальность его вердиктов ограничена правилом 2 (см. arbitrate).
+_ARBITER_REQUESTED_MODEL = "fable"
 _CLAUDE_TIMEOUT_S = 900
 _CERTIFICATION_REGISTRY = Path(__file__).resolve().parent.parent / "reviewer_certifications.json"
 _CORPUS_PATH = Path(__file__).resolve().parent.parent / "reviewer_corpus" / "cases.json"
@@ -2133,7 +2378,7 @@ def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertifica
         if (not isinstance(actual, list) or len(actual) != 1
                 or not all(_nonempty_str(v) for v in actual)
                 or not isinstance(roles, list) or len(roles) != 1
-                or not all(v in {"blocking", "supplemental"} for v in roles)):
+                or not all(v in {"blocking", "supplemental", "arbiter"} for v in roles)):
             return (None, ())
         family = str(item["family"]).casefold()
         if family not in {"anthropic", "openai", "xai", "google", "local"}:
@@ -2305,6 +2550,138 @@ def _build_reviewer_prompt(diff_text: str, *, role: str = "blocking") -> str:
         + (f"\nProject review constitution (AGENTS.md):\n{agents}\n" if agents else "")
         + _REVIEW_FOCUS + _adjudication_prompt_block()
         + f"\n\nDiff to review:\n```\n{diff_text}\n```\n")
+
+
+_ARBITER_VERDICTS = ("sustained", "refuted", "residual", "escalate")
+_ARBITER_LINE_RE = re.compile(
+    r"^\s*Verdict:\s*(?:" + "|".join(_ARBITER_VERDICTS) + r")\s*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _normalize_arbiter_text(text: str) -> "str | None":
+    """РОВНО одно вхождение `Verdict: <из словаря арбитра>`. Ноль → не решение; больше одного
+    → неоднозначность (та же дыра, что со спуфингом цитатой в ответе ревьюера)."""
+    if not text:
+        return None
+    prepared = re.sub(r"(?<!\n)(Verdict:\s*(?:" + "|".join(_ARBITER_VERDICTS) + r"))",
+                      r"\n\1", text, flags=re.IGNORECASE)
+    if len(_ARBITER_LINE_RE.findall(prepared)) != 1:
+        return None
+    return prepared[_ARBITER_LINE_RE.search(prepared).start():]
+
+
+def _build_arbiter_prompt(finding: dict, diff_text: str, ledger_view: str) -> str:
+    """Арбитр судит ВСЛЕПУЮ: он не знает, кто из панели вынес находку. Это снимает
+    «поддержу того, кто моего семейства»; семейство автора знает ГЕЙТ и применяет правило
+    терминальности уже ПОСЛЕ вердикта (дизайн §2.3/§2.4)."""
+    agents = ""
+    if REPO_ROOT is not None and (REPO_ROOT / "AGENTS.md").exists():
+        try:
+            agents = (REPO_ROOT / "AGENTS.md").read_text()[:20000]
+        except OSError:
+            agents = ""
+    return (
+        "You are an ARBITER for a code-review convergence protocol. A blocking review finding "
+        "could not be resolved by fixing, and the question is whether the finding stands.\n"
+        "You did NOT produce this finding and you are NOT told which reviewer did. Judge it on "
+        "the evidence alone.\n"
+        "Reply in EXACTLY this format and NOTHING else: first line "
+        "'Verdict: sustained' | 'Verdict: refuted' | 'Verdict: residual' | 'Verdict: escalate'; "
+        "then a blank line; then one paragraph of reasoning.\n"
+        "  sustained — the finding is real and must remain blocking.\n"
+        "  refuted   — the finding is factually wrong.\n"
+        "  residual  — the finding is real but is a fail-SAFE trade-off already accepted by the "
+        "project's constitution below.\n"
+        "  escalate  — the question is not decidable from code and stated invariants: it needs a "
+        "human (money, actuator, irreversible operations, product trade-offs, or narrowing what "
+        "the gate promises). WHEN IN DOUBT, ESCALATE.\n"
+        + (f"\nProject constitution (AGENTS.md):\n{agents}\n" if agents else "")
+        + f"\nFinding under arbitration:\n{json.dumps(finding, ensure_ascii=False, indent=2)}\n"
+        + (f"\nOther findings of this series:\n{ledger_view}\n" if ledger_view else "")
+        + f"\nDiff under review:\n```\n{diff_text}\n```\n")
+
+
+def _parse_arbiter_verdict(text: str) -> "str | None":
+    """Строгий разбор: первая строка `Verdict: <одно из четырёх>`. Пустой вывод и любой другой
+    текст — НЕ решение (та же дыра, что закрывалась у companion-review)."""
+    first = (text or "").strip().splitlines()[:1]
+    if not first:
+        return None
+    head = first[0].strip().casefold()
+    for v in _ARBITER_VERDICTS:
+        if head == f"verdict: {v}":
+            return v
+    return None
+
+
+def arbiter_certification() -> "tuple[ReviewerCertification | None, str]":
+    """Допуск арбитра — ОТДЕЛЬНЫЙ fail-closed предикат, а не общий поиск по реестру.
+    AR3: `verified`-аттестация обязательна — `declared`-арбитр закрывал бы блокирующие
+    находки без доказательства, что решение принимала заявленная модель.
+    AR4: `(provider, actual_model)` не должны совпадать ни с одним членом ФАКТИЧЕСКОЙ панели
+    серии (берём из evidence, а не из реестра: судить себя нельзя)."""
+    cert = reviewer_certification("claude", _ARBITER_REQUESTED_MODEL, "arbiter")
+    if cert is None:
+        return (None, f"нет certified арбитра claude/{_ARBITER_REQUESTED_MODEL} (роль arbiter)")
+    if cert.attestation != "verified":
+        return (None, f"арбитр аттестован как {cert.attestation!r}: терминальные решения "
+                      "требуют verified")
+    panel = []
+    # Панель берётся из ТЕКУЩЕЙ серии, а не из `PANEL_EVIDENCE`: тот пишется только после
+    # `allow`, а арбитрация по определению происходит, пока серия ЗАБЛОКИРОВАНА — проверка
+    # смотрела бы в пустоту или в прошлую успешную серию (находка код-ревью, раунд 2).
+    led = load_findings_ledger(None)
+    series_panel = (led or {}).get("panel") if isinstance(led, dict) else None
+    if not isinstance(series_panel, dict) or not series_panel.get("reviewers"):
+        return (None, "в серии нет записи о фактической панели — независимость арбитра "
+                      "не подтвердить (прогони ревью)")
+    try:
+        head_now = git_head()
+    except TrustedGitError as exc:
+        return (None, f"{exc}")
+    if series_panel.get("head_sha") != head_now:
+        return (None, "запись о панели относится к другому коммиту — независимость арбитра "
+                      "не подтвердить")
+    panel = series_panel["reviewers"]
+    families_ok = set()
+    for row in panel:
+        # Строгая валидация формы: `actual_models` СТРОКОЙ проходил бы «truthy»-проверку, а
+        # пересечение считалось бы по символам и промахивалось мимо совпадения (раунд 3).
+        if (not isinstance(row, dict) or not isinstance(row.get("provider"), str)
+                or not row["provider"] or not isinstance(row.get("actual_models"), list)
+                or not row["actual_models"]
+                or not all(isinstance(m, str) and m for m in row["actual_models"])):
+            return (None, "запись о панели неполна или искажена — независимость арбитра "
+                          "не подтвердить")
+        if row.get("role") == "blocking" and row.get("status") == "ok":
+            families_ok.add(provider_family(row["provider"]))
+        if row["provider"] == cert.provider and set(row["actual_models"]) & set(
+                cert.actual_models):
+            return (None, f"арбитр совпадает с членом панели ({cert.provider}/"
+                          f"{','.join(cert.actual_models)}) — модель не арбитрирует саму себя")
+    missing = set(MANDATORY_PANEL_FAMILIES) - families_ok
+    if missing:
+        return (None, "панель отработала не полностью (нет успешных семейств: "
+                      f"{', '.join(sorted(missing))}) — арбитрировать нечего")
+    return (cert, "")
+
+
+def run_arbiter(finding: dict, diff_text: str, ledger_view: str = ""
+                ) -> "tuple[str | None, str, str]":
+    """(вердикт|None, фактическая модель, диагностика). Fail-closed: недоступность,
+    несертифицированность или нераспознанный ответ оставляют находку открытой."""
+    cert, why = arbiter_certification()
+    if cert is None:
+        return (None, "", why + " — находка остаётся открытой")
+    text, actual, detail, _usage, status = run_claude_review_text(
+        "", role="arbiter", requested_model=_ARBITER_REQUESTED_MODEL,
+        prompt=_build_arbiter_prompt(finding, diff_text, ledger_view))
+    if status != "ok" or text is None:
+        return (None, actual, detail or f"арбитр не отработал (status={status})")
+    verdict = _parse_arbiter_verdict(text)
+    if verdict is None:
+        return (None, actual, "ответ арбитра не распознан — решением не считается")
+    return (verdict, actual, "")
 
 
 def _build_cursor_prompt(diff_text: str) -> str:
@@ -2949,13 +3326,22 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
 
 
 def run_claude_review_text(diff_text: str, *, role: str = "blocking",
-                           allow_candidate: bool = False
+                           allow_candidate: bool = False,
+                           requested_model: "str | None" = None,
+                           prompt: "str | None" = None
                            ) -> "tuple[str | None, str, str, dict, str]":
-    """Тот же контракт для Claude. `modelUsage` конверта — НАСТОЯЩАЯ аттестация (`verified`)."""
-    cert = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, role,
+    """Тот же контракт для Claude. `modelUsage` конверта — НАСТОЯЩАЯ аттестация (`verified`).
+
+    `requested_model`/`prompt` параметризованы ради роли `arbiter` (Fable): весь хардненинг
+    адаптера — стерильный cwd, `--safe-mode`, запрет managed-политики, аттестация фактической
+    модели — обязан быть ОДИН на все роли. Копия адаптера означала бы, что сертифицируется
+    не то, что работает."""
+    requested = requested_model or _CLAUDE_REQUESTED_MODEL
+    cert = reviewer_certification("claude", requested, role,
                                   allow_candidate=allow_candidate)
     if cert is None:
-        return (None, "", "нет certified Claude model для роли " + role, {}, "unavailable")
+        return (None, "", f"нет certified Claude model {requested!r} для роли {role}",
+                {}, "unavailable")
     try:
         binary = _resolve_claude_bin()
     except TrustedHomeError as exc:
@@ -2978,7 +3364,7 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
         # менять промпт. Сертификация, снятая без неё, ничего не говорит о таком прогоне.
         return (None, "", f"активна managed-политика ({managed}): сертифицированное окружение "
                           "ревьюера не воспроизводится — прогон остановлен", {}, "unavailable")
-    audit(f"claude-{role} bin={resolved_binary} requested={_CLAUDE_REQUESTED_MODEL}")
+    audit(f"claude-{role} bin={resolved_binary} requested={requested}")
     # исполняем РЕЗОЛВНУТЫЙ путь: символьная ссылка могла указывать мимо проверенного файла
     # F14: `--tools` НЕ ограничивает MCP — ревьюер наследовал MCP-серверы вызывающего, то есть
     # недоверенный текст диффа попадал к агенту с сетевыми/пишущими стоками (наблюдено живьём).
@@ -2993,7 +3379,7 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     # промпте, инструменты ревьюеру не нужны.
     cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "",
            "--safe-mode", "--strict-mcp-config",
-           "--model", _CLAUDE_REQUESTED_MODEL, "--no-session-persistence"]
+           "--model", requested, "--no-session-persistence"]
     # F8: cwd НЕ должен быть ревьюируемым репозиторием — иначе его `.claude/settings.json`
     # и хуки управляют ревьюером (маршрут, исполнение кода), то есть проверяемый контент
     # управляет проверяющим. Дифф передаётся в промпте, репозиторий читать не требуется.
@@ -3003,7 +3389,7 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
                 "unavailable")
     try:
         result = subprocess.run(cmd, cwd=sterile_cwd,
-                                input=_build_reviewer_prompt(diff_text, role=role),
+                                input=prompt or _build_reviewer_prompt(diff_text, role=role),
                                 capture_output=True, text=True, timeout=_CLAUDE_TIMEOUT_S,
                                 env=_certified_subprocess_env())
     except subprocess.TimeoutExpired:
@@ -3061,7 +3447,14 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     # «Фактическая модель» = та, что НАПИСАЛА артефакт. Служебные модели того же вендора
     # идут в usage для аудита, но не в идентичность прогона — иначе отчёт сертификации
     # содержал бы склейку имён и не сходился бы с записью реестра.
-    normalized = normalize_reviewer_text(envelope.get("result") or "")
+    if role == "arbiter":
+        # Словарь арбитра ДРУГОЙ: `normalize_reviewer_text` знает только
+        # approve|needs-attention и отвергал бы КАЖДЫЙ валидный ответ Fable. Тесты, мокавшие
+        # `run_arbiter`, этого не видели — вход в живой путь был бы невозможен (находка
+        # код-ревью 09.08.2026). Строгость та же: ровно одна строка вердикта, иначе None.
+        normalized = _normalize_arbiter_text(envelope.get("result") or "")
+    else:
+        normalized = normalize_reviewer_text(envelope.get("result") or "")
     if normalized is None:
         return (None, certified[0], "Claude ответ не прошёл строгий verdict-контракт",
                 {}, "invalid")
@@ -3311,6 +3704,7 @@ def check_reviewed_cli() -> int:
                 print("[codex-gate] ✗ findings-ledger повреждён. Деплой остановлен.",
                       file=sys.stderr)
                 return 2
+            reconcile_arbiter_duplicates(led_c)      # починка персистится, а не теряется
             decision_c, msg_c = convergence_decision(led_c)
             pending_adj = bool(led_c.get("needs_review_round"))
         if pending_adj:
@@ -3393,6 +3787,13 @@ def check_reviewed_cli() -> int:
             with findings_lock():
                 led_p = load_findings_ledger(baseline)
                 if led_p is not None:
+                    led_p["panel"] = {
+                        "head_sha": head, "baseline_sha": baseline, "diff_sha256": diff_sha,
+                        "reviewers": [{"role": r["role"], "provider": r["provider"],
+                                       "status": r["status"],
+                                       "actual_models": list(r["actual_models"])}
+                                      for r in panel_rows],
+                    }
                     merge_round(led_p, blocking, partial=True)
                     save_findings_ledger(led_p)
             print("[codex-gate] находки успевшего ревьюера сохранены в серию (частичный раунд: "
@@ -3418,8 +3819,24 @@ def check_reviewed_cli() -> int:
         if led is None:
             print("[codex-gate] ✗ findings-ledger повреждён. Деплой остановлен.", file=sys.stderr)
             return 2
+        # Фактическая панель фиксируется в СЕРИИ независимо от исхода раунда: арбитрация
+        # происходит, пока серия заблокирована, и AR4 иначе проверять не по чему.
+        led["panel"] = {
+            "head_sha": head, "baseline_sha": baseline, "diff_sha256": diff_sha,
+            # Пишем ВСЕ ряды со статусом, а не только успешные: подмножество выглядело бы
+            # как полная панель, и частично провалившийся прогон допускал бы арбитра, чья
+            # модель совпадает с НЕ отработавшим членом (находка код-ревью, раунд 3).
+            "reviewers": [{"role": r["role"], "provider": r["provider"],
+                           "status": r["status"], "actual_models": list(r["actual_models"])}
+                          for r in panel_rows],
+        }
         merge_round(led, blocking, review_started_ts=review_started_ts)   # ОДИН раунд (EARS-13)
         apply_carry_over(led)
+        # Починка графа дубликатов — ДО сохранения: иначе она делалась в памяти уже после
+        # записи, терялась, и каждый следующий прогон повторял её заново (security-раунд 5).
+        _dup_ok, _dup_why = _arbiter_duplicates_ok(led.get("findings") or {})
+        if not _dup_ok:
+            _reopen_arbiter_duplicates(led.get("findings") or {}, _dup_why)
         save_findings_ledger(led)
         decision, msg = convergence_decision(led)
     if decision == "allow":
@@ -4161,6 +4578,7 @@ def main(argv: list[str]) -> int:
                 if led_f.get("needs_review_round"):
                     ok, why = False, "появились непоказанные адъюдикации"
                 else:
+                    reconcile_arbiter_duplicates(led_f)  # починка персистится, а не теряется
                     decision_f, msg_f = convergence_decision(led_f)
                     if decision_f != "allow":
                         ok, why = False, f"решение устарело за время выкатки: {msg_f}"
@@ -4249,6 +4667,7 @@ def main(argv: list[str]) -> int:
                 print("[codex-gate] ✗ есть адъюдикации, не показанные Codex — решение устарело",
                       file=sys.stderr)
                 return 2
+            reconcile_arbiter_duplicates(led)        # починка персистится, а не теряется
             decision, msg = convergence_decision(led)
         if decision != "allow":
             print(msg, file=sys.stderr)
@@ -4266,6 +4685,123 @@ def main(argv: list[str]) -> int:
                   f"disputes={f.get('disputes', 0)} — {f.get('title', '')[:90]}"
                   + (f" | {f.get('reason', '')[:60]}" if f.get("reason") else ""))
         print(f"rounds={led.get('rounds')} baseline={str(led.get('baseline'))[:12]}")
+        return 0
+    if cmd == "arbitrate":                     # arbitrate <Fid>
+        if not _require_repo():
+            return 2
+        fid = argv[1] if len(argv) > 1 else ""
+        if not fid:
+            print("usage: arbitrate <Fid>", file=sys.stderr)
+            return 1
+        with findings_lock():                  # read-resolve-verify-write под ОДНИМ замком:
+            led = load_findings_ledger(None)   # иначе две конкурентные арбитрации F1→F2 и
+            if led is None:                    # F2→F1 увидят обе цели открытыми и закроют обе
+                print("[codex-gate] ✗ findings-ledger повреждён", file=sys.stderr)
+                return 2
+            fnd = led.get("findings") or {}
+            f = fnd.get(fid)
+            if f is None:
+                print(f"[codex-gate] ✗ неизвестная находка {fid}", file=sys.stderr)
+                return 1
+            if f.get("status") not in ("open", "duplicate"):
+                # Иначе `fixed`/`resolved-by-user`, сохранившая `dup_of` или категорию,
+                # арбитрировалась бы, и любой НЕзакрывающий исход насильно возвращал её в
+                # `open`, перечёркивая починку или решение человека (раунд 3).
+                print(f"[codex-gate] ✗ {fid} уже закрыта ({f.get('status')}) — арбитраж "
+                      "не переоткрывает решённое", file=sys.stderr)
+                return 2
+            if f.get("arbiter_verdict") or f.get("arbiter_proposal"):
+                print(f"[codex-gate] ✗ {fid} уже арбитрирована в этой серии — повторный вызов "
+                      "признак зацикливания, решает человек", file=sys.stderr)
+                return 2
+            tier, why = arbitrability(f)
+            if tier == "human":
+                print(f"[codex-gate] ✗ {fid} неарбитрабельна: {why}. Нужен "
+                      "`adjudicate {fid} resolved-by-user --operator-confirmed \"причина\"`.",
+                      file=sys.stderr)
+                return 2
+            baseline = resolve_baseline()
+            head = git_head()
+            diff_text, derr = _diff_text(baseline, head) if baseline else (None, "нет baseline")
+            if diff_text is None:
+                print(f"[codex-gate] ✗ вход арбитра не построить: {derr}", file=sys.stderr)
+                return 2
+            view = "; ".join(f"{k}[{v.get('severity')}] {v.get('status')}"
+                             for k, v in sorted(fnd.items()) if k != fid)
+            verdict, actual, detail = run_arbiter(f, diff_text, view)
+            if verdict is None:
+                print(f"[codex-gate] ✗ арбитрация не состоялась: {detail}", file=sys.stderr)
+                audit(f"ARBITER-UNAVAILABLE F={fid} detail={redact_secrets(detail)[:200]}")
+                return 2
+            # Правило 2 §2.3: однофамильный арбитр НЕ может терминально снять блокирующую
+            # находку ЕДИНСТВЕННОГО члена панели другого семейства — иначе два anthropic
+            # отменяют единственное не-anthropic суждение, и union-инвариант, ради которого
+            # обязательная пара существует, разрушается. Такой вердикт становится
+            # ПРЕДЛОЖЕНИЕМ автору находки; sustained/escalate терминальны всегда.
+            arb_family = model_family(actual) if actual else "anthropic"
+            raiser_family = provider_family(str(f.get("provider") or ""))
+            # Терминальность даётся, только когда автор находки ЗАВЕДОМО того же семейства,
+            # что арбитр: там однофамильность ничего не отнимает (этот ревьюер и так не мог
+            # блокировать в одиночку). Другое ИЛИ неизвестное семейство → предложение.
+            same_family = raiser_family != "unknown" and raiser_family == arb_family
+            terminal = (tier == "terminal" and verdict in ("refuted", "residual")
+                        and (same_family or f.get("severity") not in SEVERITY_BLOCKING))
+            # Любой исход, КРОМЕ терминального закрытия, обязан вернуть находку в `open`.
+            # У органической `[DUP:Fx]` статус `duplicate` — она не блокирует, и после
+            # закрытия корня серия отдавала бы allow, хотя арбитр находку ПОДТВЕРДИЛ или
+            # эскалировал (находка код-ревью, раунд 2).
+            def _keep_blocking() -> None:
+                f["status"] = "open"
+
+            if verdict == "escalate":
+                _keep_blocking()
+                # Без маркера повторный вызов заменял бы эскалацию предложением или
+                # терминальным закрытием, ломая и лимит «одна арбитрация на находку», и
+                # AR7 (эскалация терминальна в пользу человека).
+                f["arbiter_verdict"] = "escalate"
+                f["arbiter_model"] = actual
+                f["reason"] = f"арбитр эскалировал: решение человека ({actual})"
+                audit(f"ARBITER-DECISION F={fid} verdict=escalate model={actual} class={tier}")
+                print(f"[codex-gate] арбитр вернул escalate — нужен resolved-by-user")
+            elif verdict == "sustained":
+                _keep_blocking()
+                f["reason"] = f"арбитр подтвердил находку ({actual}) — остаётся блокирующей"
+                f["arbiter_verdict"] = "sustained"
+                audit(f"ARBITER-DECISION F={fid} verdict=sustained model={actual} class={tier}")
+                print(f"[codex-gate] арбитр подтвердил {fid}: находка остаётся блокирующей")
+            elif terminal and _dup_root(fnd, fid) in (None, fid):
+                print(f"[codex-gate] ✗ ссылка дубликата {fid} битая, циклическая или на себя — "
+                      "терминальное закрытие не выполняется", file=sys.stderr)
+                return 2
+            elif terminal and (fnd.get(_dup_root(fnd, fid)) or {}).get("status") != "open":
+                print(f"[codex-gate] ✗ корень дубликата {fid} уже закрыт — закрытие означало бы "
+                      "снятие блокировки, а не дедупликацию", file=sys.stderr)
+                return 2
+            elif terminal and (fnd.get(_dup_root(fnd, fid)) or {}).get(
+                    "severity") not in SEVERITY_BLOCKING:
+                print(f"[codex-gate] ✗ корень дубликата {fid} не блокирующий — терминальное "
+                      "закрытие не выполняется", file=sys.stderr)
+                return 2
+            elif terminal:
+                f["status"] = "resolved-by-arbiter"
+                f["arbiter_verdict"] = "duplicate-terminal"
+                f["arbiter_model"] = actual
+                f["reason"] = f"арбитр: дубликат открытой блокирующей находки ({actual})"
+                audit(f"ARBITER-DECISION F={fid} verdict={verdict} model={actual} "
+                      f"class=terminal")
+                print(f"[codex-gate] ✓ {fid} закрыта арбитром как дубликат "
+                      "(оригинал продолжает блокировать)")
+            else:
+                _keep_blocking()             # предложение блокирует до подтверждения автором
+                f["arbiter_proposal"] = verdict
+                f["arbiter_model"] = actual
+                f["reason"] = (f"ПРЕДЛОЖЕНИЕ арбитра ({actual}): {verdict}. Принимается "
+                               "решением человека, не ревьюером.")
+                audit(f"ARBITER-PROPOSAL F={fid} verdict={verdict} model={actual} class={tier}")
+                print(f"[codex-gate] арбитр предложил «{verdict}» по {fid}. Разбор записан; "
+                      f"принять:\n  bash .githooks/gates-run codex_review_gate.py adjudicate "
+                      f"{fid} resolved-by-arbiter --operator-confirmed \"принимаю\"")
+            save_findings_ledger(led)
         return 0
     if cmd == "adjudicate":                    # adjudicate <Fid> <status> "<причина>"
         if not _require_repo():
