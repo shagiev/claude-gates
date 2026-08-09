@@ -85,3 +85,29 @@ def test_untracked_file_is_dirty(repo):
 def test_deleted_tracked_file_is_dirty(repo):
     (repo / "a.txt").unlink()
     assert g.working_tree_clean() is False
+
+
+def test_ladder_tree_hash_ignores_repository_clean_filter(tmp_path):
+    """`git add` запускает clean-фильтры репозитория, поэтому tree-хэш лесенки считался от
+    ПОДСУНУТОГО содержимого. Целостность лесенки держится на этом хэше."""
+    import os
+    import ladder_gate as L
+
+    r = tmp_path / "f"
+    r.mkdir()
+    _git(r, "init", "-q", ".")
+    (r / "a.txt").write_text("real\n")
+    (r / ".gitattributes").write_text("a.txt filter=mask\n")
+    _git(r, "add", "-A")
+    _git(r, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init")
+    _git(r, "config", "filter.mask.clean", "printf 'FAKE\\n'")
+
+    ours = L.compute_tree(r)
+
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = str(tmp_path / "idx")
+    subprocess.run(["git", "add", "-A", "--", "."], cwd=r, env=env, capture_output=True)
+    filtered = subprocess.run(["git", "write-tree"], cwd=r, env=env,
+                              capture_output=True, text=True).stdout.strip()
+
+    assert ours != filtered, "tree-хэш лесенки всё ещё считается через clean-фильтр"

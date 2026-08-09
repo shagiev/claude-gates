@@ -25,10 +25,11 @@ except ImportError:            # PyYAML может отсутствовать в
 # уже в sys.path (тесты через conftest, запуск обоих скриптов из одного каталога), фолбэк —
 # при запуске как голый скрипт из произвольного cwd.
 try:
-    from codex_review_gate import is_code_path
+    from codex_review_gate import is_code_path, _trusted_git, TrustedGitError
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from codex_review_gate import is_code_path  # type: ignore[no-redef]
+    from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
+                                   TrustedGitError)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -131,9 +132,8 @@ def _gate_config(root: Path) -> "dict | None":
 def _config_blob(root: Path, ref: str) -> "bytes | None":
     """Содержимое .codex-gate.yaml в index (ref='' → ':<path>') или коммите (ref='HEAD').
     None = файла там нет / git-сбой (консервативно «не совпало» у вызывающего)."""
-    r = subprocess.run(["git", "show", f"{ref}:{GATE_CONFIG_NAME}"], cwd=root,
-                       capture_output=True)
-    return r.stdout if r.returncode == 0 else None
+    r = _trusted_git("show", f"{ref}:{GATE_CONFIG_NAME}", cwd=root)
+    return r.stdout.encode() if (r is not None and r.returncode == 0) else None
 
 
 def _worktree_config_bytes(root: Path) -> "bytes | None":
@@ -183,11 +183,31 @@ def compute_tree(root: Path) -> str:
         tmp_index = Path(td) / "index"
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = str(tmp_index)
-        subprocess.run(["git", "add", "-A", "--", "."],
-                       cwd=root, env=env, check=True, capture_output=True)
-        subprocess.run(["git", "rm", "--cached", "--ignore-unmatch", "-q", "--",
-                        *_BOOKKEEPING_PATHS],
-                       cwd=root, env=env, check=True, capture_output=True)
+        # `git add` ЗАПУСКАЕТ clean-фильтры репозитория (`.gitattributes`), поэтому дерево
+        # считалось бы от преобразованного содержимого, а не от того, что лежит на диске.
+        # Собираем индекс plumbing'ом: hash-object --no-filters + update-index --cacheinfo.
+        listing = _trusted_git("ls-files", "-c", "-o", "--exclude-standard", "-z", cwd=root)
+        if listing is None or listing.returncode != 0:
+            raise TrustedGitError("не перечислить файлы дерева — tree-хэш не посчитать")
+        skip = set(_BOOKKEEPING_PATHS)
+        for rel in listing.stdout.split("\0"):
+            if not rel or rel in skip:
+                continue
+            full = root / rel
+            if full.is_symlink():
+                mode = "120000"
+            elif full.is_file():
+                mode = "100755" if os.access(full, os.X_OK) else "100644"
+            else:
+                continue
+            h = _trusted_git("hash-object", "--no-filters", "-w", "--", rel, cwd=root)
+            if h is None or h.returncode != 0:
+                raise TrustedGitError(f"не посчитать хэш {rel!r} — tree-хэш не посчитать")
+            u = subprocess.run(["git", "update-index", "--add", "--cacheinfo",
+                                f"{mode},{h.stdout.strip()},{rel}"],
+                               cwd=root, env=env, capture_output=True, text=True)
+            if u.returncode != 0:
+                raise TrustedGitError(f"update-index отверг {rel!r}")
         r = subprocess.run(["git", "write-tree"], cwd=root, env=env, check=True,
                            capture_output=True, text=True)
         return r.stdout.strip()
@@ -405,7 +425,12 @@ def _write_ledger(root: Path, sha: str, payload: dict) -> None:
 
 
 def _git_out(root: Path, args: list[str]) -> str:
-    r = subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
+    """Все чтения лесенки — через доверенный слой. Голый git позволял шиму вернуть пустой
+    `rev-list baseline..HEAD`, и check_range одобрял диапазон без evidence и без аудита."""
+    r = _trusted_git(*args, cwd=root)
+    if r is None or r.returncode != 0:
+        raise TrustedGitError(f"доверенный git недоступен для {args[0]!r} — лесенка не может "
+                              "принять решение")
     return r.stdout.strip()
 
 
