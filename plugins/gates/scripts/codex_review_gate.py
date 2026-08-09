@@ -3559,6 +3559,46 @@ def main(argv: list[str]) -> int:
     cmd = argv[0] if argv else ""
     if cmd == "check-reviewed":
         return check_reviewed_cli()
+    if cmd == "verify-deployable":
+        # §2.2b/§2.5: гейт САМ строит неизменяемый артефакт из отревьюенного коммита и
+        # подтверждает чистоту ТОЛЬКО для него. Проверять «чисто ли рабочее дерево» и надеяться,
+        # что актуатор отправит именно его, — обещание, которое нечем подкрепить: команда
+        # деплоя произвольна. Здесь связь есть по построению: манифест равен дереву коммита.
+        if not _require_repo():
+            return 2
+        try:
+            head = git_head()
+            if not working_tree_clean():
+                print("[codex-gate] ✗ рабочее дерево грязное — артефакт строится из коммита, "
+                      "но расхождение означает, что выкатывают не то, что ревьюили",
+                      file=sys.stderr)
+                return 2
+        except TrustedGitError as exc:
+            print(f"[codex-gate] ✗ {exc}", file=sys.stderr)
+            return 2
+        reviewed = LAST_REVIEWED.read_text().strip() if LAST_REVIEWED.exists() else ""
+        if reviewed != head:
+            print(f"[codex-gate] ✗ HEAD {head[:12]} не совпадает с одобренным ревью "
+                  f"{reviewed[:12] or '(нет)'} — артефакт строить не из чего", file=sys.stderr)
+            return 2
+        out_dir = _sterile_mkdtemp("gates-artifact-")
+        if out_dir is None:
+            print("[codex-gate] ✗ не создать каталог артефакта вне ревьюируемого репозитория",
+                  file=sys.stderr)
+            return 2
+        tar = Path(out_dir) / f"{head[:12]}.tar"
+        r = _trusted_git("archive", "--format=tar", "-o", str(tar), head)
+        if r is None or r.returncode != 0:
+            print("[codex-gate] ✗ не построить артефакт из коммита", file=sys.stderr)
+            return 2
+        digest = hashlib.sha256(tar.read_bytes()).hexdigest()
+        audit(f"verify-deployable head={head} artifact={tar} sha256={digest}")
+        print(f"[codex-gate] ✓ артефакт построен из отревьюенного коммита {head[:12]}")
+        print(f"[codex-gate] ВЫКАТЫВАЙ ИМЕННО ЕГО — иначе гарантия не действует "
+              f"(остаток R-ACTUATOR-HANDOFF)", file=sys.stderr)
+        print(f"GATES_ARTIFACT={tar}")
+        print(f"GATES_ARTIFACT_SHA256={digest}")
+        return 0
     if cmd == "check-decision":                # быстрая ревалидация решения (deploy-lock, F3):
         if not _require_repo():
             return 2

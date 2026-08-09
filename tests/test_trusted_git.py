@@ -122,3 +122,57 @@ def test_fetch_adapter_rejects_command_executing_transport():
     for ok in ("https://github.com/x/y.git", "git@github.com:x/y.git",
                "ssh://git@host/x.git", "/srv/bare/repo.git", "file:///srv/bare/repo.git"):
         assert pg._fetch_remote_allowed(ok), ok
+
+
+def test_verify_deployable_builds_artifact_from_reviewed_commit(repo, monkeypatch, tmp_path,
+                                                                capsys):
+    """Гейт строит артефакт САМ и подтверждает только его: проверять «чисто ли дерево» и
+    надеяться, что актуатор отправит именно его — обещание без подкрепления."""
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    reviewed = tmp_path / "lr"
+    reviewed.write_text(head)
+    monkeypatch.setattr(g, "LAST_REVIEWED", reviewed)
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "a.log")
+    monkeypatch.setattr(g, "_require_repo", lambda: True)
+    assert g.main(["verify-deployable"]) == 0
+    out = capsys.readouterr().out
+    assert "GATES_ARTIFACT=" in out and "GATES_ARTIFACT_SHA256=" in out
+    art = [l.split("=", 1)[1] for l in out.splitlines() if l.startswith("GATES_ARTIFACT=")][0]
+    assert os.path.isfile(art) and not art.startswith(str(repo)), "артефакт внутри репозитория"
+
+
+def test_verify_deployable_refuses_when_head_moved(repo, monkeypatch, tmp_path, capsys):
+    """HEAD сдвинулся после ревью — строить артефакт не из чего."""
+    reviewed = tmp_path / "lr"
+    reviewed.write_text("0" * 40)
+    monkeypatch.setattr(g, "LAST_REVIEWED", reviewed)
+    monkeypatch.setattr(g, "_require_repo", lambda: True)
+    assert g.main(["verify-deployable"]) == 2
+    assert "не совпадает с одобренным" in capsys.readouterr().err
+
+
+def test_verify_deployable_refuses_dirty_tree(repo, monkeypatch, tmp_path, capsys):
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    (tmp_path / "lr").write_text(head)
+    monkeypatch.setattr(g, "LAST_REVIEWED", tmp_path / "lr")
+    monkeypatch.setattr(g, "_require_repo", lambda: True)
+    (repo / "a.txt").write_text("dirty\n")
+    assert g.main(["verify-deployable"]) == 2
+    assert "грязное" in capsys.readouterr().err
+
+
+def test_deploy_template_has_no_bare_git_in_decision_path():
+    """PATH-шим вернул бы одобренный SHA и пустой статус после подмены дерева — финальная
+    проверка reviewed≡deployed обязана идти через гейт, а не через голый git."""
+    import pathlib as _pl
+
+    tpl = (_pl.Path(g.__file__).resolve().parent.parent
+           / "templates" / "Makefile.snippet").read_text()
+    deploy = tpl[tpl.index("deploy: check-reviewed"):]
+    for bad in ("git rev-parse", "git status", "git diff"):
+        assert bad not in deploy, f"в деплой-пути шаблона остался голый {bad!r}"
+    assert "verify-deployable" in deploy and "GATES_ARTIFACT" in deploy
+    # выкатывается РАСПАКОВАННЫЙ артефакт, а не рабочее дерево
+    assert "tar -xf $$GATES_ARTIFACT" in deploy

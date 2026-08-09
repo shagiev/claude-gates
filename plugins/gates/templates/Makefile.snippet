@@ -5,9 +5,12 @@
 #   check-decision ПРЯМО перед выкаткой (rsync/push)
 #   запись .claude/.last-deployed-sha ТОЛЬКО после успешной пост-деплой верификации
 # NB: в Makefile каждый '$' шелла пишется как '$$'.
-# REVIEW_PROVIDER отсутствует → fail-closed `portable` (certified Gemini + mandatory Claude).
-# Временный explicit legacy: `REVIEW_PROVIDER=cursor make deploy` — слабее portable:
-# Cursor не аттестует actual model, Claude supplemental не запускается.
+# Панель ревьюеров — обязательная пара Codex+Claude; REVIEW_PROVIDER её НЕ понижает
+# (легаси-значения codex|cursor|both блокируют деплой). Аварийный выход — CODEX_REVIEW_SKIP=1.
+# ВАЖНО: выкатывать нужно АРТЕФАКТ из verify-deployable, а не рабочее дерево. Голые
+# `git rev-parse`/`git status` здесь не годятся: PATH-шим вернёт одобренный SHA и пустой
+# статус после подмены дерева. verify-deployable делает те же проверки доверенным git и
+# строит неизменяемый артефакт из отревьюенного коммита.
 
 setup-hooks:
 	@git config core.hooksPath .githooks
@@ -25,21 +28,21 @@ deploy: check-reviewed   # + твои проверки: check-committed test myp
 	fi; \
 	trap 'rmdir logs/.deploy.lock.d 2>/dev/null' EXIT; \
 	trap 'exit 130' INT TERM; \
-	REVIEWED_SHA=$$(git rev-parse HEAD); \
-	if [ ! -f .claude/.last-reviewed-sha ] || [ "$$REVIEWED_SHA" != "$$(cat .claude/.last-reviewed-sha)" ]; then \
-		echo "❌ HEAD ($$REVIEWED_SHA) != одобренного check-reviewed SHA — HEAD сдвинулся; прерываю"; \
-		exit 1; \
-	fi; \
-	if [ -n "$$(git status --porcelain)" ] || [ "$$(git rev-parse HEAD)" != "$$REVIEWED_SHA" ]; then \
-		echo "❌ дерево изменилось после ревью (правка во время review) — прерываю до выкатки"; \
+	ART=$$(bash .githooks/gates-run codex_review_gate.py verify-deployable) || exit 1; \
+	GATES_ARTIFACT=$$(printf '%s\n' "$$ART" | sed -n 's/^GATES_ARTIFACT=//p'); \
+	REVIEWED_SHA=$$(cat .claude/.last-reviewed-sha); \
+	if [ -z "$$GATES_ARTIFACT" ]; then \
+		echo "❌ verify-deployable не выдал артефакт — гарантия не действует, прерываю"; \
 		exit 1; \
 	fi; \
 	if ! bash .githooks/gates-run codex_review_gate.py check-decision; then \
 		echo "❌ решение ревью устарело (конкурентная находка/адъюдикация после allow) — прерываю"; \
 		exit 1; \
 	fi; \
-	echo "==> ЗДЕСЬ твоя выкатка (rsync/docker compose/ssh) и пост-деплой верификация"; \
-	echo "==> при УСПЕХЕ верификации зафиксируй baseline:"; \
+	echo "==> ВЫКАТЫВАЙ АРТЕФАКТ, а не рабочее дерево:"; \
+	echo "==>   mkdir -p build/payload && tar -xf $$GATES_ARTIFACT -C build/payload"; \
+	echo "==>   rsync -a build/payload/ host:/srv/app/    # вместо rsync ."; \
+	echo "==> затем пост-деплой верификация; при УСПЕХЕ зафиксируй baseline:"; \
 	printf '%s\n' "$$REVIEWED_SHA" > .claude/.last-deployed-sha; \
 	echo "==> baseline ревью обновлён: $$(cat .claude/.last-deployed-sha)"
 
