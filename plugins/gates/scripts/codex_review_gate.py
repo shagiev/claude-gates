@@ -859,10 +859,52 @@ def diff_sha256(base: str, head: str = "HEAD") -> str:
 
 
 def working_tree_clean() -> bool:
-    _r = _trusted_git("status", "--porcelain")
-    if _r is None or _r.returncode != 0:
+    # `status` НЕ является предикатом безопасности: он сравнивает ПРЕОБРАЗОВАННОЕ
+    # представление. Локальный clean/process-фильтр (`.gitattributes`, `.git/info/attributes`)
+    # отдаёт закоммиченное содержимое, тогда как в дереве лежат другие байты — именно те, что
+    # уедут актуатором; `assume-unchanged`/`skip-worktree` прячут изменение вовсе.
+    # Поэтому сверяем СЫРЫЕ байты с деревом коммита.
+    head = _trusted_git("rev-parse", "--verify", "-q", "HEAD")
+    if head is None or head.returncode != 0:
         raise TrustedGitError("доверенный git недоступен — чистоту дерева не проверить")
-    return not _r.stdout.strip()
+    tree = _trusted_git("ls-tree", "-r", "-z", head.stdout.strip())
+    if tree is None or tree.returncode != 0:
+        raise TrustedGitError("не прочитать дерево коммита — чистоту не проверить")
+    committed: dict[str, tuple[str, str]] = {}
+    for entry in tree.stdout.split("\0"):
+        if not entry.strip():
+            continue
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3 or not path:
+            raise TrustedGitError("ls-tree изменил формат — чистоту не проверить")
+        committed[path] = (parts[0], parts[2])       # режим, blob-хэш
+    for path, (mode, blob) in committed.items():
+        full = Path(REPO_ROOT) / path
+        if mode == "120000":                          # симлинк: содержимое blob'а — ЦЕЛЬ ссылки
+            try:
+                target = os.readlink(full).encode()
+            except OSError:
+                return False                          # не симлинк или исчез
+            digest = hashlib.sha1(b"blob %d\0" % len(target) + target).hexdigest()
+            if digest != blob:
+                return False
+            continue
+        if not full.is_file():
+            return False                              # удалён или заменён
+        actual_mode = "100755" if os.access(full, os.X_OK) else "100644"
+        if actual_mode != mode:
+            return False                              # изменён исполняемый бит
+        h = _trusted_git("hash-object", "--no-filters", "--", str(full))
+        if h is None or h.returncode != 0:
+            raise TrustedGitError("не посчитать хэш файла — чистоту не проверить")
+        if h.stdout.strip() != blob:
+            return False                              # СЫРЫЕ байты разошлись с коммитом
+    # untracked (не игнорируемые) файлы: их отсутствие подтверждает, что состав дерева тот же
+    st = _trusted_git("status", "--porcelain", "--untracked-files=all")
+    if st is None or st.returncode != 0:
+        raise TrustedGitError("доверенный git недоступен — чистоту дерева не проверить")
+    return not st.stdout.strip()
     out = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True,
                          check=True).stdout
     return out.strip() == ""
@@ -1407,20 +1449,20 @@ def _config_section_at_ref(root: Path, ref: str, section: str) -> "tuple[str, di
 
     NB: парс-слой НЕ переиспользует _read_gate_config: тому нужен ref-bound blob и
     ТРЁХСТАТУСНЫЙ исход, а _read_gate_config читает worktree и коллапсирует в dict|None."""
-    ls = subprocess.run(["git", "ls-tree", ref, "--", GATE_CONFIG_NAME],
-                        cwd=root, capture_output=True, text=True)
-    if ls.returncode != 0:
+    # Голый git здесь давал ТИХОЕ ослабление: шим с успехом и пустым выводом делал
+    # настроенные секции `absent`, и эмпирический гейт возвращал успех как «не сконфигурировано».
+    ls = _trusted_git("ls-tree", ref, "--", GATE_CONFIG_NAME, cwd=root)
+    if ls is None or ls.returncode != 0:
         return ("unreadable", None)             # дерево/ref не прочитано — доказательства нет
     if not ls.stdout.strip():
         return ("absent", None)                 # дерево прочитано, пути нет — ДОКАЗАНО absent
-    blob = subprocess.run(["git", "cat-file", "blob", f"{ref}:{GATE_CONFIG_NAME}"],
-                         cwd=root, capture_output=True)
-    if blob.returncode != 0:
+    blob = _trusted_git("cat-file", "blob", f"{ref}:{GATE_CONFIG_NAME}", cwd=root)
+    if blob is None or blob.returncode != 0:
         return ("unreadable", None)             # путь есть, но объект не читается
     if yaml is None:
         return ("unreadable", None)             # нет PyYAML при наличии файла — не подтвердить
     try:
-        data = yaml.safe_load(blob.stdout.decode())
+        data = yaml.safe_load(blob.stdout)   # слой отдаёт text=True
     except (yaml.YAMLError, UnicodeError):
         return ("unreadable", None)
     if not isinstance(data, dict):
