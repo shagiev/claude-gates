@@ -76,6 +76,10 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # ОДНОГО тест-файла — новый тест-файл без локального мока писал в БОЕВОЙ
     # logs/review_findings (создал мусорную серию с critical-находкой из фикстуры, уронил
     # 7 соседних тестов). Инвариант «тесты не трогают боевые ledger'ы» — в ОБЩЕМ chokepoint.
+    # Состояние гейта (счётчик раундов ревью и всё, что рядом) — тоже НЕ боевое: иначе
+    # тесты жгли бы реальный бюджет и зависели бы от порядка запуска. Тот же инвариант,
+    # что для FINDINGS_DIR/LEDGER_DIR ниже.
+    monkeypatch.setattr(g, "_gate_state_dir", lambda: tmp_path / "gate_state")
     monkeypatch.setattr(g, "FINDINGS_DIR", tmp_path / "rf_conftest")
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path / "ledger_conftest")
     # Резолв companion не должен зависеть от машины. ВАЖНО: CODEX_COMPANION_CMD именно

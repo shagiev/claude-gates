@@ -19,3 +19,5 @@ ladder:
 
 convergence:
   hard_cap: 8
+review:
+  tier: decision

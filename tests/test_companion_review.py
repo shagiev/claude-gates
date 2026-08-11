@@ -126,3 +126,25 @@ def test_timeout_does_not_leak_argv_secret(monkeypatch, capsys):
     assert "TimeoutExpired" in captured.err        # ветка таймаута реально пройдена
     assert "SUPERSECRETVALUE4" not in captured.err
     assert captured.out == ""
+
+
+def test_companion_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    """`subprocess.run(timeout=)` убивает только ПРЯМОГО потомка. Companion — обёртка на node,
+    порождающая свои процессы; они наследуют stdout, и после смерти обёртки `communicate()`
+    ждёт закрытия пайпа. Замерено 11.08.2026: ревью висело 46 минут при заявленном потолке
+    900 с, то есть «жёсткий потолок» не действовал, а зависшее ревью неотличимо от медленного.
+    Тест ПАДАЕТ (висит), если убрать `start_new_session=True`."""
+    import time
+
+    script = tmp_path / "hanging-companion.sh"
+    script.write_text("#!/bin/sh\nsleep 600 &\nsleep 600\n")     # внук держит stdout
+    script.chmod(0o755)
+    monkeypatch.setattr(g, "_REVIEW_TIMEOUT_S", 3)
+    monkeypatch.setattr(g, "resolve_companion_cmd", lambda **kw: ["/bin/sh", str(script)])
+
+    started = time.monotonic()
+    result = g._exec_companion(["adversarial-review"])
+    elapsed = time.monotonic() - started
+
+    assert result is None, "таймаут не превратился в отказ"
+    assert elapsed < 60, f"висело {elapsed:.0f}s при потолке 3s — группа процессов не убита"
