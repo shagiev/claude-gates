@@ -658,6 +658,8 @@ def test_security_state_dir_inside_repo_fails_closed(tmp_path, monkeypatch):
     (home / ".local" / "state").mkdir(parents=True)
     monkeypatch.setattr(g, "REPO_ROOT", home)
     monkeypatch.setattr(g, "_trusted_home", lambda: home)
+    # conftest подменяет `_gate_state_dir` ради изоляции состояния — здесь нужен НАСТОЯЩИЙ.
+    monkeypatch.setattr(g, "_gate_state_dir", g._REAL_GATE_STATE_DIR)
     with pytest.raises(g.TrustedGitError):
         g._gate_state_dir()
 

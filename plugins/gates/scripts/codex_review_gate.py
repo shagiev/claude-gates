@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -808,7 +809,13 @@ def resolve_companion_cmd(*, allow_env_override: bool = True) -> list[str]:
 
 _REVIEW_FOCUS = (
     "Review the committed changes for correctness, safety, and money-loss risks per AGENTS.md. "
-    "Return a structured Verdict and findings with severity; critical/high block the deploy.")
+    "Return a structured Verdict and findings with severity; critical/high block the deploy. "
+    # Стоп-политика v3: ревьюер оптимизирует полноту, а не ценность за раунд, и без этого
+    # требования предлагает ПОЛНОЕ решение — которое затем и строится. Пусть даёт ещё и
+    # дешёвое, тогда выбор между ними остаётся за оператором.
+    "For EACH finding state, in this order: (1) what the attacker must ALREADY control for it "
+    "to matter; (2) what they gain; (3) the CHEAPEST fix that removes most of the risk, stated "
+    "separately from the full fix. Rank findings by expected loss, not by severity label.")
 
 
 def _exec_companion(args: list[str], *, allow_env_override: bool = True,
@@ -825,12 +832,33 @@ def _exec_companion(args: list[str], *, allow_env_override: bool = True,
     except FileNotFoundError as e:
         print(f"[codex-gate] плагин codex-companion не найден: {e}", file=sys.stderr)
         return None
+    # ⚠️ `subprocess.run(timeout=)` убивает только ПРЯМОГО потомка. Companion — обёртка на
+    # node, порождающая собственные процессы; они наследуют stdout, и после смерти обёртки
+    # `communicate()` продолжает ждать закрытия пайпа. Замерено 11.08.2026: ревью висело
+    # 46 минут при заявленном потолке 900 с — то есть «жёсткий потолок» не действовал вовсе,
+    # а зависшее ревью неотличимо от медленного, и оператор ждёт вместо fail-closed ответа.
+    # Лечится своей process group: убиваем ГРУППУ, тогда пайп закрывают все.
     try:
-        return subprocess.run(cmd + args, capture_output=True, text=True,
-                              timeout=_REVIEW_TIMEOUT_S, cwd=cwd,
-                              env=(None if allow_env_override
-                                   else _certified_subprocess_env(codex_home)))
+        proc = subprocess.Popen(cmd + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, cwd=cwd, start_new_session=True,
+                                env=(None if allow_env_override
+                                     else _certified_subprocess_env(codex_home)))
+    except OSError as e:
+        print(f"[codex-gate] companion не запустился: {type(e).__name__}: "
+              f"{redact_secrets(str(e))}", file=sys.stderr)
+        return None
+    try:
+        out, err = proc.communicate(timeout=_REVIEW_TIMEOUT_S)
+        return subprocess.CompletedProcess(cmd + args, proc.returncode, out, err)
     except (subprocess.TimeoutExpired, OSError) as e:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            proc.kill()
+        try:
+            proc.communicate(timeout=30)      # добираем хвост уже мёртвой группы
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         # источник #8 (R5-F2): TimeoutExpired.__str__ включает ВЕСЬ argv — если в команде есть
         # `--api-key=…`, он попал бы оператору целиком; редактируем текст исключения
         print(f"[codex-gate] companion не отработал: {type(e).__name__}: "
@@ -1037,6 +1065,11 @@ def _state_override(name: str, default: "Path | None") -> "Path | None":
                 "нельзя доверять стороне, чей код проверяют")
         return real          # канонический путь, а не симлинк: цель можно переставить потом
     return path
+
+
+#: Неподменённая реализация: тесты хардненинга обязаны проверять НАСТОЯЩИЙ выбор каталога,
+#: а conftest подменяет его ради изоляции состояния.
+_REAL_GATE_STATE_DIR = _gate_state_dir
 
 
 # LEDGER_DIR перекрывается env CODEX_LEDGER_DIR (изоляция subprocess-тестов make check-reviewed)
@@ -4425,6 +4458,108 @@ def _cli_opts(argv: "list[str]") -> "dict[str, str]":
             if a.startswith("--") and i + 1 < len(argv)}
 
 
+
+#: Бюджет раундов ревью по радиусу поражения (стоп-политика v3,
+#: docs/methodology/2026-08-11-review-budget-design.md). Правило существовало и раньше
+#: (хард-кап ≈5), но НИЧТО его не проверяло — и один дизайн собрал 15 раундов, из которых
+#: полезны были первые пять. Поэтому счётчик виден, а превышение блокирует запуск.
+REVIEW_BUDGETS = {"money": 5, "decision": 3, "convenience": 1}
+_DEFAULT_REVIEW_TIER = "money"        # неизвестно → строже всего (fail-safe)
+
+
+def review_tier() -> str:
+    """Ярус из секции `review` в `.codex-gate.yaml`. Нечитаемо/нет/неизвестно → самый строгий.
+
+    Читается ТЕМ ЖЕ загрузчиком, что и остальной конфиг: у него уже есть отказ от симлинка,
+    узкие исключения и правило «битое → строгий режим». Свой `except Exception` здесь глотал
+    бы в том числе баги (правило конституции «исключения не глотать»)."""
+    if REPO_ROOT is None:
+        return _DEFAULT_REVIEW_TIER
+    cfg = _read_gate_config(REPO_ROOT) or {}
+    section = cfg.get("review")
+    tier = section.get("tier") if isinstance(section, dict) else None
+    return tier if tier in REVIEW_BUDGETS else _DEFAULT_REVIEW_TIER
+
+
+def _review_artifact_key(args: "list[str]") -> str:
+    """Канонический ключ цикла.
+
+    Два обхода, найденных ревью 11.08.2026: (а) ключ из СЫРОГО порядка аргументов менялся от
+    перестановки флагов; (б) вид артефакта угадывался по тексту — типовая команда скилла
+    передаёт `--base/--scope` и фокус, где путь к дизайну лежит ВНУТРИ фразы, поэтому
+    дизайн-ревью попадало под кодовый бюджет, а код-ревью со словом «...md» становилось
+    безлимитным. Вид объявляется ЯВНО флагом `--design-file`, который до companion не доезжает.
+    """
+    opts = {a[2:]: args[i + 1] for i, a in enumerate(args)
+            if a.startswith("--") and i + 1 < len(args)}
+    design = opts.get("design-file")
+    if design:
+        return f"design:{design}"
+    return f"range:{opts.get('base', 'HEAD')}:{opts.get('scope', 'branch')}"
+
+
+def _rounds_path() -> "Path | None":
+    return (_gate_state_dir() / "review_rounds.json") if REPO_ROOT else None
+
+
+def _rounds_state() -> dict:
+    p = _rounds_path()
+    if p is None or not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            return {}
+        # Значения валидируются поштучно: `{"k": {}}` или строка роняли бы ревью
+        # TypeError/ValueError уже ПОСЛЕ чтения, вместо безопасного сброса.
+        return {k: v for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
+                and v >= 0}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def is_design_artifact(artifact: str) -> bool:
+    """Дизайн-файл. Его находки НИГДЕ не сохраняются, поэтому «принять остатки» по нему
+    нечем подкрепить: блокировать было бы некому. Пока структурного ledger'а дизайн-находок
+    нет (остаток R-DESIGN-FINDINGS-LEDGER), дизайн выведен из-под бюджета ЦЕЛИКОМ —
+    самая дешёвая правка вместо неисполнимого обещания (код-ревью 11.08.2026)."""
+    return artifact.startswith("design:")
+
+
+def review_round_check(artifact: str) -> "tuple[int, int, str]":
+    """(номер начинаемого раунда, бюджет, сообщение-отказ или '')."""
+    if is_design_artifact(artifact):
+        return (0, 0, "")
+    tier = review_tier()
+    budget = REVIEW_BUDGETS[tier]
+    used = int(_rounds_state().get(artifact, 0))
+    if used >= budget:
+        return (used + 1, budget, (
+            f"[codex-gate] ✗ бюджет ревью исчерпан: {used} из {budget} раундов (ярус {tier}).\n"
+            "  Оставшиеся находки — в реестр остатков КАК ЕСТЬ, со своей severity. Это не\n"
+            "  «починим потом», а «приняли, вот цена».\n"
+            # Артефакт содержит имя ветки, а git принимает `$()`/бэктики в именах ссылок:
+            # неэкранированная подстановка в КОПИРУЕМУЮ команду исполнилась бы под аккаунтом
+            # оператора (security-проход 11.08.2026).
+            f"  bash .githooks/gates-run codex_review_gate.py residuals-accept "
+            f"{shlex.quote(artifact)} "
+            "--operator-confirmed \"причина\"\n"
+            "  ⚠️ Для ДИЗАЙН-ревью неразрешённые critical/high под бюджет НЕ подпадают: их\n"
+            "  находки нигде не сохраняются, поэтому блокировать было бы нечему — их чинят."))
+    return (used + 1, budget, "")
+
+
+def review_round_record(artifact: str) -> None:
+    p = _rounds_path()
+    if p is None:
+        return
+    state = _rounds_state()
+    state[artifact] = int(state.get(artifact, 0)) + 1
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(p, state)
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[0] if argv else ""
     if cmd == "check-reviewed":
@@ -4917,6 +5052,34 @@ def main(argv: list[str]) -> int:
             return 0
         clear_marker()
         return 0
+    if cmd == "residuals-accept":              # стоп-политика v3: закрыть цикл ревью явно
+        if not _require_repo():
+            return 2
+        art = argv[1] if len(argv) > 1 else ""
+        confirmed = "--operator-confirmed" in argv
+        reason = " ".join(a for a in argv[2:] if not a.startswith("--")).strip()
+        if not art or not reason:
+            print("usage: residuals-accept <artifact> --operator-confirmed \"причина\"",
+                  file=sys.stderr)
+            return 1
+        if not confirmed:
+            print("[codex-gate] ✗ регистрация остатков — решение ЧЕЛОВЕКА: он принимает цену.\n"
+                  "  Добавь --operator-confirmed. И убедись, что неразрешённых critical/high\n"
+                  "  дизайн-ревью НЕТ: они под бюджет не подпадают (их находки нигде не\n"
+                  "  сохраняются, блокировать было бы нечему).", file=sys.stderr)
+            return 2
+        state = _rounds_state()
+        state.pop(art, None)
+        pth = _rounds_path()
+        if pth is not None:
+            pth.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_json(pth, state)
+        audit(f"residuals-accept artifact={art} tier={review_tier()} "
+              f"reason={redact_secrets(reason)[:300]!r}")
+        print(f"[codex-gate] ✓ остатки по {art} приняты; счётчик раундов сброшен. "
+              "Запись в аудите. Открытые находки ledger'а при этом НЕ трогаются — "
+              "они продолжают блокировать деплой.")
+        return 0
     if cmd == "companion-review":
         # Дизайн-ревью для скилла: подкоманда ВЫПОЛНЯЕТ ревью, а не печатает argv.
         # Печать argv (прошлая companion-path) обходила редакцию — в argv может лежать
@@ -4927,6 +5090,32 @@ def main(argv: list[str]) -> int:
             print("usage: companion-review [--base <ref>] [--scope <scope>] \"<фокус-текст>\"",
                   file=sys.stderr)
             return 1
+        # Артефакт цикла: файл дизайна, если он назван, иначе диапазон кода.
+        artifact = _review_artifact_key(passthrough)
+        # `--design-file` — флаг ГЕЙТА, не companion'а: он объявляет вид артефакта и до
+        # внешнего движка не доезжает.
+        if "--design-file" in passthrough:
+            i = passthrough.index("--design-file")
+            passthrough = passthrough[:i] + passthrough[i + 2:]
+        with findings_lock():            # check+increment одной транзакцией: две сессии иначе
+            rnd, budget, refusal = review_round_check(artifact)   # проходили обе
+            if refusal:
+                print(refusal, file=sys.stderr)
+                return 2
+        if is_design_artifact(artifact):
+            print(f"[codex-gate] дизайн-ревью {artifact}: бюджет не применяется (ОДИН раунд по "
+                  "подходу — правило скилла, а не механика: находки дизайна нигде не "
+                  "сохраняются).", file=sys.stderr)
+        else:
+            print(f"[codex-gate] ревью {artifact}: раунд {rnd} из {budget} "
+                  f"(ярус {review_tier()})", file=sys.stderr)
+        if rnd >= 3:
+            # Класс находок машинно не размечен (это потребовало бы менять контракт ревьюера —
+            # ровно то изменение, от которого отказались как от несоразмерного). Поэтому
+            # напоминание прозой: два раунда одного класса — сигнал переформулировать правило.
+            print("[codex-gate] ⚠️ третий раунд и дальше: если находки повторяют ОДИН класс — "
+                  "переформулируй правило на верном уровне общности либо режь фичу, а не чини "
+                  "экземпляры по одному.", file=sys.stderr)
         r = _exec_companion(["adversarial-review", "--wait", *passthrough])
         if r is None:
             return 2                     # отказ уже объяснён в stderr, дальше — fail-closed
@@ -4944,6 +5133,26 @@ def main(argv: list[str]) -> int:
             return 2
         # Тело ревью печатается дословно: это вход для читателя-агента, а не диагностика,
         # и порча текста редакцией исказила бы находки (источник #10 реестра ниже).
+        # Раунд засчитывается ТОЛЬКО здесь: аутэйдж (таймаут, квота, ненулевой код,
+        # деградировавший конверт) не должен жечь бюджет — иначе три сбоя подряд на ярусе
+        # decision отказывают в ПЕРВОМ же состоявшемся ревью (код-ревью 11.08.2026).
+        # Тот же принцип уже действует для счётчика раундов сходимости при partial-прогоне.
+        # Непустой текст с кодом 0 («You have hit your usage limit», traceback) — не ревью.
+        # Без этой проверки первая же деградация на ярусе convenience съедала весь бюджет и
+        # оператору предлагали принять несуществующие остатки (код-ревью 11.08.2026).
+        # Ответ НЕ отвергается: дизайн-ревью возвращает прозу без `Verdict:`, и она обязана
+        # проходить. Но и раунд за неё не засчитывается — иначе «You have hit your usage
+        # limit» с кодом 0 съедал бы бюджет и оператору предлагали принять несуществующие
+        # остатки (код-ревью 11.08.2026). Дёшево и без слома существующего контракта.
+        counts = not is_design_artifact(artifact) and parse_review_output(r.stdout or "").valid
+        if not counts and not is_design_artifact(artifact):
+            print("[codex-gate] ⚠️ ответ не по контракту ревью (нет валидного `Verdict:`) — "
+                  "раунд НЕ засчитан, бюджет не израсходован.", file=sys.stderr)
+        if counts:
+            with findings_lock():
+                review_round_record(artifact)
+            audit(f"review-round artifact={artifact} round={rnd}/{budget} "
+                  f"tier={review_tier()}")
         print(r.stdout, end="")
         return 0
     print(f"codex_review_gate: неизвестная команда {cmd!r}", file=sys.stderr)
