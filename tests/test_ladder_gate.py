@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -136,10 +137,12 @@ def test_full_chain_ok_with_real_gitignore(repo):
 # test_bookkeeping_exclusion_is_narrow, где .claude/.ladder-foo ОБЯЗАН влиять на compute_tree) —
 # поэтому здесь стейджим явные пути кода (не `git add -A`), воспроизводя тот же эффект.
 def _git(repo, *args):
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
-                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
-                        "PATH": os.environ["PATH"], "HOME": str(repo.parent)})
+    # Возвращает результат, а не глотает его: иначе тесту, которому нужен stdout, приходится
+    # звать subprocess напрямую — в обход HOME=tmp, то есть с ~/.gitconfig разработчика.
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True,
+                          env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                               "PATH": os.environ["PATH"], "HOME": str(repo.parent)})
 
 
 def _head(repo) -> str:
@@ -152,18 +155,20 @@ def _head_tree(repo) -> str:
                           capture_output=True, text=True, check=True).stdout.strip()
 
 
-def _grow_valid_chain(repo):
-    """Полная цепочка канонических проходов (после security-спеки — ТРИ звена):
-    begin/mark simplify → code-review → security, финальные правки в app/x.py."""
-    lg.begin_pass(repo, "simplify")
-    (repo / "app" / "x.py").write_text("x = 2\n")
-    lg.mark_pass(repo, "simplify")
-    lg.begin_pass(repo, "code-review")
-    (repo / "app" / "x.py").write_text("x = 2  # reviewed\n")
-    lg.mark_pass(repo, "code-review")
-    lg.begin_pass(repo, "security")
-    (repo / "app" / "x.py").write_text("x = 2  # reviewed, security-checked\n")
-    lg.mark_pass(repo, "security")
+def _grow_valid_chain(repo, rel="app/x.py"):
+    """Полная цепочка канонических проходов с правкой между звеньями.
+
+    Проходы берутся из `DEPLOY_REQUIRED_PASSES`, а не перечисляются литералами: второй
+    хелпер со своим списком разошёлся бы с тем, что гейт считает валидной цепочкой, ровно
+    в том файле, который это и стережёт."""
+    for name in lg.DEPLOY_REQUIRED_PASSES:
+        lg.begin_pass(repo, name)
+        (repo / rel).write_text(f"x = 2  # {name}\n")
+        lg.mark_pass(repo, name)
+
+
+def _tree_paths(repo, tree) -> list[str]:
+    return _git(repo, "ls-tree", "-r", "--name-only", tree).stdout.split()
 
 
 # --- changed_paths_staged / commit_touches_code ---
@@ -746,3 +751,600 @@ def test_repo_root_falls_back_to_cwd_outside_git(tmp_path, monkeypatch):
     """Вне git-репо поведение прежнее — гейт не обязан падать там, где его просто нет."""
     monkeypatch.chdir(tmp_path)
     assert lg._repo_root() == Path.cwd()
+
+
+# --- tree-хэш на нерегулярных записях (BUG-0.9.0-symlink-tree-hash + находки дизайн-ревью) ---
+# Общий корень всех случаев ниже: compute_tree считал, что запись дерева — это регулярный
+# файл, хэшируемый по пути. Каждое отступление (симлинк, gitlink, сырые байты, запись без
+# файла на диске) давало либо падение движка, либо молча неверный tree-хэш. Проверка везде
+# ЭТАЛОННАЯ — равенство настоящему дереву git'а, а не «не упало»: неверный хэш означает, что
+# маркер лесенки привязан к дереву, которого не существует.
+
+def _mkrepo(tmp_path, name):
+    r = tmp_path / name
+    r.mkdir(parents=True)
+    _git(r, "init", "-q", "-b", "main", ".")
+    r.joinpath(".gitignore").write_text(".claude/\n")     # как в реальных репо: бухгалтерия вне git
+    return r
+
+
+def _commit_all(r, msg="init"):
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", msg)
+
+
+@pytest.fixture()
+def symlink_repo(tmp_path):
+    """Три вида tracked-симлинков. `linkdir` — на директорию: ровно он валил движок
+    (`hash-object` по пути разыменовывает ссылку, а на директории git отвечает
+    `fatal: Unable to add (null) to database`). `linkfile` — на файл: он НЕ падал, а молча
+    получал блоб СОДЕРЖИМОГО цели при режиме 120000, то есть tree-хэш врал. `broken` — на
+    несуществующий путь."""
+    r = _mkrepo(tmp_path, "sl")
+    (r / "real" / "sub").mkdir(parents=True)
+    (r / "real" / "sub" / "f").write_text("x\n")
+    os.symlink("real/sub", r / "linkdir")
+    os.symlink("real/sub/f", r / "linkfile")
+    os.symlink("nowhere/missing", r / "broken")
+    _commit_all(r)
+    return r
+
+
+def test_compute_tree_matches_git_tree_with_symlinks(symlink_repo):
+    assert lg.compute_tree(symlink_repo) == _head_tree(symlink_repo)
+
+
+def test_compute_tree_symlink_to_file_hashes_link_text_not_target(tmp_path):
+    """Тихая половина бага: симлинк на ФАЙЛ не роняет hash-object — он отдаёт блоб цели.
+    Падения нет, хэш неверен. Отдельным тестом, чтобы регресс ловился и без симлинка
+    на директорию."""
+    r = _mkrepo(tmp_path, "sf")
+    (r / "real").mkdir()
+    (r / "real" / "f").write_text("target-content\n")
+    os.symlink("real/f", r / "link")
+    _commit_all(r)
+    assert lg.compute_tree(r) == _head_tree(r)
+
+
+def test_compute_tree_handles_non_utf8_symlink_target(tmp_path):
+    """Цель симлинка — любые байты кроме NUL. `os.readlink` отдаёт str с surrogate-escape, и
+    текстовый режим subprocess падал бы UnicodeEncodeError — мимо диагностики, потому что это
+    не TrustedGitError (находка дизайн-ревью, раунд 1)."""
+    r = _mkrepo(tmp_path, "nonutf")
+    (r / "plain.txt").write_text("p\n")
+    os.symlink(b"real/\xff\xfename", os.fsencode(r / "link"))
+    _commit_all(r)
+    assert lg.compute_tree(r) == _head_tree(r)
+
+
+def test_ladder_runs_in_repo_with_dir_symlink(symlink_repo, monkeypatch):
+    """Маршрут оператора целиком в затронутом репо: до фикса begin падал TrustedGitError."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    lg.begin_pass(symlink_repo, "simplify")
+    (symlink_repo / "real" / "sub" / "f").write_text("y\n")
+    lg.mark_pass(symlink_repo, "simplify")
+    m = lg.read_marker(symlink_repo, "simplify")
+    assert m["tree_before"] != m["tree_after"]
+
+
+def test_symlink_retarget_changes_tree(symlink_repo):
+    """Хэш обязан быть чувствителен к перенаправлению ссылки: подмена цели — правка кода."""
+    t0 = lg.compute_tree(symlink_repo)
+    (symlink_repo / "real" / "other").mkdir()
+    (symlink_repo / "linkdir").unlink()
+    os.symlink("real/other", symlink_repo / "linkdir")
+    assert lg.compute_tree(symlink_repo) != t0
+
+
+@pytest.fixture()
+def submodule_repo(tmp_path):
+    sub = _mkrepo(tmp_path, "sub")
+    (sub / "a.txt").write_text("a\n")
+    _commit_all(sub, "s1")
+    top = _mkrepo(tmp_path, "top")
+    (top / "app").mkdir()
+    (top / "app" / "x.py").write_text("x = 1\n")
+    _commit_all(top)
+    _git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    _git(top, "commit", "-qm", "add submodule")
+    return top, sub
+
+
+def test_compute_tree_matches_git_tree_with_submodule(submodule_repo):
+    top, _ = submodule_repo
+    assert lg.compute_tree(top) == _head_tree(top)
+
+
+def test_ladder_completes_in_repo_with_submodule(submodule_repo, monkeypatch):
+    """Находка дизайн-ревью (critical), воспроизведена: gitlink выпадал из compute_tree, а в
+    index_tree он есть всегда — значит честная цепочка НИКОГДА не могла дать 0, и репозиторий
+    с подмодулем жил на LADDER_SKIP. Сквозной тест: полная цепочка обязана пропустить коммит."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    top, _ = submodule_repo
+    _grow_valid_chain(top)
+    _git(top, "add", "app/x.py")
+    assert lg.check_precommit(top) == 0
+
+
+def test_submodule_head_move_changes_tree(submodule_repo, monkeypatch):
+    """Бамп указателя подмодуля обязан ломать цепочку, а не проскакивать под старым маркером."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    top, sub = submodule_repo
+    _grow_valid_chain(top)
+    _git(top, "add", "app/x.py")
+    assert lg.check_precommit(top) == 0
+
+    (sub / "b.txt").write_text("b\n")
+    _commit_all(sub, "s2")
+    new_head = _head(sub)
+    _git(top / "sub", "-c", "protocol.file.allow=always", "fetch", "-q", "origin")
+    _git(top / "sub", "checkout", "-q", new_head)
+    # Незастейдженный сдвиг в коммит не попадает: check_precommit сверяет маркер с ИНДЕКСОМ.
+    assert lg.check_precommit(top) == 0
+    _git(top, "add", "sub")                     # а вот теперь он ЧАСТЬ коммита
+    assert lg.check_precommit(top) == 2
+
+
+def test_uninitialized_submodule_completes_ladder(submodule_repo, monkeypatch):
+    """Неинициализированный подмодуль: `git add -A` его не трогает, дерево обязано совпасть
+    с индексом — иначе снова неисполнимая лесенка."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    top, _ = submodule_repo
+    _git(top, "submodule", "deinit", "-f", "-q", "sub")
+    assert lg.compute_tree(top) == _head_tree(top)
+    _grow_valid_chain(top)
+    _git(top, "add", "app/x.py")
+    assert lg.check_precommit(top) == 0
+
+
+def test_removed_submodule_directory_drops_entry(submodule_repo):
+    """Удалённый каталог подмодуля выпадает из дерева, как выпадает удалённый файл."""
+    top, _ = submodule_repo
+    shutil.rmtree(top / "sub")
+    assert "sub" not in _tree_paths(top, lg.compute_tree(top))
+
+
+def test_ladder_completes_in_sparse_checkout(tmp_path, monkeypatch):
+    """Находка дизайн-ревью (раунд 2), воспроизведена и шире заявленного: SKIP_WORKTREE-запись
+    отсутствует на диске, но остаётся в индексе. Трактовка «нет файла = удалён» разводила
+    compute_tree и index_tree в ЛЮБОМ sparse-checkout репозитории (на обычных файлах, не
+    только на подмодулях) — лесенка была неисполнима."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    r = _mkrepo(tmp_path, "sparse")
+    for d in ("keep", "excluded"):
+        (r / d).mkdir()
+        (r / d / "f.py").write_text(f"# {d}\n")
+    _commit_all(r)
+    _git(r, "sparse-checkout", "init", "--cone")
+    _git(r, "sparse-checkout", "set", "keep")
+    assert not (r / "excluded").exists()                  # запись есть в индексе, файла нет
+    assert lg.compute_tree(r) == lg.index_tree(r)
+
+    _grow_valid_chain(r, "keep/f.py")
+    _git(r, "add", "keep/f.py")
+    assert lg.check_precommit(r) == 0
+
+
+def test_sparse_plus_assume_unchanged_completes_ladder(tmp_path, monkeypatch):
+    """`skip-worktree` и `assume-unchanged` — независимые биты, и `ls-files -v` кодирует
+    второй РЕГИСТРОМ буквы первого: у записи с обоими флаг `s`, а не `S`. Наивное сравнение
+    `tag == "S"` вернуло бы такую запись в ветку «удалён» и воспроизвело неисполнимую
+    лесенку (находка дизайн-ревью, раунд 3)."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    r = _mkrepo(tmp_path, "combined")
+    for d in ("keep", "excluded"):
+        (r / d).mkdir()
+        (r / d / "f.py").write_text(f"# {d}\n")
+    _commit_all(r)
+    _git(r, "sparse-checkout", "init", "--cone")
+    _git(r, "sparse-checkout", "set", "keep")
+    _git(r, "update-index", "--assume-unchanged", "excluded/f.py")
+    flags = {e.split()[0] for e in _git(r, "ls-files", "-v", "-s").stdout.splitlines() if e}
+    assert "s" in flags, f"ожидался комбинированный флаг 's', получены {flags}"
+    assert lg.compute_tree(r) == lg.index_tree(r)
+
+    _grow_valid_chain(r, "keep/f.py")
+    _git(r, "add", "keep/f.py")
+    assert lg.check_precommit(r) == 0
+
+
+def test_sparse_checkout_still_tracks_in_cone_edits(tmp_path):
+    """Sparse checkout не должен стать дырой: правка ВНУТРИ конуса меняет tree-хэш."""
+    r = _mkrepo(tmp_path, "sparse2")
+    for d in ("keep", "excluded"):
+        (r / d).mkdir()
+        (r / d / "f.py").write_text(f"# {d}\n")
+    _commit_all(r)
+    _git(r, "sparse-checkout", "init", "--cone")
+    _git(r, "sparse-checkout", "set", "keep")
+    t0 = lg.compute_tree(r)
+    (r / "keep" / "f.py").write_text("# changed\n")
+    assert lg.compute_tree(r) != t0
+
+
+def test_deleted_file_still_changes_tree(tmp_path):
+    """Настоящее удаление обязано менять дерево — его нельзя спутать со skip-worktree."""
+    r = _mkrepo(tmp_path, "del")
+    (r / "a.py").write_text("a\n")
+    (r / "b.py").write_text("b\n")
+    _commit_all(r)
+    t0 = lg.compute_tree(r)
+    (r / "b.py").unlink()
+    tree = lg.compute_tree(r)
+    assert tree != t0
+    assert "b.py" not in _tree_paths(r, tree)
+
+
+def test_assume_unchanged_does_not_hide_edit(tmp_path):
+    """`assume-unchanged` прячет правку от самого git'а; гейт целостности обязан её видеть."""
+    r = _mkrepo(tmp_path, "assume")
+    (r / "a.py").write_text("a\n")
+    _commit_all(r)
+    _git(r, "update-index", "--assume-unchanged", "a.py")
+    t0 = lg.compute_tree(r)
+    (r / "a.py").write_text("MALICIOUS\n")
+    assert lg.compute_tree(r) != t0
+
+
+def test_unmerged_entry_collapses_to_worktree_content(tmp_path):
+    """Конфликтный merge даёт stage 1/2/3 и НИ ОДНОЙ stage-0 записи. Путь не должен потеряться:
+    `git add -A` застейджил бы содержимое рабочего дерева одной stage-0 записью."""
+    r = _mkrepo(tmp_path, "merge")
+    (r / "c.txt").write_text("base\n")
+    _commit_all(r, "base")
+    _git(r, "checkout", "-q", "-b", "other")
+    (r / "c.txt").write_text("other\n")
+    _commit_all(r, "other")
+    _git(r, "checkout", "-q", "main")
+    (r / "c.txt").write_text("mine\n")
+    _commit_all(r, "mine")
+    subprocess.run(["git", "merge", "other"], cwd=r, capture_output=True)   # конфликт
+    stages = _git(r, "ls-files", "-s", "c.txt").stdout.splitlines()
+    assert len(stages) == 3, f"ожидался конфликт со stage 1/2/3, получено {stages}"
+
+    tree = lg.compute_tree(r)
+    entries = _git(r, "ls-tree", "-r", tree).stdout
+    assert entries.count("\tc.txt") == 1                  # ровно одна запись, не три
+    on_disk = _git(r, "hash-object", "--no-filters", "--", "c.txt").stdout.strip()
+    assert on_disk in entries                             # и это содержимое С ДИСКА
+
+
+# --- отказ движка ≠ непройденная лесенка ---
+
+def _break_engine(monkeypatch, exc):
+    def boom(root):
+        raise exc
+    monkeypatch.setattr(lg, "compute_tree", boom)
+
+
+def test_precommit_reports_broken_engine_not_missing_passes(repo, monkeypatch, capsys):
+    """Инцидент 0.9.0 прожил двое суток именно из-за этого: отказ движка печатался как
+    штатное «цепочка не подтверждена», а подсказка в конце вела прямо к LADDER_SKIP —
+    инфраструктурный отказ читался как собственная забывчивость оператора."""
+    (repo / "app" / "x.py").write_text("x = 42\n")
+    subprocess.run(["git", "add", "app/x.py"], cwd=repo, check=True)
+    _break_engine(monkeypatch, lg.TrustedGitError(
+        "не посчитать хэш симлинка 'linkdir' (git rc=128): "
+        "fatal: Unable to add (null) to database — tree-хэш не посчитать"))
+    rc = lg.check_precommit(repo)
+    err = capsys.readouterr().err
+    assert rc == 2                                        # коммит по-прежнему блокирован
+    assert "ДВИЖОК ГЕЙТА СЛОМАН" in err
+    assert "Unable to add (null)" in err                  # stderr git'а доехал до оператора
+    assert "цепочка" not in err                           # и это НЕ штатное сообщение
+
+
+def test_precommit_reports_broken_engine_for_any_exception(repo, monkeypatch, capsys):
+    """Перечислять формы отказа бессмысленно: их нашлось четыре за один день, а не-UTF-8 имя
+    файла на APFS даже не воспроизводится. Громким обязано быть ЛЮБОЕ исключение."""
+    (repo / "app" / "x.py").write_text("x = 42\n")
+    subprocess.run(["git", "add", "app/x.py"], cwd=repo, check=True)
+    _break_engine(monkeypatch, UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates"))
+    rc = lg.check_precommit(repo)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "ДВИЖОК ГЕЙТА СЛОМАН" in err
+    assert "Traceback" in err                             # трейсбек не проглочен, а озаглавлен
+
+
+def test_main_reports_broken_engine_exit_3(repo, monkeypatch, capsys):
+    """begin/mark на сломанном движке: код 3 (отличим и от 0, и от 2 = «гейт блокирует»)."""
+    _break_engine(monkeypatch, lg.TrustedGitError("синтетический отказ"))
+    monkeypatch.setattr(lg, "_repo_root", lambda: repo)
+    assert lg.main(["begin", "simplify"]) == 3
+    assert "ДВИЖОК ГЕЙТА СЛОМАН" in capsys.readouterr().err
+
+
+def test_main_still_reports_ladder_errors_plainly(repo, monkeypatch, capsys):
+    """Нарушение протокола — не отказ движка: оно обязано остаться обычным сообщением и 2."""
+    monkeypatch.setattr(lg, "_repo_root", lambda: repo)
+    assert lg.main(["mark", "simplify"]) == 2             # mark без begin
+    err = capsys.readouterr().err
+    assert "ДВИЖОК ГЕЙТА СЛОМАН" not in err
+    assert "без begin" in err
+
+
+def test_tree_hash_error_carries_git_stderr(repo, monkeypatch):
+    """`не посчитать хэш X` без stderr git'а недиагностируем — причину инцидента пришлось
+    воспроизводить руками."""
+    real = lg._git_mutate
+
+    def failing(root, env, *args, stdin_bytes=None):
+        if args and args[0] == "hash-object":
+            return subprocess.CompletedProcess(args, 128, "", "fatal: синтетический отказ\n")
+        return real(root, env, *args, stdin_bytes=stdin_bytes)
+
+    monkeypatch.setattr(lg, "_git_mutate", failing)
+    with pytest.raises(lg.TrustedGitError, match="синтетический отказ"):
+        lg.compute_tree(repo)
+
+
+# --- инвариант как исполняемое свойство ---
+# Заявленный инвариант: compute_tree == дерево, которое дал бы `git add -A && git write-tree`.
+# Пока он жил только в прозе докстринга, сравнения шли против _head_tree на ЧИСТОМ репо, где
+# он тождествен, — то есть проверялось свойство слабее заявленного. Здесь он проверяется в том
+# единственном состоянии, в котором compute_tree реально зовут из begin/mark: на ГРЯЗНОМ дереве.
+
+def _add_all_tree(repo) -> str:
+    """Эталон: что реально застейджил бы `git add -A`, во ВРЕМЕННОМ индексе (реальный цел)."""
+    idx = repo.parent / f".idx-inv-{repo.name}"
+    idx.unlink(missing_ok=True)
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "PATH": os.environ["PATH"], "HOME": str(repo.parent),
+           "GIT_INDEX_FILE": str(idx)}
+    def g(*a):
+        return subprocess.run(["git", *a], cwd=repo, env=env, capture_output=True, text=True)
+    g("read-tree", "HEAD")
+    g("add", "-A")
+    tree = g("write-tree").stdout.strip()
+    idx.unlink(missing_ok=True)
+    return tree
+
+
+def test_compute_tree_equals_git_add_all_on_dirty_symlink_tree(symlink_repo):
+    r = symlink_repo
+    (r / "untracked.py").write_text("u = 1\n")            # новый неотслеживаемый файл
+    (r / "real" / "sub" / "f").write_text("edited\n")     # правка отслеживаемого
+    (r / "real" / "other").mkdir()
+    (r / "linkfile").unlink()
+    os.symlink("real/other", r / "linkfile")              # ссылка перенацелена на КАТАЛОГ
+    (r / "broken").unlink()                               # симлинк удалён
+    assert lg.compute_tree(r) == _add_all_tree(r)
+
+
+def test_compute_tree_equals_git_add_all_on_dirty_submodule_tree(submodule_repo):
+    top, _ = submodule_repo
+    (top / "app" / "new.py").write_text("n = 1\n")
+    (top / "app" / "x.py").write_text("x = 99\n")
+    assert lg.compute_tree(top) == _add_all_tree(top)
+
+
+def test_untracked_nested_git_repo_becomes_gitlink(tmp_path):
+    """Вендоренный клон приходит из `ls-files -o` ОДНИМ путём со слэшем, и вид записи у него
+    определяет ДИСК (каталог с .git → gitlink), а не индекс, где его нет. Пока вид брался из
+    индекса, каталог молча выпадал из дерева со всем поддеревом: правка внутри него не меняла
+    tree-хэш вовсе — та же тихая слепота, что у симлинка на файл."""
+    r = _mkrepo(tmp_path, "nested")
+    (r / "app").mkdir()
+    (r / "app" / "x.py").write_text("x = 1\n")
+    _commit_all(r)
+    vendor = r / "vendor"
+    vendor.mkdir()
+    _git(vendor, "init", "-q", "-b", "main", ".")
+    (vendor / "lib.py").write_text("v = 1\n")
+    _git(vendor, "add", "-A")
+    _git(vendor, "commit", "-qm", "v1")
+
+    assert lg.compute_tree(r) == _add_all_tree(r)          # инвариант держится
+    t0 = lg.compute_tree(r)
+    (vendor / "lib.py").write_text("v = 999\n")           # правка ВНУТРИ вложенного репо
+    _git(vendor, "add", "-A")
+    _git(vendor, "commit", "-qm", "v2")
+    assert lg.compute_tree(r) != t0                        # и она видна
+
+
+def test_gate_refusal_is_not_engine_breakage_and_offers_no_bypass(repo, monkeypatch, capsys):
+    """Отказ доверия («похоже на подмену git») — не поломка движка. До разведения он печатался
+    тем же баннером и с готовым рецептом LADDER_SKIP, то есть сигнал ОБНАРУЖЕННОЙ подмены
+    приходил вместе с инструкцией, как её обойти."""
+    def refuse():
+        raise lg.GateRefusal("git выдал корень /other, не содержащий текущий каталог — "
+                             "похоже на подмену git; решения лесенки не принимаются")
+    monkeypatch.setattr(lg, "_repo_root", refuse)
+    assert lg.main(["begin", "simplify"]) == 3
+    err = capsys.readouterr().err
+    assert "ГЕЙТ ОТКАЗАЛСЯ РЕШАТЬ" in err
+    assert "ДВИЖОК ГЕЙТА СЛОМАН" not in err
+    assert "LADDER_SKIP" not in err              # рецепта обхода тут быть не должно
+    assert "Обходить НЕЛЬЗЯ" in err
+
+
+def test_engine_breakage_still_offers_audited_bypass(repo, monkeypatch, capsys):
+    """Обратная сторона: настоящая поломка обход предлагать обязана — иначе оператор заперт."""
+    _break_engine(monkeypatch, lg.TrustedGitError("не посчитать хэш — tree-хэш не посчитать"))
+    monkeypatch.setattr(lg, "_repo_root", lambda: repo)
+    assert lg.main(["begin", "simplify"]) == 3
+    err = capsys.readouterr().err
+    assert "ДВИЖОК ГЕЙТА СЛОМАН" in err
+    assert "LADDER_SKIP" in err
+
+
+# --- находки код-ревью 2026-08-13 ---
+
+def test_skip_worktree_cannot_launder_staged_bytes(tmp_path):
+    """Канал подмены через skip-worktree (находка код-ревью, high).
+
+    Бит skip-worktree ставит ПРОВЕРЯЕМАЯ сторона. Атака: застейджить злое, вернуть на диск
+    безобидное, поставить `--skip-worktree`. Если дереву брать oid из индекса безусловно, то
+    маркеры лесенки хэшируют злой блоб, ревьюер читает добрый файл, а pre-commit сходится —
+    два разных рабочих дерева получают один хэш. Индексу верим ТОЛЬКО когда файла нет."""
+    r = _mkrepo(tmp_path, "tamper")
+    (r / "app.py").write_text("safe = 1\n")
+    _commit_all(r)
+
+    (r / "app.py").write_text("MALICIOUS = 'payload'\n")
+    _git(r, "add", "app.py")
+    evil = _git(r, "rev-parse", ":app.py").stdout.strip()
+    (r / "app.py").write_text("safe = 1\n")               # ревьюер увидит это
+    good = _git(r, "hash-object", "--no-filters", "--", "app.py").stdout.strip()
+    _git(r, "update-index", "--skip-worktree", "app.py")
+    assert evil != good
+
+    entries = _git(r, "ls-tree", "-r", lg.compute_tree(r)).stdout
+    assert good in entries, "tree-хэш обязан отражать ДИСК, а не застейдженные байты"
+    assert evil not in entries
+    # и, как следствие, честная цепочка на таком дереве не сойдётся с индексом — fail-closed
+    assert lg.compute_tree(r) != lg.index_tree(r)
+
+
+def test_file_replaced_by_empty_directory_matches_git(tmp_path):
+    """Смена типа файл→каталог: раньше фабриковался gitlink `160000` поверх блоб-oid'а."""
+    r = _mkrepo(tmp_path, "f2dir")
+    (r / "thing").write_text("i am a file\n")
+    (r / "keep.py").write_text("k = 1\n")
+    _commit_all(r)
+    (r / "thing").unlink()
+    (r / "thing").mkdir()
+    assert lg.compute_tree(r) == _add_all_tree(r)
+    assert "thing" not in _tree_paths(r, lg.compute_tree(r))
+
+
+def test_file_replaced_by_directory_with_contents_matches_git(tmp_path):
+    """Тот же случай, но каталог НЕ пуст: `update-index` падал
+    `appears as both a file and as a directory`, то есть лесенка была неисполнима."""
+    r = _mkrepo(tmp_path, "f2dir2")
+    (r / "thing").write_text("file\n")
+    _commit_all(r)
+    (r / "thing").unlink()
+    (r / "thing").mkdir()
+    (r / "thing" / "inner.py").write_text("inner = 1\n")
+    assert lg.compute_tree(r) == _add_all_tree(r)
+    assert "thing/inner.py" in _tree_paths(r, lg.compute_tree(r))
+
+
+def test_skip_worktree_absent_file_cannot_launder_staged_bytes(tmp_path):
+    """Форма 2 того же канала (код-ревью, раунд 2): застейджить злое, skip-worktree, удалить
+    файл — ревьюер не видит НИЧЕГО, а в коммит уезжает злой блоб."""
+    r = _mkrepo(tmp_path, "launder2")
+    (r / "app.py").write_text("safe = 1\n")
+    _commit_all(r)
+
+    (r / "app.py").write_text("MALICIOUS = 'payload'\n")
+    _git(r, "add", "app.py")
+    _git(r, "update-index", "--skip-worktree", "app.py")
+    (r / "app.py").unlink()
+
+    with pytest.raises(lg.TrustedGitError, match="skip-worktree"):
+        lg.compute_tree(r)
+
+
+def test_skip_worktree_unchanged_from_head_is_accepted(tmp_path):
+    """Обратная сторона: законный sparse-checkout обязан продолжать работать — там
+    невидимая запись совпадает с HEAD, ревьюить в ней нечего."""
+    r = _mkrepo(tmp_path, "legit_sparse")
+    for d in ("keep", "excluded"):
+        (r / d).mkdir()
+        (r / d / "f.py").write_text(f"# {d}\n")
+    _commit_all(r)
+    _git(r, "sparse-checkout", "init", "--cone")
+    _git(r, "sparse-checkout", "set", "keep")
+    assert lg.compute_tree(r) == lg.index_tree(r)
+
+
+def test_deinitialized_submodule_cannot_launder_staged_pointer(tmp_path):
+    """Форма 3 (код-ревью, раунд 3): переключить подмодуль на злой коммит, застейджить
+    указатель, деинициализировать — содержимого на диске нет, ревьюеру нечего смотреть."""
+    sub = _mkrepo(tmp_path, "sub")
+    (sub / "a.txt").write_text("benign\n")
+    _commit_all(sub, "good")
+    top = _mkrepo(tmp_path, "top")
+    (top / "app.py").write_text("x = 1\n")
+    _commit_all(top)
+    _git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor")
+    _git(top, "commit", "-qm", "add submodule")
+
+    (sub / "a.txt").write_text("MALICIOUS\n")
+    _commit_all(sub, "evil")
+    evil = _head(sub)
+    _git(top / "vendor", "-c", "protocol.file.allow=always", "fetch", "-q", "origin")
+    _git(top / "vendor", "checkout", "-q", evil)
+    _git(top, "add", "vendor")                       # злой указатель в индексе
+    _git(top, "submodule", "deinit", "-f", "-q", "vendor")   # и содержимое спрятано
+
+    with pytest.raises(lg.TrustedGitError, match="разошёлся с HEAD"):
+        lg.compute_tree(top)
+
+
+def test_skip_worktree_on_brand_new_file_cannot_launder(tmp_path):
+    """Форма, которой ревью НЕ называло — доказательство, что закрыт класс, а не экземпляры:
+    файла не было в HEAD вовсе, сравнивать не с чем, значит проходить он не должен."""
+    r = _mkrepo(tmp_path, "sw_new")
+    (r / "keep.py").write_text("k = 1\n")
+    _commit_all(r)
+    (r / "secret.py").write_text("BACKDOOR = 1\n")
+    _git(r, "add", "secret.py")
+    _git(r, "update-index", "--skip-worktree", "secret.py")
+    (r / "secret.py").unlink()
+
+    with pytest.raises(lg.TrustedGitError, match="разошёлся с HEAD"):
+        lg.compute_tree(r)
+
+
+def test_deinitialized_submodule_with_untouched_pointer_is_accepted(tmp_path):
+    """Обратная сторона: законный deinit (указатель не трогали) обязан работать."""
+    sub = _mkrepo(tmp_path, "sub2")
+    (sub / "a.txt").write_text("a\n")
+    _commit_all(sub, "s1")
+    top = _mkrepo(tmp_path, "top2")
+    (top / "app.py").write_text("x = 1\n")
+    _commit_all(top)
+    _git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendor")
+    _git(top, "commit", "-qm", "add submodule")
+    _git(top, "submodule", "deinit", "-f", "-q", "vendor")
+    assert lg.compute_tree(top) == lg.index_tree(top)
+
+
+def test_moving_head_cannot_bless_invisible_content(tmp_path, monkeypatch):
+    """Находка security-ревью: базис правила «невидимое не менялось» — HEAD, а HEAD это
+    обычная ссылка, которую проверяемая сторона переставляет `git symbolic-ref` НЕ трогая ни
+    индекс, ни рабочее дерево. Схема: спрятать бэкдор в индекс, перевести HEAD на старую ветку,
+    где он «не менялся», провести всю лесенку, вернуть HEAD и закоммитить. Маркеры честные,
+    ledger полный — а содержимое не видел никто. Поэтому исключение перепроверяется на
+    pre-commit против того HEAD, на который коммит реально ложится."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "atk")
+    r = _mkrepo(tmp_path, "headatk")
+    (r / "app.py").write_text("v1\n")
+    _commit_all(r, "base")
+    _git(r, "checkout", "-q", "-b", "legacy")
+    (r / "auth.py").write_text("BACKDOOR = True\n")
+    _commit_all(r, "legacy")
+    backdoor = _git(r, "rev-parse", "legacy:auth.py").stdout.strip()
+    _git(r, "checkout", "-q", "main")
+
+    (r / "app.py").write_text("v2\n")                    # видимая безобидная правка
+    _git(r, "add", "app.py")
+    _git(r, "update-index", "--add", "--cacheinfo", f"100644,{backdoor},auth.py")
+    _git(r, "update-index", "--skip-worktree", "auth.py")
+    assert not (r / "auth.py").exists()                   # ревьюер этого не увидит
+
+    with pytest.raises(lg.TrustedGitError, match="разошёлся с HEAD"):
+        lg.compute_tree(r)                                # с честным HEAD — отказ
+
+    _git(r, "symbolic-ref", "HEAD", "refs/heads/legacy")  # подменяем базис
+    for name in lg.DEPLOY_REQUIRED_PASSES:
+        lg.begin_pass(r, name)
+        lg.mark_pass(r, name)
+    _git(r, "symbolic-ref", "HEAD", "refs/heads/main")    # и возвращаем
+
+    assert lg.check_precommit(r) == 2                     # цепочка честна, но коммит блокирован
+
+
+def test_precommit_unseen_recheck_leaves_normal_flow_alone(repo, monkeypatch):
+    """Обратная сторона: перепроверка не должна трогать обычный ход дел. Незастейдженная
+    правка в дереве законна, коммита не касается и блокировать его не обязана."""
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
+    _grow_valid_chain(repo)
+    _git(repo, "add", "app/x.py")
+    (repo / "app" / "x.py").write_text("правка ПОСЛЕ mark, не застейджена\n")
+    assert lg.check_precommit(repo) == 0
