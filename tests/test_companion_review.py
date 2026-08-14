@@ -21,6 +21,10 @@ def _fake(monkeypatch, script: str) -> None:
 
 
 def test_passes_flags_and_focus_through_and_forces_wait(monkeypatch, capsys):
+    # Проверка непустоты входа — отдельный механизм со своими тестами
+    # (`test_review_input_guard.py`); здесь проверяется ПРОБРОС флагов, поэтому фиктивный
+    # `--base` не должен упираться в неё.
+    monkeypatch.setattr(g, "review_input_empty", lambda *a, **k: None)
     _fake(monkeypatch, 'printf "%s\\n" "$@"')
     rc = g.main(["companion-review", "--base", "abc123", "--scope", "branch", "фокус-текст"])
     out = capsys.readouterr().out

@@ -61,98 +61,101 @@ def _prepush_fetch(root: "Path", remote: str, branch: str, timeout: int):
     """Сетевая операция — ОТДЕЛЬНЫЙ адаптер: `protocol.*.allow=never` несовместим с fetch по
     построению, поэтому транспорт разрешается явно и URL валидируется. Всё остальное
     (абсолютный бинарь, аллоулист окружения, нейтрализация исполняемых конфигов) — как в слое."""
-    git = _trusted_git_bin()
-    if git is None:
-        raise TrustedGitError("доверенный git недоступен — fetch не выполнить безопасно")
-    url = _prepush_git("remote", "get-url", remote, cwd=root)
-    if url.returncode != 0:
-        # remote неизвестен/не читается — это ДОСТУПНОСТЬ, а не безопасность: пусть решает
-        # существующая политика on_fetch_failure (по умолчанию блок, скип аудируется).
-        return subprocess.CompletedProcess([], 128, "", f"remote {remote!r} не читается")
-    raw_url = url.stdout.strip()
-    if not _fetch_remote_allowed(raw_url):
-        # А это уже безопасность: `ext::` исполняет произвольную команду.
-        raise TrustedGitError(
-            f"remote {remote!r} использует запрещённый транспорт (`ext::` исполняет "
-            "произвольную команду) — сетевая операция отклонена")
-    # Тянем ПРОВАЛИДИРОВАННЫЙ URL, а не имя ремоута, и приводим его к абсолютному:
-    # относительный (`../base.git` — форма, разрешённая намеренно) резолвится от CWD ПРОЦЕССА,
-    # а cwd ниже нейтральный. Иначе смена cwd тихо переопределила бы, с какой историей
-    # сверяется гейт.
-    fetch_url = str((Path(root) / raw_url).resolve()) if _is_relative_local_url(raw_url) \
-        else raw_url
-    ssh = _trusted_ssh_bin()
-    if ssh is None:
-        # ПОЛИТИКА, а не доступность: `TrustedGitError` обходит `on_fetch_failure`, иначе при
-        # `skip-audited` пропавший ssh тихо пропустил бы гейт, хотя §4 обещает fail-closed
-        # безусловно. Форма та же, что у ветки `ext::` ниже.
-        raise TrustedGitError(
-            "ssh не найден в доверенных каталогах "
-            f"({', '.join(_TRUSTED_PATH_DIRS)}) — сетевая операция гейта невыполнима")
-    env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
-    env["HOME"] = str(_trusted_home())
-    env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
-    env.update({k: v for k, v in _GIT_SAFE_ENV.items()})
-    # Транспорт разрешаем АЛЛОУЛИСТОМ, и именно ПЕРЕМЕННОЙ: `-c protocol.allow=never` не спасает —
-    # `protocol.<схема>.allow` СПЕЦИФИЧНЕЕ, поэтому `protocol.ext.allow=always` из локального
-    # `.git/config` перебивает общий запрет откуда угодно, хоть с командной строки (проверено).
-    # `GIT_ALLOW_PROTOCOL` перекрывает и общий ключ, и специфичный.
-    #
-    # Зачем: `get-url` применяет `url.*.insteadOf` ОДИН раз, и мы валидируем результат, а
-    # `git fetch <url>` применяет правила к переданной строке ЕЩЁ раз. Цепочка из двух правил
-    # (`https://a/` → `https://b/` → `ext::sh -c …`) даёт транспорт, которого валидация не
-    # видела, — воспроизведён RCE правами pre-push хука (security-проход 2026-08-14). До
-    # перехода на fetch по URL расхождения не было: имя ремоута резолвилось тем же единственным
-    # проходом. Разрешаем РОВНО схему провалидированного URL: во что бы `insteadOf` строку ни
-    # переписал, чужой транспорт запрещён.
-    env["GIT_ALLOW_PROTOCOL"] = _url_scheme(fetch_url)
-    # убираем ПАРУ `-c protocol.allow=never` целиком: одиночный висячий `-c` съедал
-    # следующий аргумент как значение конфига, и `fetch` переставал быть подкомандой
-    neutralize: list[str] = []
-    for flag, val in zip(_GIT_NEUTRALIZE[::2], _GIT_NEUTRALIZE[1::2]):
-        if val == "protocol.allow=never":
-            continue                            # ставится ниже вместе с разрешённой схемой
-        if val.startswith("core.sshCommand="):
-            val = f"core.sshCommand={ssh}"      # транспорт ЗАКРЕПЛЯЕМ, а не гасим
-        neutralize += [flag, val]
-    # Проверки URL НЕДОСТАТОЧНО: git исполняет `remote.<name>.uploadpack` как КОМАНДУ на
-    # локальном транспорте, а `remote.<name>.vcs` и `core.gitProxy` дают то же самое другими
-    # путями. Воспроизведено ревью 09.08.2026 на системном git: `remote.probe.uploadpack`
-    # исполнилась при обычном pre-push fetch правами хука. Гасим все три и жёстко закрепляем
-    # upload-pack: неотразимая часть — именно КОМАНДА, а не адрес.
-    # `--upload-pack` из командной строки перебивает `remote.<name>.uploadpack` (замерено
-    # 09.08.2026), поэтому дублировать его через `-c` не нужно — иначе git ругается на два
-    # значения. А вот `remote.<name>.vcs` гасить ПУСТЫМ значением нельзя: git тогда ищет
-    # helper `git-remote-` и fetch ломается. Поэтому vcs — ОТКЛОНЯЕМ, как filter-драйверы.
-    vcs = _prepush_git("config", "--get", f"remote.{remote}.vcs", cwd=root)
-    if vcs.returncode == 0 and vcs.stdout.strip():
-        raise TrustedGitError(
-            f"remote {remote!r} задаёт vcs={vcs.stdout.strip()!r} — git исполнит внешний "
-            "transport-helper; сетевая операция отклонена")
-    exec_conf = ("-c", "core.gitProxy=")
-    # Рефспек ОБЯЗАТЕЛЕН, и это не украшение: `fetch <url> <branch>` пишет только FETCH_HEAD и
-    # НЕ двигает refs/remotes/<remote>/<branch> — оппортунистическое обновление трекинг-рефа
-    # происходит лишь при fetch по ИМЕНИ ремоута. А потребители (`_check_integration`) читают
-    # именно `base_ref` = `<remote>/<branch>`. Без рефспека гейт обновлял бы одно, а сверялся с
-    # другим, и пуш на разошедшуюся базу проходил бы (fail-open, воспроизведён на сдвиге базы
-    # из другого клона). Тест обязан ассертить трекинг-реф, а не FETCH_HEAD.
-    # Источник КВАЛИФИЦИРОВАН: короткое имя git разрешает DWIM'ом, а `refs/tags/<name>` в этом
-    # порядке стоит ПЕРЕД `refs/heads/<name>`. Ремоут с веткой `main` и одноимённым тегом на её
-    # предке отдал бы в трекинг-реф коммит ТЕГА, гейт увидел бы «отставания нет» и пропустил
-    # пуш на разошедшуюся базу (воспроизведено: тег 6dfe6cf вместо ветки 4740ca5).
-    # `--no-tags` — чтобы попутная выкачка тегов не переписала ничего ещё.
-    refspec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
-    # cwd — НЕ корень репозитория: относительный путь в любом конфиге, который читает git или
-    # ssh (`ProxyCommand ./proxy`, `core.sshCommand=./x`), резолвился в байты ПРОВЕРЯЕМОЙ
-    # стороны и исполнялся (воспроизведено 2026-08-14). Перечислять исполняемые директивы
-    # OpenSSH бессмысленно — денилист по чужому набору; уводим сам cwd, и класс закрыт.
-    # Репозиторий указывается через --git-dir, и путь берётся `_git_common_dir`, а не
-    # `root/.git`: в связанном worktree и в submodule это файл, в bare-репо его нет вовсе.
-    return subprocess.run([git, "--git-dir", str(_git_common_dir(root)), *neutralize, *exec_conf,
-                           "fetch", "--quiet", "--no-tags", "--upload-pack", "git-upload-pack",
-                           "--end-of-options", fetch_url, refspec],
-                          cwd=_NEUTRAL_CWD, capture_output=True, text=True,
-                          timeout=timeout, env=env)
+    # `with` внутри тела, а не декоратор: `_timed` импортируется НИЖЕ по файлу,
+    # и декоратор на функции, объявленной раньше импорта, не разрешился бы.
+    with _timed("prepush_fetch"):
+        git = _trusted_git_bin()
+        if git is None:
+            raise TrustedGitError("доверенный git недоступен — fetch не выполнить безопасно")
+        url = _prepush_git("remote", "get-url", remote, cwd=root)
+        if url.returncode != 0:
+            # remote неизвестен/не читается — это ДОСТУПНОСТЬ, а не безопасность: пусть решает
+            # существующая политика on_fetch_failure (по умолчанию блок, скип аудируется).
+            return subprocess.CompletedProcess([], 128, "", f"remote {remote!r} не читается")
+        raw_url = url.stdout.strip()
+        if not _fetch_remote_allowed(raw_url):
+            # А это уже безопасность: `ext::` исполняет произвольную команду.
+            raise TrustedGitError(
+                f"remote {remote!r} использует запрещённый транспорт (`ext::` исполняет "
+                "произвольную команду) — сетевая операция отклонена")
+        # Тянем ПРОВАЛИДИРОВАННЫЙ URL, а не имя ремоута, и приводим его к абсолютному:
+        # относительный (`../base.git` — форма, разрешённая намеренно) резолвится от CWD ПРОЦЕССА,
+        # а cwd ниже нейтральный. Иначе смена cwd тихо переопределила бы, с какой историей
+        # сверяется гейт.
+        fetch_url = str((Path(root) / raw_url).resolve()) if _is_relative_local_url(raw_url) \
+            else raw_url
+        ssh = _trusted_ssh_bin()
+        if ssh is None:
+            # ПОЛИТИКА, а не доступность: `TrustedGitError` обходит `on_fetch_failure`, иначе при
+            # `skip-audited` пропавший ssh тихо пропустил бы гейт, хотя §4 обещает fail-closed
+            # безусловно. Форма та же, что у ветки `ext::` ниже.
+            raise TrustedGitError(
+                "ssh не найден в доверенных каталогах "
+                f"({', '.join(_TRUSTED_PATH_DIRS)}) — сетевая операция гейта невыполнима")
+        env = {k: v for k, v in os.environ.items() if k in _GIT_ENV_ALLOW}
+        env["HOME"] = str(_trusted_home())
+        env["PATH"] = os.pathsep.join(_TRUSTED_PATH_DIRS)
+        env.update({k: v for k, v in _GIT_SAFE_ENV.items()})
+        # Транспорт разрешаем АЛЛОУЛИСТОМ, и именно ПЕРЕМЕННОЙ: `-c protocol.allow=never` не спасает —
+        # `protocol.<схема>.allow` СПЕЦИФИЧНЕЕ, поэтому `protocol.ext.allow=always` из локального
+        # `.git/config` перебивает общий запрет откуда угодно, хоть с командной строки (проверено).
+        # `GIT_ALLOW_PROTOCOL` перекрывает и общий ключ, и специфичный.
+        #
+        # Зачем: `get-url` применяет `url.*.insteadOf` ОДИН раз, и мы валидируем результат, а
+        # `git fetch <url>` применяет правила к переданной строке ЕЩЁ раз. Цепочка из двух правил
+        # (`https://a/` → `https://b/` → `ext::sh -c …`) даёт транспорт, которого валидация не
+        # видела, — воспроизведён RCE правами pre-push хука (security-проход 2026-08-14). До
+        # перехода на fetch по URL расхождения не было: имя ремоута резолвилось тем же единственным
+        # проходом. Разрешаем РОВНО схему провалидированного URL: во что бы `insteadOf` строку ни
+        # переписал, чужой транспорт запрещён.
+        env["GIT_ALLOW_PROTOCOL"] = _url_scheme(fetch_url)
+        # убираем ПАРУ `-c protocol.allow=never` целиком: одиночный висячий `-c` съедал
+        # следующий аргумент как значение конфига, и `fetch` переставал быть подкомандой
+        neutralize: list[str] = []
+        for flag, val in zip(_GIT_NEUTRALIZE[::2], _GIT_NEUTRALIZE[1::2]):
+            if val == "protocol.allow=never":
+                continue                            # ставится ниже вместе с разрешённой схемой
+            if val.startswith("core.sshCommand="):
+                val = f"core.sshCommand={ssh}"      # транспорт ЗАКРЕПЛЯЕМ, а не гасим
+            neutralize += [flag, val]
+        # Проверки URL НЕДОСТАТОЧНО: git исполняет `remote.<name>.uploadpack` как КОМАНДУ на
+        # локальном транспорте, а `remote.<name>.vcs` и `core.gitProxy` дают то же самое другими
+        # путями. Воспроизведено ревью 09.08.2026 на системном git: `remote.probe.uploadpack`
+        # исполнилась при обычном pre-push fetch правами хука. Гасим все три и жёстко закрепляем
+        # upload-pack: неотразимая часть — именно КОМАНДА, а не адрес.
+        # `--upload-pack` из командной строки перебивает `remote.<name>.uploadpack` (замерено
+        # 09.08.2026), поэтому дублировать его через `-c` не нужно — иначе git ругается на два
+        # значения. А вот `remote.<name>.vcs` гасить ПУСТЫМ значением нельзя: git тогда ищет
+        # helper `git-remote-` и fetch ломается. Поэтому vcs — ОТКЛОНЯЕМ, как filter-драйверы.
+        vcs = _prepush_git("config", "--get", f"remote.{remote}.vcs", cwd=root)
+        if vcs.returncode == 0 and vcs.stdout.strip():
+            raise TrustedGitError(
+                f"remote {remote!r} задаёт vcs={vcs.stdout.strip()!r} — git исполнит внешний "
+                "transport-helper; сетевая операция отклонена")
+        exec_conf = ("-c", "core.gitProxy=")
+        # Рефспек ОБЯЗАТЕЛЕН, и это не украшение: `fetch <url> <branch>` пишет только FETCH_HEAD и
+        # НЕ двигает refs/remotes/<remote>/<branch> — оппортунистическое обновление трекинг-рефа
+        # происходит лишь при fetch по ИМЕНИ ремоута. А потребители (`_check_integration`) читают
+        # именно `base_ref` = `<remote>/<branch>`. Без рефспека гейт обновлял бы одно, а сверялся с
+        # другим, и пуш на разошедшуюся базу проходил бы (fail-open, воспроизведён на сдвиге базы
+        # из другого клона). Тест обязан ассертить трекинг-реф, а не FETCH_HEAD.
+        # Источник КВАЛИФИЦИРОВАН: короткое имя git разрешает DWIM'ом, а `refs/tags/<name>` в этом
+        # порядке стоит ПЕРЕД `refs/heads/<name>`. Ремоут с веткой `main` и одноимённым тегом на её
+        # предке отдал бы в трекинг-реф коммит ТЕГА, гейт увидел бы «отставания нет» и пропустил
+        # пуш на разошедшуюся базу (воспроизведено: тег 6dfe6cf вместо ветки 4740ca5).
+        # `--no-tags` — чтобы попутная выкачка тегов не переписала ничего ещё.
+        refspec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+        # cwd — НЕ корень репозитория: относительный путь в любом конфиге, который читает git или
+        # ssh (`ProxyCommand ./proxy`, `core.sshCommand=./x`), резолвился в байты ПРОВЕРЯЕМОЙ
+        # стороны и исполнялся (воспроизведено 2026-08-14). Перечислять исполняемые директивы
+        # OpenSSH бессмысленно — денилист по чужому набору; уводим сам cwd, и класс закрыт.
+        # Репозиторий указывается через --git-dir, и путь берётся `_git_common_dir`, а не
+        # `root/.git`: в связанном worktree и в submodule это файл, в bare-репо его нет вовсе.
+        return subprocess.run([git, "--git-dir", str(_git_common_dir(root)), *neutralize, *exec_conf,
+                               "fetch", "--quiet", "--no-tags", "--upload-pack", "git-upload-pack",
+                               "--end-of-options", fetch_url, refspec],
+                              cwd=_NEUTRAL_CWD, capture_output=True, text=True,
+                              timeout=timeout, env=env)
 
 
 def _prepush_git(*args: str, cwd: "Path | None" = None):
@@ -171,7 +174,7 @@ try:
                                    _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
                                    _trusted_home, TrustedGitError,
                                    _deploy_section_hash, _run_empirical, redact_secrets,
-                                   _trusted_ssh_bin, _NEUTRAL_CWD)
+                                   _trusted_ssh_bin, _NEUTRAL_CWD, _timed)
     from ladder_gate import _audit_line
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -180,7 +183,7 @@ except ImportError:                                    # запуск как г�
                                    _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
                                    _trusted_home, TrustedGitError,
                                    _deploy_section_hash, _run_empirical, redact_secrets,
-                                   _trusted_ssh_bin, _NEUTRAL_CWD)
+                                   _trusted_ssh_bin, _NEUTRAL_CWD, _timed)
     from ladder_gate import _audit_line                                       # type: ignore
 
 import re
@@ -478,6 +481,7 @@ def self_weaken_verdict(root: Path, remote_sha: str, remote: str, branch: str,
 
 # ═══ Предсказание слияния ═══
 
+@_timed("predict_merge")
 def predict_merge(root: Path, base: str, sha: str) -> MergeResult:
     """`merge-tree --write-tree` — предсказание БЕЗ касания рабочего дерева.
     «Неизвестно» ≠ «чисто» (И3)."""
@@ -599,7 +603,19 @@ def _probe_git(root: Path, env: dict, *args: str):
 @contextlib.contextmanager
 def probe_worktree(root: Path, base: str, sha: str, tree: str):
     """Материализует смерженное дерево в отдельный worktree. Рабочее дерево пользователя
-    не трогается (И1). Уборка best-effort + prune на старте (И7: SIGKILL `finally` не выполнит)."""
+    не трогается (И1). Уборка best-effort + prune на старте (И7: SIGKILL `finally` не выполнит).
+
+    Измеряется ИЗНУТРИ, а не декоратором: декоратор на генераторной функции оборачивает её
+    ВЫЗОВ, а он лишь создаёт объект-генератор — тело выполняется позже, в `with` вызывающего.
+    Порядок декораторов делу не помогает: оборачивается создание объекта в обоих случаях, и
+    самая дорогая локальная фаза (`worktree add` = настоящий checkout) отчитывалась бы нулём
+    в релизе, чья цель — измерить (находка код-ревью 2026-08-14, воспроизведена)."""
+    with _timed("merge_probe"), _probe_worktree_inner(root, base, sha, tree) as got:
+        yield got
+
+
+@contextlib.contextmanager
+def _probe_worktree_inner(root: Path, base: str, sha: str, tree: str):
     # `worktree add` делает CHECKOUT, то есть запускает smudge/process-фильтры, выбранные
     # атрибутами и локальным конфигом РЕВЬЮИРУЕМОГО репозитория — код проверяемой стороны
     # исполнялся бы до интеграционных тестов. Плюс раньше сюда уезжало полное окружение
