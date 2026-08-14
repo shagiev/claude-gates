@@ -755,8 +755,12 @@ def test_git_calls_with_config_derived_refs_use_end_of_options(repo, monkeypatch
     feat = _diverge(repo)
     monkeypatch.setattr(pg.subprocess, "run", spy)
     _run(repo, feat)
+    # Интроспекция репозитория ref'ов не принимает вовсе (`rev-parse --git-common-dir`), и
+    # `--end-of-options` там превратил бы флаг в позиционный аргумент. Правило — про ЗНАЧЕНИЯ
+    # из конфига, поэтому такие вызовы исключаются явно, а не размыванием ассерта.
+    introspection = {"--git-common-dir", "--show-toplevel", "--absolute-git-dir"}
     for name in ("fetch", "merge-tree", "rev-parse"):
-        calls = [c for c in seen if name in c]
+        calls = [c for c in seen if name in c and not introspection & set(c)]
         assert calls, f"вызов git {name} не состоялся — тест перестал проверять то, что заявляет"
         assert all("--end-of-options" in c for c in calls), f"git {name} без --end-of-options"
 
@@ -848,3 +852,177 @@ def test_t16g_remote_vcs_transport_helper_is_rejected(repo):
     _git(repo, "config", "remote.origin.vcs", "evil")
     with pytest.raises(pg.TrustedGitError):
         pg._prepush_fetch(repo, "origin", "main", timeout=30)
+
+
+# --- транспорт fetch: гейт был НЕИСПОЛНИМ для любого SSH-ремоута (2026-08-14) ---
+# Разбор «почему» — в докстринге `_trusted_ssh_bin`; здесь только свойства.
+
+def _recorder(dirpath, name="rec.sh"):
+    """Скрипт-свидетель: если его запустили — останется файл."""
+    witness = dirpath / f"{name}.witness"
+    script = dirpath / name
+    script.write_text(f'#!/bin/sh\necho fired >> "{witness}"\nexit 1\n')
+    script.chmod(0o755)
+    return script, witness
+
+
+def test_trusted_ssh_bin_is_absolute_and_from_trusted_dirs():
+    """S2: резолв тем же правилом, что для git, — не через PATH вызывающего."""
+    ssh = pg._trusted_ssh_bin()
+    assert ssh is not None, "ssh не найден в доверенных каталогах — проблема среды"
+    assert os.path.isabs(ssh) and os.access(ssh, os.X_OK)
+    assert any(ssh.startswith(d) for d in pg._TRUSTED_PATH_DIRS)
+
+
+def test_trusted_ssh_bin_ignores_caller_path(tmp_path, monkeypatch):
+    """S2: подложенный «ssh» в PATH вызывающего НЕ выбирается."""
+    fake, _ = _recorder(tmp_path, "ssh")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert pg._trusted_ssh_bin() != str(fake)
+
+
+def test_fetch_updates_the_ref_the_gate_actually_reads(repo, tmp_path):
+    """Гейт сверяется с `base_ref` = `origin/main`, а `fetch <url> <branch>` пишет только
+    FETCH_HEAD и трекинг-реф НЕ двигает — это происходит лишь при fetch по имени ремоута.
+    Ассертить FETCH_HEAD здесь бесполезно: он показывает, что fetch ПИШЕТ, а не что гейт ЧИТАЕТ.
+
+    База двигается из ДРУГОГО клона намеренно: `_diverge` двигает её через push из этого же
+    репозитория, а push обновляет трекинг-реф побочным эффектом и маскирует дефект."""
+    remote = repo.parent / "remote.git"
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "-q", str(remote), str(other))
+    (other / "moved.txt").write_text("сдвинуто другим клоном\n")
+    _git(other, "add", "-A"); _git(other, "commit", "-qm", "moved")
+    _git(other, "push", "-q", "origin", "main")
+    real_tip = _sha(remote, "main")
+    assert _sha(repo, "refs/remotes/origin/main") != real_tip      # мы ещё не знаем о сдвиге
+
+    r = pg._prepush_fetch(repo, "origin", "main", 30)
+    assert r.returncode == 0, r.stderr
+    assert _sha(repo, "refs/remotes/origin/main") == real_tip
+
+
+def test_fetch_refuses_as_policy_when_no_ssh(repo, tmp_path, monkeypatch):
+    """S4: ssh не найден → это ПОЛИТИКА, а не недоступность сети, поэтому TrustedGitError.
+    Вернись оно `CompletedProcess`, при `on_fetch_failure: skip-audited` пропавший ssh тихо
+    пропускал бы гейт — притом что fail-closed обещан безусловно."""
+    # Гасим ИМЕННО резолв ssh: подмена _TRUSTED_PATH_DIRS убрала бы заодно и git, и мы бы
+    # проверяли не тот отказ.
+    monkeypatch.setattr(pg, "_trusted_ssh_bin", lambda: None)
+    with pytest.raises(pg.TrustedGitError, match="ssh не найден"):
+        pg._prepush_fetch(repo, "origin", "main", 10)
+
+
+def test_transport_env_names_never_enter_allowlist():
+    """Закрепление транспорта держится на том, что `GIT_SSH_COMMAND` (приоритет ВЫШЕ, чем у
+    `-c core.sshCommand`) в аллоулист не входит. Проверяем это там, где произойдёт
+    расширение, — иначе правило защищало бы один адаптер из трёх."""
+    import codex_review_gate as g
+    assert not (set(g._GIT_ENV_ALLOW) & set(g._TRANSPORT_ENV_DENY))
+
+
+def test_relative_local_url_is_resolved_against_repo_not_cwd(repo):
+    """S10: относительный URL резолвится от CWD ПРОЦЕССА. Пока cwd был корнем репо это
+    совпадало; после ухода в нейтральный каталог сверка молча уехала бы на чужую историю (или
+    упала) — поэтому URL приводится к абсолютному ОТ КОРНЯ РЕПОЗИТОРИЯ."""
+    remote_tip = _sha(repo.parent / "remote.git", "main")
+    _git(repo, "remote", "set-url", "origin", "../remote.git")
+    r = pg._prepush_fetch(repo, "origin", "main", 30)
+    assert r.returncode == 0, r.stderr
+    assert _sha(repo, "refs/remotes/origin/main") == remote_tip    # именно ТА база
+
+
+def test_relative_command_in_config_is_not_executed_from_repo(repo):
+    """S8: относительная команда в конфиге резолвилась в байты РЕПОЗИТОРИЯ и исполнялась,
+    потому что fetch шёл с cwd = корень репо. Уход в нейтральный cwd закрывает класс целиком,
+    а не перечень исполняемых директив OpenSSH."""
+    _git(repo, "remote", "set-url", "origin", "ssh://example.invalid/repo.git")
+    _, witness = _recorder(repo, "probe.sh")
+    _git(repo, "config", "core.sshCommand", "./probe.sh")
+    pg._prepush_fetch(repo, "origin", "main", 30)          # упадёт: сети нет
+    assert not witness.exists(), "команда из репозитория была исполнена"
+
+
+@pytest.mark.parametrize("var", ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT",
+                                 "GIT_CONFIG_PARAMETERS"])
+def test_transport_substitution_env_is_not_honoured(repo, tmp_path, monkeypatch, var):
+    """S7: `GIT_SSH_COMMAND` имеет приоритет НАД `-c core.sshCommand` (проверено рекордером).
+    Аллоулист её не пропускает — свойство несущее, поэтому закреплено чёрным ящиком."""
+    rec, witness = _recorder(tmp_path)
+    _git(repo, "remote", "set-url", "origin", "ssh://example.invalid/repo.git")
+    monkeypatch.setenv(var, f"'core.sshCommand'='{rec}'" if var == "GIT_CONFIG_PARAMETERS"
+                       else str(rec))
+    pg._prepush_fetch(repo, "origin", "main", 30)
+    assert not witness.exists(), f"{var} подменила закреплённый ssh"
+
+
+def test_tag_with_branch_name_does_not_hijack_the_base(repo, tmp_path):
+    """Короткое имя в refspec git разрешает DWIM'ом, а `refs/tags/<name>` стоит ПЕРЕД
+    `refs/heads/<name>`. Ремоут с веткой `main` и одноимённым тегом на её предке отдавал бы в
+    трекинг-реф коммит ТЕГА — гейт видел бы «отставания нет» и пропускал пуш на разошедшуюся
+    базу. Источник поэтому квалифицирован до `refs/heads/<branch>`."""
+    remote = repo.parent / "remote.git"
+    ancestor = _sha(repo, "HEAD")
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", "-q", str(remote), str(other))
+    (other / "moved.txt").write_text("база ушла вперёд\n")
+    _git(other, "add", "-A"); _git(other, "commit", "-qm", "moved")
+    _git(other, "push", "-q", "origin", "refs/heads/main:refs/heads/main")
+    _git(other, "push", "-q", "origin", f"{ancestor}:refs/tags/main")   # тег на ПРЕДКЕ
+    branch_tip = _sha(remote, "refs/heads/main")
+    tag_tip = _sha(remote, "refs/tags/main")
+    assert branch_tip != tag_tip
+
+    r = pg._prepush_fetch(repo, "origin", "main", 30)
+    assert r.returncode == 0, r.stderr
+    assert _sha(repo, "refs/remotes/origin/main") == branch_tip
+
+
+def test_tag_named_like_base_ref_cannot_hijack_the_comparison(repo):
+    """Зеркальная половина перехвата: refspec квалифицирован и ПИШЕТ верно, но потребители
+    читали короткое `origin/main`, а `refs/tags/origin/main` резолвится РАНЬШЕ
+    `refs/remotes/origin/main`. Тег, буквально названный `origin/main` и указывающий на
+    пушимый коммит, давал «отставания нет»: гейт возвращал 0, не дойдя до предсказания слияния.
+
+    Сквозной и с НАСТОЯЩИМ конфликтом (обе стороны правят app/x.py), поэтому верный ответ — 2."""
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "app" / "x.py").write_text("x = 'feature'\n")
+    _git(repo, "commit", "-qam", "feat")
+    feat = _sha(repo)
+    _git(repo, "checkout", "-q", "main")
+    (repo / "app" / "x.py").write_text("x = 'main moved'\n")
+    _git(repo, "commit", "-qam", "main-move")
+    _git(repo, "push", "-q", "origin", "main")
+    _git(repo, "checkout", "-q", "feature")
+
+    _git(repo, "tag", "origin/main", feat)          # тег на пушимом коммите
+    assert _sha(repo, "origin/main") == feat        # короткое имя резолвится в ТЕГ
+    assert _sha(repo, "refs/remotes/origin/main") != feat
+    assert _run(repo, feat) == 2                    # конфликт обязан быть пойман
+
+
+def test_two_stage_insteadof_cannot_reach_ext_transport(repo, tmp_path):
+    """RCE правами pre-push хука (security-проход 2026-08-14), воспроизведён.
+
+    `get-url` применяет `url.*.insteadOf` ОДИН раз — его результат мы и валидируем. Но
+    `git fetch <url>` применяет правила к переданной строке ЕЩЁ раз, и цепочка из двух правил
+    даёт `ext::`, которого валидация не видела. Локальный `protocol.ext.allow=always` его
+    включает, а общий `-c protocol.allow=never` не помогает: специфичный ключ побеждает.
+    Закрыто `GIT_ALLOW_PROTOCOL` — он перекрывает и общий ключ, и специфичный."""
+    owned = tmp_path / "OWNED"
+    cfg = repo / ".git" / "config"
+    cfg.write_text(cfg.read_text() + f'''
+[url "https://b/"]
+\tinsteadOf = https://a/
+[url "ext::sh -c touch>{owned};false #"]
+\tinsteadOf = https://b/
+[protocol "ext"]
+\tallow = always
+''')
+    _git(repo, "remote", "set-url", "origin", "https://a/repo")
+    seen = pg._prepush_git("remote", "get-url", "origin", cwd=repo).stdout.strip()
+    assert seen == "https://b/repo"                 # валидация видит безобидное
+    assert pg._fetch_remote_allowed(seen)
+
+    pg._prepush_fetch(repo, "origin", "main", 30)
+    assert not owned.exists(), "ext:: исполнил команду правами хука"
