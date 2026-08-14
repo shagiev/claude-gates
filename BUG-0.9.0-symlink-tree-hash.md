@@ -145,3 +145,33 @@ printf '%s' "$(readlink ...)" | git hash-object --stdin      → 734c31b9d7673d9
 «проходы не отмечены». Это же относится к тексту самой ошибки: `не посчитать хэш X` не
 содержит stderr от git (`fatal: Unable to add (null) to database`) — без него причина
 не диагностируется, пришлось воспроизводить `hash-object` руками.
+
+## Дополнение 14.08: Codex-сторона указывает на несуществующую версию
+
+В 0.9.1 баг исправлен (и аккуратнее предложенного — `stdin_bytes` + `os.readlink(os.fsencode(...))`,
+что заодно снимает `UnicodeEncodeError` на не-UTF8 целях). Проверено: `compute_tree` из
+`~/.codex/plugins/cache/lenar-gates/gates/0.9.1+codex.20260813` считает tree-хэш на живом
+`wb-ad-ruler` без ошибок.
+
+Но остались два хвоста установки:
+
+1. **Claude-сторона не обновлена.** `~/.claude/plugins/installed_plugins.json` по-прежнему
+   указывает на `gates/0.9.0`, каталога 0.9.1 в `~/.claude/plugins/cache/` нет. Лесенка в
+   Claude Code остаётся неисполнимой, коммиты идут через `LADDER_SKIP`.
+2. **Codex-хук ссылается на удалённую версию.** PreToolUse-хук зовёт
+   `~/.codex/plugins/cache/lenar-gates/gates/0.9.0+codex.20260811/scripts/codex_review_gate.py`,
+   а в кэше лежит только `0.9.1+codex.20260813`. Результат — хук падает с `[Errno 2]` и
+   **блокирует команду**, а не пропускает её:
+
+   ```
+   ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook:
+   can't open file '.../0.9.0+codex.20260811/scripts/codex_review_gate.py': [Errno 2]
+   Command: git -C <worktree> diff -- <files>
+   ```
+
+   Практический эффект: у Codex-ревьюера отобран `git diff`. Он не сообщает «не вижу
+   диффа», а молча уходит читать файлы с GitHub через MCP — то есть выносит вердикт по
+   ДРУГОМУ дереву (на удалённой ветке проверяемых правок ещё нет). Ревью выглядит
+   состоявшимся и не является им. Обновление версии стоит делать атомарно с ссылкой в
+   хуке, а сам хук при отсутствии движка — валить с явным «движок не найден», раз он
+   всё равно fail-closed.
