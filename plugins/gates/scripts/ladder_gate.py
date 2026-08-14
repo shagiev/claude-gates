@@ -29,14 +29,14 @@ try:
     from codex_review_gate import (is_code_path, _trusted_git, TrustedGitError,
                                    _trusted_git_bin, _trusted_home, _GIT_ENV_ALLOW,
                                    _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
-                                   _bootstrap_git, _has_git_marker, redact_secrets)
+                                   _bootstrap_git, _has_git_marker, redact_secrets, _timed)
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
                                    TrustedGitError, _trusted_git_bin, _trusted_home,
                                    _GIT_ENV_ALLOW, _GIT_SAFE_ENV, _GIT_NEUTRALIZE,
                                    _TRUSTED_PATH_DIRS, _bootstrap_git,
-                                   _has_git_marker, redact_secrets)
+                                   _has_git_marker, redact_secrets, _timed)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -406,7 +406,7 @@ def compute_tree(root: Path) -> str:
     (self-referential — маркер о состоянии кода не должен зависеть от файла,
     описывающего этот же маркер). Исключение — просто пропуск пути при сборке; ни
     `add -A`, ни pathspec-негаций, на которых это спотыкалось раньше, здесь больше нет."""
-    with tempfile.TemporaryDirectory() as td:
+    with _timed("compute_tree") as _span, tempfile.TemporaryDirectory() as td:
         # ПУСТОЙ tmp-индекс, НЕ копия реального (ревью Task 3): shutil.copy сбрасывал mtime
         # индекса в «сейчас», отключая git-детекцию racy-правок — same-size правка в ту же
         # секунду (типичный фикс /simplify) могла отдать STALE blob → ложный tree-хэш на
@@ -424,7 +424,9 @@ def compute_tree(root: Path) -> str:
         head = _head_entries(root)
         skip = set(_BOOKKEEPING_PATHS)
         # dict.fromkeys — дедуп с сохранением порядка git'а (он уже отсортирован)
-        for rel in dict.fromkeys([*tracked, *_untracked_paths(root)]):
+        listing = dict.fromkeys([*tracked, *_untracked_paths(root)])
+        _span.scale = len(listing)              # то, что РЕАЛЬНО хэшируется, а не только tracked
+        for rel in listing:
             if rel in skip:
                 continue
             got = _tree_entry(root, env, rel, tracked.get(rel), head)
@@ -438,8 +440,9 @@ def compute_tree(root: Path) -> str:
 
 def index_tree(root: Path) -> str:
     """git write-tree РЕАЛЬНОГО индекса (для pre-commit — ровно то, что закоммитится)."""
-    return _git_ok(root, None, "write-tree реального индекса не удался",
-                   "write-tree").stdout.strip()
+    with _timed("index_tree"):
+        return _git_ok(root, None, "write-tree реального индекса не удался",
+                       "write-tree").stdout.strip()
 
 
 def read_marker(root: Path, pass_name: str) -> dict | None:
@@ -478,6 +481,13 @@ def begin_pass(root: Path, pass_name: str) -> None:
     if pass_name not in DEPLOY_REQUIRED_PASSES:
         raise LadderError(f"неизвестный проход {pass_name!r} — ожидается один из "
                           f"{DEPLOY_REQUIRED_PASSES}")
+    # `with` на теле, а не декоратор: span обязан начаться ПОСЛЕ валидации имени прохода —
+    # иначе опечатка в аргументе порождала бы событие «фаза упала», которого не было.
+    with _timed("begin_pass"):
+        _begin_pass_inner(root, pass_name)
+
+
+def _begin_pass_inner(root: Path, pass_name: str) -> None:
     tree = compute_tree(root)
     idx = DEPLOY_REQUIRED_PASSES.index(pass_name)
     if idx > 0:
@@ -507,6 +517,11 @@ def mark_pass(root: Path, pass_name: str) -> None:
     if pass_name not in DEPLOY_REQUIRED_PASSES:   # симметрия с begin_pass (ревью Task 1)
         raise LadderError(f"неизвестный проход {pass_name!r} — ожидается один из "
                           f"{DEPLOY_REQUIRED_PASSES}")
+    with _timed("mark_pass"):
+        _mark_pass_inner(root, pass_name)
+
+
+def _mark_pass_inner(root: Path, pass_name: str) -> None:
     pending_path = _pending_path(root, pass_name)
     pending = _read_pending(root, pass_name)
     if pending is None:
@@ -640,6 +655,7 @@ def _engine_broken_message(exc: BaseException) -> str:
     ])
 
 
+@_timed("check_precommit")
 def check_precommit(root: Path) -> int:
     """Pre-commit гейт (спека §2). Порядок: (1) staged не трогает код → exempt; (2)
     ladder.enabled=false → пропуск; (3) LADDER_SKIP=1 → пропуск + аудит; (4) chain-валидация

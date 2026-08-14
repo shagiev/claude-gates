@@ -20,6 +20,11 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "_gate_state_dir", lambda: tmp_path / "state")
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
     monkeypatch.setattr(g, "_require_repo", lambda: True)
+    # Проверка непустоты входа ревью — отдельный предикат со своими тестами
+    # (`test_review_input_guard.py`). Здесь она отключена намеренно: тесты про БЮДЖЕТ, и
+    # поднимать ради них настоящий git-репозиторий с разрешимым `--base` значило бы проверять
+    # два механизма одним стендом.
+    monkeypatch.setattr(g, "review_input_empty", lambda *a, **k: None)
     return r
 
 

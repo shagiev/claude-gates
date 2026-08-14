@@ -13,6 +13,8 @@ import io
 import json
 import os
 import re
+import secrets
+import time
 import shlex
 import signal
 import shutil
@@ -894,6 +896,70 @@ def companion_outage_reason(out: str) -> str | None:
     return outage_details(raw) or "деградировавший конверт companion (result отсутствует)"
 
 
+def review_input_empty(passthrough: "list[str]", design_file: "str | None") -> "str | None":
+    """Причина, по которой ревьюеру НЕЧЕГО смотреть, либо None. Проверяется ДО запуска движка.
+
+    Гейт обязан сам убедиться, что вход ревью непуст. Иначе ревьюер получает пустоту, честно
+    отвечает «дифф пустой» — и это приходит с КОДОМ 0 и валидным `Verdict:`, то есть ревью,
+    которого не было, неотличимо от ревью без замечаний. За один день 2026-08-14 так вышло
+    ТРИЖДЫ, и ни разу этого не заметила механика — только глаза по тексту ответа.
+
+    Ключевое: диапазон выводится ПО ПРАВИЛАМ ДВИЖКА, а не по своим. `resolveReviewTarget`
+    (`lib/git.mjs`) при заданном `--base` возвращает `mode: "branch"` ДО того, как посмотрит на
+    `--scope`, то есть `--base X --scope working-tree` ревьюит ТОЛЬКО КОММИТЫ, молча игнорируя
+    рабочее дерево. Собственный вывод диапазона был бы денилистом по чужому парсеру — он уже
+    разъезжался (находка security-прохода 2026-08-14, воспроизведена)."""
+    single_dash = [a for a in passthrough
+                   if a in ("-base", "-scope") or a.startswith(("-base=", "-scope="))]
+    if single_dash:
+        # Парсер companion принимает и одинарный дефис. Угадывать, что он поймёт, — та же
+        # игра в денилист; отвергаем неоднозначную форму и просим написать канонически.
+        return (f"неоднозначная форма аргумента {single_dash[0]!r}: движок её понимает, а гейт "
+                "проверить не берётся. Напиши `--base` / `--scope`")
+    base = None
+    scope = None
+    for i, a in enumerate(passthrough):
+        if a == "--base" and i + 1 < len(passthrough):
+            base = passthrough[i + 1]
+        elif a.startswith("--base="):
+            base = a.split("=", 1)[1]
+        elif a == "--scope" and i + 1 < len(passthrough):
+            scope = passthrough[i + 1]
+        elif a.startswith("--scope="):
+            scope = a.split("=", 1)[1]
+    if base and scope == "working-tree":
+        # Не «проверим что-нибудь», а отказ: пользователь просит одно, движок сделает другое.
+        return ("одновременно заданы --base и --scope working-tree: движок при заданном --base "
+                "ревьюит ТОЛЬКО КОММИТЫ и рабочее дерево игнорирует. Убери --base, если "
+                "ревьюишь незакоммиченное, либо убери --scope")
+    if base:
+        rev = _trusted_git("rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
+        if rev is None or rev.returncode != 0 or not rev.stdout.strip():
+            return (f"--base {base!r} не разрешается в коммит (сокращённый sha? опечатка?) — "
+                    "диапазон ревью построить не из чего")
+        d = _trusted_git("diff", "--name-only", f"{base}...HEAD")
+        if d is None:
+            return "доверенный git недоступен — вход ревью не проверить"
+        if not d.stdout.strip():
+            # Дизайн-файл проверяется ДОПОЛНИТЕЛЬНО, а не ВМЕСТО: `--design-file` — флаг гейта,
+            # до движка он не доезжает, и ревьюер всё равно получит ДИАПАЗОН. Ветка, которая
+            # при наличии файла возвращала None, пропускала ровно инцидент №2 (незакоммиченный
+            # дизайн при `HEAD == base`) — тот самый, ради которого гвард и писался.
+            return (f"диапазон {base}..HEAD ПУСТ — ревьюеру нечего показать. Закоммить артефакт "
+                    "(или ревьюй незакоммиченное через `--scope working-tree` БЕЗ `--base`)")
+    elif scope == "working-tree":
+        d = _trusted_git("status", "--porcelain", "--untracked-files=all")
+        if d is None:
+            return "доверенный git недоступен — вход ревью не проверить"
+        if not d.stdout.strip():
+            return "рабочее дерево чисто — ревьюеру нечего показать"
+    if design_file:
+        p = Path(design_file)
+        if not p.is_file() or not p.read_text(errors="replace").strip():
+            return f"файл дизайна {design_file!r} не существует или пуст"
+    return None
+
+
 def run_companion_review(base: str | None, scope: str) -> str | None:
     # adversarial-review --json даёт СТРУКТУРНЫЙ result{verdict,findings[severity]} (схема),
     # в отличие от нативного `review`, чей вывод — текст P1/P2/P3 без Verdict: (инцидент:
@@ -1639,8 +1705,7 @@ def adjudicate(led: dict, fid: str, status: str, reason: str,
     # источник #4: причина от оператора/автоматики может нести секрет-улику; редактируем ДО
     # сохранения — тогда ledger, audit, вывод `findings` и промпт следующего раунда чисты
     f["reason"] = redact_secrets(reason.strip())
-    import time as _time
-    led["last_adj_ts"] = _time.time()
+    led["last_adj_ts"] = time.time()
     led["needs_review_round"] = True   # Codex должен УВИДЕТЬ адъюдикацию (спор F3-2: кэш
     if status == "resolved-by-arbiter":
         # Предложение арбитра принимает ЧЕЛОВЕК: канал ревьюера форжится инъекцией в диффе.
@@ -2147,9 +2212,8 @@ def _write_deploy_verdict(head: str, baseline: "str | None", diff_sha: str,
     """Ф2: машиночитаемый вердикт для inframon. Delete-then-write под локом (R1-F2/R2-F2).
     0 = ок/best-effort-warning; 2 = блок (unlink упал, старый вердикт остался бы маскировать)."""
     path = VERDICT_DIR / f"{head}.json"
-    import time as _time
     payload = {
-        "schema": 2, "run_id": f"{int(_time.time() * 1000)}-{os.getpid()}",
+        "schema": 2, "run_id": f"{int(time.time() * 1000)}-{os.getpid()}",
         "head_sha": head, "baseline_sha": baseline or "", "diff_sha256": diff_sha,
         "gates": {"ladder": ladder_st, "empirical": empirical_st, "codex": codex_st},
         "providers": reviewers if reviewers is not None else [],   # Ф1: кто судил (схема 2)
@@ -3076,6 +3140,244 @@ _GIT_SAFE_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                  "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
 
 
+#: Фазы, которые измеряются. Перечень ЗАКРЫТ: событие не принимает произвольных полей, иначе
+#: рано или поздно в него попадёт путь, URL или секрет, а редакция по шаблонам не ловит ни имя
+#: пользователя, ни имя приватного репозитория (находка дизайн-ревью 2026-08-14).
+_TELEMETRY_PHASES = frozenset((
+    "compute_tree", "index_tree", "begin_pass", "mark_pass", "check_precommit",
+    "prepush_fetch", "predict_merge", "merge_probe", "reviewer_call",
+))
+_TELEMETRY_KEYS = ("ts", "session", "trace", "span", "parent", "phase",
+                   "dur_ms", "self_ms", "scale", "outcome", "pid")
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+#: Стек открытых span'ов ТЕКУЩЕГО процесса. Trace = одна CLI-инвокация, а не цикл лесенки:
+#: `begin`, `mark` и `check-precommit` — разные процессы, связать их стеком нельзя в принципе.
+#: Инвокации сшиваются постфактум по `session`. Потоков в гейтах нет (проверено), хуки —
+#: одноразовые процессы, поэтому модульный стек тут достаточен и `contextvars` не нужны.
+_SPAN_STACK: "list[dict]" = []
+#: Один trace на ПРОЦЕСС. Наследование только через непустой стек давало каждой фазе верхнего
+#: уровня свой trace, а их в одной инвокации несколько и они ПОСЛЕДОВАТЕЛЬНЫ, не вложены
+#: (`_prepush_fetch` → `predict_merge` → `probe_worktree`). «Инвокаций» завышалось кратно, и
+#: ровно эта цифра пошла бы в довод «гейты добавляют N секунд на инвокацию».
+_TRACE_ID = secrets.token_hex(16)
+_SPAN_DISORDER = 0
+_TELEMETRY_SHARD: "Path | None | str" = "?"
+
+
+class _Span:
+    """Ручка открытой фазы: тело проставляет `scale` там, где стоимость линейна.
+
+    Параметром это выразить нельзя — масштаб известен только В СЕРЕДИНЕ тела (`len(tracked)`
+    в `compute_tree`), поэтому ручка, а не аргумент."""
+    __slots__ = ("scale",)
+
+    def __init__(self) -> None:
+        self.scale = None
+
+
+def _telemetry_dir() -> "Path | None":
+    d = _gate_state_dir()
+    return (d / "telemetry") if d else None
+
+
+def _telemetry_shard() -> "Path | None":
+    """Файл ЭТОГО процесса, посчитанный ОДИН раз.
+
+    Шард на процесс — чтобы не было ни общей блокировки, ни гонки: общий файл под `flock` был
+    отвергнут дизайн-ревью, и правильно, поскольку захват без таймаута даёт зависшему процессу
+    задержать вердикт во ВСЕХ остальных сессиях, причём без исключения.
+
+    Кэш не ради 60 мкс (это шум), а ради инварианта: имя содержит дату, и пересчёт на каждое
+    событие разложил бы один trace по ДВУМ шардам у процесса, пережившего полночь UTC."""
+    global _TELEMETRY_SHARD
+    if _TELEMETRY_SHARD == "?":
+        try:
+            d = _telemetry_dir()
+            _TELEMETRY_SHARD = (
+                d / f"{datetime.now(timezone.utc):%Y-%m-%d}-{os.getpid()}.jsonl") if d else None
+        except Exception:                       # noqa: BLE001 — см. `_timed`
+            _TELEMETRY_SHARD = None
+    return _TELEMETRY_SHARD
+
+
+def _telemetry_valid(e: "dict") -> bool:
+    """Схема закрыта по КЛЮЧАМ И ПО ТИПАМ. Одного перечня ключей мало: `scale` проставляет тело
+    через ручку, и `_span.scale = str(path)` протащил бы путь в файл мимо всех заявленных
+    защит. Проверка одна на писателя и на читателя, иначе они разъезжаются."""
+    if set(e) != set(_TELEMETRY_KEYS) or e["phase"] not in _TELEMETRY_PHASES:
+        return False
+    if e["outcome"] not in ("ok", "error"):
+        return False
+    if not all(isinstance(e[k], int) and e[k] >= 0 for k in ("dur_ms", "self_ms", "pid")):
+        return False
+    if not (e["scale"] is None or (isinstance(e["scale"], int) and e["scale"] >= 0)):
+        return False
+    if not (isinstance(e["trace"], str) and _HEX32.match(e["trace"])):
+        return False
+    if not (isinstance(e["span"], str) and _HEX32.match(e["span"])):
+        return False
+    if not (e["parent"] is None or (isinstance(e["parent"], str) and _HEX32.match(e["parent"]))):
+        return False
+    if not (isinstance(e["session"], str) and re.fullmatch(r"[0-9a-f]{0,32}", e["session"])):
+        return False
+    return isinstance(e["ts"], str) and bool(re.fullmatch(r"[0-9T:.+\-]{10,40}", e["ts"]))
+
+
+def _telemetry_write(event: "dict") -> None:
+    """Append одной строки. Отказ НЕ глотается здесь: единственная граница — `_timed`."""
+    if not _telemetry_valid(event):
+        return                                  # закрытая схема: чужой ключ/тип не пишем вовсе
+    shard = _telemetry_shard()
+    if shard is None:
+        return
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    with open(shard, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+@contextlib.contextmanager
+def _timed(phase: str):
+    """Измеряет фазу и пишет событие в `finally`, пробрасывая исключение тела НЕИЗМЕННЫМ.
+
+    Годится и как декоратор (`@_timed("phase")`) — `contextmanager` возвращает
+    `ContextDecorator`, — и как `with`, когда span обязан начаться ПОСЛЕ валидации аргументов.
+
+    Падающие фазы измеряются намеренно: fetch, проба и вызов ревьюера падают и по таймауту, а
+    их длительность как раз интересна. `self_ms` — за вычетом ПРЯМЫХ детей, иначе суммирование
+    по фазам посчитало бы одну работу дважды (`begin_pass` содержит `compute_tree`)."""
+    global _SPAN_DISORDER
+    handle = _Span()
+    if phase not in _TELEMETRY_PHASES:
+        yield handle                            # неизвестная фаза не пишется и не мешает
+        return
+    span = secrets.token_hex(16)
+    frame = {"span": span, "parent": _SPAN_STACK[-1]["span"] if _SPAN_STACK else None,
+             "children_ns": 0, "start": time.monotonic_ns()}
+    _SPAN_STACK.append(frame)
+    outcome = "ok"
+    try:
+        yield handle
+    except BaseException:
+        outcome = "error"                       # KeyboardInterrupt тоже измеряем и пробрасываем
+        raise
+    finally:
+        # ЕДИНСТВЕННАЯ в кодовой базе граница, где глотается что угодно. Она оправдана и узка:
+        # измеритель ничего не возвращает в логику, зовётся только отсюда, из `finally`, и
+        # потому не может ни подменить летящее исключение тела, ни повлиять на вердикт.
+        # Перечень типов тут не годится — выяснено на живом примере: `AttributeError` из
+        # резолва каталога состояния прошёл мимо `(OSError, TypeError, ValueError)` и уронил
+        # `begin_pass`, то есть измеритель сломал измеряемое.
+        try:
+            dur_ns = time.monotonic_ns() - frame["start"]
+            if _SPAN_STACK and _SPAN_STACK[-1] is frame:
+                _SPAN_STACK.pop()
+                if _SPAN_STACK:
+                    _SPAN_STACK[-1]["children_ns"] += dur_ns
+            else:
+                # Стек разошёлся. Оставить чужой фрейм нельзя: он навсегда станет родителем
+                # всех последующих span'ов и будет копить чужое время, тихо ЗАНИЖАЯ self_ms до
+                # конца процесса. Обрываем и считаем случай, чтобы сбой был виден в данных.
+                _SPAN_STACK.clear()
+                _SPAN_DISORDER += 1
+            _telemetry_write({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                # ХЭШ, а не сама строка: сшивать инвокации нужно по РАВЕНСТВУ, само значение
+                # не нужно. Санитайзер по шаблону тут не помощник — он срезает структуру пути,
+                # но оставляет имя: `CLAUDE_CODE_SESSION_ID=/Users/x/clients/acme-private`
+                # превращается в `_Users_x_clients_acme-private` и утекает в файл, который
+                # потом приложат к отчёту (поймано позитивным тестом).
+                "session": hashlib.sha256(_env_session().encode()).hexdigest()[:16],
+                "trace": _TRACE_ID, "span": span, "parent": frame["parent"],
+                "phase": phase, "dur_ms": dur_ns // 1_000_000,
+                "self_ms": max(0, dur_ns - frame["children_ns"]) // 1_000_000,
+                "scale": handle.scale, "outcome": outcome, "pid": os.getpid(),
+            })
+        except Exception:                       # noqa: BLE001 — измеритель не ломает измеряемое
+            pass
+
+
+def telemetry_summary(paths: "list[Path]") -> str:
+    """Сводка: SELF-время по фазам и латентность КОРНЕВЫХ span'ов — отдельными таблицами.
+
+    Смешивать их нельзя: фазы вложены (`begin_pass` содержит `compute_tree`), и сумма `dur_ms`
+    посчитала бы одну работу дважды, указав на неверную цель оптимизации."""
+    events, bad = [], 0
+    for f in paths:
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                bad += 1
+                continue
+            if isinstance(e, dict) and _telemetry_valid(e):
+                events.append(e)
+            else:
+                bad += 1
+    if not events:
+        return "телеметрии нет" + (f" (отброшено записей: {bad})" if bad else "")
+    spans = {e["span"] for e in events}
+    orphans = sum(1 for e in events if e["parent"] and e["parent"] not in spans)
+
+    def _pct(xs, q):                            # nearest-rank: корректен и при n == 1
+        xs = sorted(xs)
+        return xs[min(len(xs) - 1, int(len(xs) * q))]
+
+    by: "dict[str, list]" = {}
+    for e in events:
+        by.setdefault(e["phase"], []).append(e)
+    head = f"{'фаза':<16}{'n':>5}{'self, с':>10}{'p50 dur':>9}{'p90 dur':>9}{'масштаб':>9}"
+    out = [f"событий: {len(events)}   инвокаций: {len({e['trace'] for e in events})}"
+           + (f"   отброшено: {bad}" if bad else "")
+           + (f"   ORPHAN-parent: {orphans}" if orphans else ""),
+           "", head, "-" * len(head)]
+    for ph, es in sorted(by.items(), key=lambda kv: -sum(x["self_ms"] for x in kv[1])):
+        durs = [x["dur_ms"] for x in es]
+        scales = [x["scale"] for x in es if isinstance(x["scale"], int)]
+        out.append(f"{ph:<16}{len(es):>5}{sum(x['self_ms'] for x in es) / 1000:>10.1f}"
+                   f"{_pct(durs, .5):>9}{_pct(durs, .9):>9}"
+                   f"{(sum(scales) // len(scales)) if scales else '—':>9}")
+    roots = [e["dur_ms"] for e in events if not e["parent"]]
+    if roots:
+        out += ["", f"латентность КОРНЕВЫХ фаз, мс: p50 {_pct(roots, .5)}  "
+                    f"p90 {_pct(roots, .9)}  макс {max(roots)}"]
+    if _SPAN_DISORDER:
+        out += [f"⚠️ рассинхрон стека span'ов: {_SPAN_DISORDER} — self_ms этого процесса неточен"]
+    return "\n".join(out)
+
+
+_TELEMETRY_RETENTION_DAYS = 14
+
+
+def telemetry_prune(paths: "list[Path]", days: int = _TELEMETRY_RETENTION_DAYS) -> int:
+    """Удаляет шарды старше окна. ОТДЕЛЬНАЯ команда, а не работа писателя: пока любой процесс
+    вправе удалять чужие шарды, он однажды удалит шард ЖИВОГО писателя, и тот на POSIX
+    продолжит писать в невидимый inode, теряя события без ошибки. Недавно изменённые
+    пропускаем — на случай, если процесс ещё жив."""
+    # Пол в один день — не косметика: `telemetry-prune 0` обнулял окно, и «недавние
+    # пропускаем» переставало существовать, то есть удалялся шард ЖИВОГО писателя, а тот на
+    # POSIX продолжал писать в невидимый inode. Ровно то, что дизайн объявил невозможным.
+    cutoff = time.time() - max(1, days) * 86400
+    removed = 0
+    for f in paths:
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _telemetry_shards() -> "list[Path]":
+    """Только чтение: отчётные команды не имеют роли в вердикте и не должны падать на
+    хардненинге каталога состояния."""
+    try:
+        d = _telemetry_dir()
+    except Exception:                           # noqa: BLE001
+        return []
+    return sorted(d.glob("*.jsonl")) if d and d.exists() else []
+
+
 def _trusted_ssh_bin() -> "str | None":
     """Абсолютный ssh из доверенных каталогов — тем же правилом, что `_trusted_git_bin`.
 
@@ -3558,6 +3860,7 @@ def _run_text_reviewer(cert: ReviewerCertification, role: str, base: str, head: 
                        cert.certification_id, "ok", verdict=verdict, usage=usage)
 
 
+@_timed("reviewer_call")
 def run_certified_reviewer(cert: ReviewerCertification, base: str, head: str) -> ReviewerRun:
     if cert.roles == ("blocking",):
         role = "blocking"
@@ -3815,8 +4118,7 @@ def check_reviewed_cli() -> int:
                   "— почини/удали файл. Деплой остановлен.", file=sys.stderr)
             return 2
         save_findings_ledger(led)   # свежая/архивированная серия видна промпт-блоку
-    import time as _time
-    review_started_ts = _time.time()   # для ts-guard needs_review_round (спор F3-3)
+    review_started_ts = time.time()   # для ts-guard needs_review_round (спор F3-3)
     # Ф3: КАЖДЫЙ запрошенный провайдер ревьюит один и тот же дифф в ОДНОМ прогоне; второй проход
     # выполняется ДАЖЕ при blocking у первого (union за один раунд — адъюдикация разом, EARS-14b).
     results, failures, supplemental_advisory = [], [], []
@@ -5054,6 +5356,14 @@ def main(argv: list[str]) -> int:
               "ревьюер ВЫКЛЮЧЕН в сессии (деплой заблокирован, G1 пропускает)")
         _disabled_banner(redact_secrets(reason))
         return 0
+    if cmd == "telemetry-summary":
+        print(telemetry_summary(_telemetry_shards()))
+        return 0
+    if cmd == "telemetry-prune":
+        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 14
+        print(f"удалено шардов старше {days} дн.: "
+              f"{telemetry_prune(_telemetry_shards(), days)}")
+        return 0
     if cmd == "gate-edit":
         return gate_edit_cli(sys.stdin.read())
     if cmd == "gate-bash":
@@ -5132,9 +5442,19 @@ def main(argv: list[str]) -> int:
         artifact = _review_artifact_key(passthrough)
         # `--design-file` — флаг ГЕЙТА, не companion'а: он объявляет вид артефакта и до
         # внешнего движка не доезжает.
+        design_file = None
         if "--design-file" in passthrough:
             i = passthrough.index("--design-file")
+            design_file = passthrough[i + 1] if i + 1 < len(passthrough) else None
             passthrough = passthrough[:i] + passthrough[i + 2:]
+        # ДО списания раунда: пустой вход — это отказ гейта, а не «ревью без замечаний».
+        empty = review_input_empty(passthrough, design_file)
+        if empty is not None:
+            print(f"[codex-gate] ✗ ревью НЕ запускается: {empty}.\n"
+                  "  Это отказ ГЕЙТА, а не вердикт: ревьюер на пустом входе ответил бы "
+                  "«замечаний нет» с кодом 0, и это невозможно отличить от состоявшегося "
+                  "ревью. Раунд бюджета НЕ израсходован.", file=sys.stderr)
+            return 2
         with findings_lock():            # check+increment одной транзакцией: две сессии иначе
             rnd, budget, refusal = review_round_check(artifact)   # проходили обе
             if refusal:
