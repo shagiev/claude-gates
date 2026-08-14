@@ -15,6 +15,7 @@ import tempfile
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import yaml
@@ -28,14 +29,14 @@ try:
     from codex_review_gate import (is_code_path, _trusted_git, TrustedGitError,
                                    _trusted_git_bin, _trusted_home, _GIT_ENV_ALLOW,
                                    _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
-                                   _bootstrap_git, _has_git_marker)
+                                   _bootstrap_git, _has_git_marker, redact_secrets)
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
                                    TrustedGitError, _trusted_git_bin, _trusted_home,
                                    _GIT_ENV_ALLOW, _GIT_SAFE_ENV, _GIT_NEUTRALIZE,
                                    _TRUSTED_PATH_DIRS, _bootstrap_git,
-                                   _has_git_marker)
+                                   _has_git_marker, redact_secrets)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -90,13 +91,13 @@ def _repo_root() -> Path:
     r = _bootstrap_git("rev-parse", "--show-toplevel", cwd=cwd)
     if r is None or r.returncode != 0 or not r.stdout.strip():
         if _has_git_marker(cwd):
-            raise TrustedGitError("маркер .git есть, но корень репозитория не разрешился — "
-                                  "решения лесенки принимать не на чем")
+            raise GateRefusal("маркер .git есть, но корень репозитория не разрешился — "
+                              "решения лесенки принимать не на чем")
         return cwd
     root = Path(r.stdout.strip()).resolve()
     if root != cwd and root not in cwd.parents:
-        raise TrustedGitError(f"git выдал корень {root}, не содержащий текущий каталог {cwd} — "
-                              "похоже на подмену git; решения лесенки не принимаются")
+        raise GateRefusal(f"git выдал корень {root}, не содержащий текущий каталог {cwd} — "
+                          "похоже на подмену git; решения лесенки не принимаются")
     return root
 
 # Правило одно на все проходы, поэтому печатается один раз, а не копией в каждой строке.
@@ -115,6 +116,14 @@ _BOOKKEEPING_PATHS = tuple(
     f".claude/.ladder-{name}"
     for p in DEPLOY_REQUIRED_PASSES for name in (p, f"pending-{p}")
 )
+
+
+class GateRefusal(TrustedGitError):
+    """Гейт ОТКАЗАЛСЯ принимать решение (подмена git, неразрешимый корень) — это не поломка.
+
+    Разница операционная: сломанный движок чинят и, при нужде, обходят с аудитом; отказ
+    доверия обходить НЕЛЬЗЯ — обход и есть то, чего добивается подмена. До 2026-08-13 оба
+    случая печатались одним баннером с готовым рецептом LADDER_SKIP."""
 
 
 class LadderError(Exception):
@@ -176,6 +185,218 @@ def classification_trustworthy(root: Path, ref: str) -> bool:
     return _worktree_config_bytes(root) == _config_blob(root, ref)
 
 
+def _git_fail(what: str, r) -> str:
+    """Текст отказа git'а вместе с кодом и stderr.
+
+    Без них сообщение недиагностируемо: `не посчитать хэш X` не содержало
+    `fatal: Unable to add (null) to database`, и причину инцидента 0.9.0 пришлось
+    воспроизводить руками."""
+    err = redact_secrets((r.stderr or "").strip())
+    return f"{what} (git rc={r.returncode}){f': {err}' if err else ''} — tree-хэш не посчитать"
+
+
+def _git_ok(root: Path, env: "dict | None", what: str, *args: str,
+            stdin_bytes: "bytes | None" = None):
+    """git-вызов, для которого ненулевой код — отказ движка, а не ответ."""
+    r = _git_mutate(root, env, *args, stdin_bytes=stdin_bytes)
+    if r.returncode != 0:
+        raise TrustedGitError(_git_fail(what, r))
+    return r
+
+
+class _IndexEntry(NamedTuple):
+    mode: str
+    oid: str
+    skip_worktree: bool
+
+
+def _index_entries(root: Path) -> "dict[str, _IndexEntry | None]":
+    """Всё, что git считает содержимым дерева, ИЗ ИНДЕКСА: `path -> запись | None`.
+
+    `None` — путь с конфликтом (stage != 0): stage-0 записи для него в индексе нет, а правда
+    лежит на диске (`git add -A` застейджил бы содержимое рабочего дерева одной stage-0
+    записью). Отдельным списком его возвращать не нужно — `None` и означает «спроси диск».
+
+    `-v` добавляет флаг состояния: `S` = SKIP_WORKTREE (sparse checkout). Именно по нему
+    отличается «файла нет, потому что он вне конуса» (git считает запись неизменной) от
+    «файла нет, потому что его удалили» (это изменение дерева). До 2026-08-13 оба случая
+    трактовались как удаление, и в любом sparse-checkout репозитории `compute_tree` не мог
+    совпасть с `index_tree` — лесенка была неисполнима (воспроизведено).
+
+    Регистр буквы — ОТДЕЛЬНЫЙ бит `assume-unchanged`, а не другой вид записи: у записи с
+    обоими битами флаг `s`, и трактовать его надо как skip-worktree (иначе sparse-файл с
+    `assume-unchanged` снова выпал бы из дерева — находка ревью, раунд 3). Поэтому сравнение
+    идёт по `tag.upper()`, а `assume-unchanged` на состав дерева не влияет вовсе: то, что
+    лежит на диске, всё равно пере-хэшируется.
+
+    ВАЖНО: `env=None` — читаем РЕАЛЬНЫЙ индекс. С `GIT_INDEX_FILE` от пустого tmp-индекса
+    `ls-files` вернул бы пустоту с кодом 0, и дерево молча вышло бы пустым."""
+    r = _git_ok(root, None, "не перечислить записи индекса", "ls-files", "-v", "-s", "-z")
+    out: dict[str, "_IndexEntry | None"] = {}
+    for entry in r.stdout.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) < 4 or not path:
+            raise TrustedGitError(f"ls-files -v -s изменил формат: {entry!r}")
+        tag, mode, oid, stage = parts[0], parts[1], parts[2], parts[3]
+        if stage != "0":
+            out[path] = None                  # unmerged: решает рабочее дерево
+            continue
+        out[path] = _IndexEntry(mode, oid, tag.upper() == "S")
+    return out
+
+
+def _from_index_unseen(rel: str, mode: str, oid: str,
+                       head: "dict[str, tuple[str, str]]", why: str) -> "tuple[str, str]":
+    """Единственная точка, где запись берётся из ИНДЕКСА, а не с диска.
+
+    Всё, что не пере-хэшировано с диска, — содержимое, которого ревьюер физически не видит,
+    а индекс наполняет ПРОВЕРЯЕМАЯ сторона. Отсюда правило, общее для всех таких записей:
+
+        невидимое проходит ревью, только если оно НЕ МЕНЯЛОСЬ с последнего коммита.
+
+    Совпало с HEAD — ревьюить нечего, законный рабочий процесс (sparse checkout,
+    неинициализированный подмодуль) не страдает. Разошлось — это правка, которую никто не
+    может прочитать, и благословлять её нельзя ни молча, ни вовсе.
+
+    Правило живёт ОДНОЙ функцией сознательно: код-ревью 2026-08-13 три раунда подряд находило
+    один и тот же класс в разных ветках (skip-worktree с файлом на диске, skip-worktree без
+    файла, деинициализированный подмодуль). Чинить экземпляры по одному значило бы ждать
+    четвёртый — общее правило закрывает и те формы, которые ещё не назвали."""
+    if head.get(rel) != (mode, oid):
+        raise GateRefusal(
+            f"{rel!r}: {why}, а индекс разошёлся с HEAD — это изменение, которого ревьюер "
+            f"физически не видит. Верни содержимое в рабочее дерево, чтобы его можно было "
+            f"прочитать, — tree-хэш не посчитать")
+    return mode, oid
+
+
+def _head_entries(root: Path) -> "dict[str, tuple[str, str]]":
+    """path -> (mode, oid) в HEAD. Пустой словарь, если HEAD ещё нет (репо без коммитов)."""
+    r = _git_mutate(root, None, "ls-tree", "-r", "-z", "HEAD")
+    if r.returncode != 0:
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    for entry in r.stdout.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3 or not path:
+            raise TrustedGitError(f"ls-tree изменил формат: {entry!r}")
+        out[path] = (parts[0], parts[2])
+    return out
+
+
+def _untracked_paths(root: Path) -> "list[str]":
+    """Неотслеживаемые и неигнорируемые пути — «всё изменённое» включает и их.
+
+    Вложенный git-репозиторий (вендоренный клон) git отдаёт ОДНИМ путём со слэшем на конце и
+    внутрь не заходит; `git add -A` делает из него gitlink. Слэш снимаем, иначе
+    `update-index --cacheinfo` такой путь не примет, а сам каталог молча выпал бы из дерева
+    вместе со всем поддеревом (та же тихая слепота, что у симлинка на файл)."""
+    r = _git_ok(root, None, "не перечислить неотслеживаемые файлы",
+                "ls-files", "-o", "--exclude-standard", "-z")
+    return [p.rstrip("/") for p in r.stdout.split("\0") if p]
+
+
+def _is_unseen(root: Path, rel: str, entry: "_IndexEntry | None") -> bool:
+    """Берётся ли запись из ИНДЕКСА, а не с диска, — то есть невидима ли она ревьюеру.
+
+    Один предикат на все формы (sparse-запись без файла, неинициализированный подмодуль):
+    именно разъехавшиеся копии этого условия дали три раунда находок одного класса."""
+    if entry is None:
+        return False
+    full = root / rel
+    if entry.skip_worktree and not os.path.lexists(full):
+        return True
+    return entry.mode == "160000" and full.is_dir() and not (full / ".git").exists()
+
+
+def _unseen_drift(root: Path) -> "str | None":
+    """Путь, чьё НЕВИДИМОЕ содержимое разошлось с HEAD, либо None.
+
+    Отдельно от `compute_tree`, потому что нужен на pre-commit: см. `check_precommit`."""
+    tracked = _index_entries(root)
+    unseen = [(rel, e) for rel, e in tracked.items() if _is_unseen(root, rel, e)]
+    if not unseen:
+        return None                       # исключение не применялось — перепроверять нечего
+    head = _head_entries(root)
+    return next((rel for rel, e in unseen if head.get(rel) != (e.mode, e.oid)), None)
+
+
+def _tree_entry(root: Path, env: dict, rel: str, entry: "_IndexEntry | None",
+                head: "dict[str, tuple[str, str]]") -> "tuple[str, str] | None":
+    """(mode, oid) для одной записи дерева. None = записи в дереве быть не должно.
+
+    Реализует таблицу «источник правды» из дизайна СВЕРХУ ВНИЗ и целиком: раньше решение
+    «индекс или диск» принималось в трёх местах (цикл `compute_tree`, эта функция,
+    `_gitlink_entry`), и одна строка таблицы из-за этого терялась.
+
+    Пере-хэш с диска — смысл функции: он обходит clean-фильтры репозитория, racy-index и
+    `assume-unchanged`, которыми проверяемая сторона могла бы подменить представление."""
+    full = root / rel
+    if _is_unseen(root, rel, entry):
+        # Файл на диске ЕСТЬ → сюда не попадаем и хэшируем диск: иначе «застейджить злое,
+        # вернуть на диск доброе» прошло бы мимо ревьюера.
+        return _from_index_unseen(
+            rel, entry.mode, entry.oid, head,
+            "запись помечена skip-worktree и файла на диске нет" if entry.skip_worktree
+            else "подмодуль не инициализирован")
+    if full.is_symlink():
+        # hash-object ПО ПУТИ разыменовывает ссылку: на цели-директории git умирает
+        # (`fatal: Unable to add (null) to database` — инцидент 0.9.0), а на цели-файле МОЛЧА
+        # отдаёт блоб содержимого цели, то есть врёт при режиме 120000. Блоб симлинка в git —
+        # ровно текст цели, СЫРЫМИ байтами (цель может быть не-UTF-8), без перевода строки.
+        h = _git_ok(root, env, f"не посчитать хэш симлинка {rel!r}",
+                    "hash-object", "--no-filters", "-w", "--stdin",
+                    stdin_bytes=os.readlink(os.fsencode(full)))
+        return "120000", h.stdout.strip()
+    if full.is_dir():
+        # Признак gitlink даёт ДИСК (каталог с `.git` — в том числе НЕотслеживаемый вендоренный
+        # клон, который `git add -A` тоже превращает в gitlink) либо ИНДЕКС с mode 160000
+        # (подмодуль, который просто не инициализирован). Каталог, оказавшийся на месте
+        # ОБЫЧНОЙ записи, подмодулем не является: раньше он фабриковал `160000` поверх
+        # блоб-oid'а, а каталог с содержимым и вовсе ронял update-index
+        # (`appears as both a file and as a directory`). Правильное поведение то же, что у
+        # `git add -A`: сама запись уходит из дерева, а файлы внутри приезжают своими путями.
+        # Сюда доходят только ВИДИМЫЕ каталоги: невидимые (подмодуль без содержимого) уже
+        # разобраны выше. Значит либо инициализированный подмодуль, либо вложенный
+        # репозиторий, либо обычный каталог на месте не-gitlink записи — у последнего запись
+        # уходит из дерева, а файлы внутри приезжают своими путями, как у `git add -A`.
+        return _gitlink_entry(root, rel) if (full / ".git").exists() else None
+    if full.is_file():
+        h = _git_ok(root, env, f"не посчитать хэш {rel!r}",
+                    "hash-object", "--no-filters", "-w", "--", rel)
+        return ("100755" if os.access(full, os.X_OK) else "100644"), h.stdout.strip()
+    # Ни файла, ни симлинка, ни каталога: удалённый путь (запись обязана уйти из дерева) либо
+    # спецфайл, который `git add -A` тоже не берёт. Обе ветки совпадают с git — тихо пропустить
+    # здесь ЗНАЧИТ то же, что делает git, а не «не поняли и потеряли».
+    return None
+
+
+def _gitlink_entry(root: Path, rel: str) -> "tuple[str, str] | None":
+    """Подмодуль: какой коммит попадёт в дерево. None = записи быть не должно.
+
+    Подмодуль не файл и не симлинк, поэтому файловая ветка его пропускала — и дерево не могло
+    совпасть с `index_tree` НИКОГДА (в индексе gitlink есть всегда). В репозитории с
+    подмодулем лесенка была неисполнима так же, как с симлинком на директорию (находка
+    дизайн-ревью 2026-08-13, воспроизведена: честная цепочка давала check_precommit == 2).
+
+    Семантика — «что застейджил бы `git add -A`»: инициализированный отдаёт свой HEAD (сдвиг
+    указателя обязан быть виден), неинициализированный — oid индекса (`git add -A` его не
+    трогает), удалённый каталог выпадает из дерева, как выпадает удалённый файл."""
+    full = root / rel
+    h = _git_mutate(full, None, "rev-parse", "HEAD")
+    if h.returncode != 0:
+        # Инициализирован, но HEAD не читается: состояние рабочего дерева неизвестно.
+        # Подставить индекс значило бы объявить совпадение, которого мы не проверяли.
+        raise TrustedGitError(_git_fail(f"не прочитать HEAD подмодуля {rel!r}", h))
+    return "160000", h.stdout.strip()
+
+
 def compute_tree(root: Path) -> str:
     """TREE-хэш «всё изменённое»: ПУСТОЙ временный индекс, GIT_INDEX_FILE=<tmp>
     git add -A && git write-tree (полный re-hash). Реальный индекс НЕ мутируется.
@@ -183,15 +404,8 @@ def compute_tree(root: Path) -> str:
     Ladder-бухгалтерия (`.claude/.ladder-*`) исключена: иначе запись pending/маркера
     самим протоколом меняла бы дерево между соседними begin/mark-вызовами
     (self-referential — маркер о состоянии кода не должен зависеть от файла,
-    описывающего этот же маркер). Исключение — через `git rm --cached --ignore-unmatch`
-    ПОСЛЕ `add -A`, а не через негативные pathspec-и в самом `add -A` (фикс smoke-теста
-    Task 4): если бухгалтерский файл УЖЕ существует на диске и подпадает под реальный
-    `.gitignore` (`.claude/*`), git трактует `:!path`-негацию на такой путь как явную
-    попытку добавить игнорируемый файл и падает `fatal: ... ignored by .gitignore ...
-    use -f` — воспроизводится начиная со ВТОРОГО вызова begin/mark в жизни репозитория
-    (после первого `mark` маркер уже лежит на диске). `git rm --cached --ignore-unmatch`
-    не подвержен этой проверке и идемпотентен, если путь и не был застейджен (тестовые
-    tmp-репо без .gitignore)."""
+    описывающего этот же маркер). Исключение — просто пропуск пути при сборке; ни
+    `add -A`, ни pathspec-негаций, на которых это спотыкалось раньше, здесь больше нет."""
     with tempfile.TemporaryDirectory() as td:
         # ПУСТОЙ tmp-индекс, НЕ копия реального (ревью Task 3): shutil.copy сбрасывал mtime
         # индекса в «сейчас», отключая git-детекцию racy-правок — same-size правка в ту же
@@ -204,39 +418,28 @@ def compute_tree(root: Path) -> str:
         # `git add` ЗАПУСКАЕТ clean-фильтры репозитория (`.gitattributes`), поэтому дерево
         # считалось бы от преобразованного содержимого, а не от того, что лежит на диске.
         # Собираем индекс plumbing'ом: hash-object --no-filters + update-index --cacheinfo.
-        listing = _trusted_git("ls-files", "-c", "-o", "--exclude-standard", "-z", cwd=root)
-        if listing is None or listing.returncode != 0:
-            raise TrustedGitError("не перечислить файлы дерева — tree-хэш не посчитать")
+        tracked = _index_entries(root)
+        # HEAD нужен для любой невидимой записи. Условной загрузки нет сознательно: она уже
+        # один раз протухла, когда к skip-worktree добавились неинициализированные подмодули.
+        head = _head_entries(root)
         skip = set(_BOOKKEEPING_PATHS)
-        for rel in listing.stdout.split("\0"):
-            if not rel or rel in skip:
+        # dict.fromkeys — дедуп с сохранением порядка git'а (он уже отсортирован)
+        for rel in dict.fromkeys([*tracked, *_untracked_paths(root)]):
+            if rel in skip:
                 continue
-            full = root / rel
-            if full.is_symlink():
-                mode = "120000"
-            elif full.is_file():
-                mode = "100755" if os.access(full, os.X_OK) else "100644"
-            else:
-                continue
-            h = _trusted_git("hash-object", "--no-filters", "-w", "--", rel, cwd=root)
-            if h is None or h.returncode != 0:
-                raise TrustedGitError(f"не посчитать хэш {rel!r} — tree-хэш не посчитать")
-            u = _git_mutate(root, env, "update-index", "--add", "--cacheinfo",
-                            f"{mode},{h.stdout.strip()},{rel}")
-            if u.returncode != 0:
-                raise TrustedGitError(f"update-index отверг {rel!r}")
-        r = _git_mutate(root, env, "write-tree")
-        if r.returncode != 0:
-            raise TrustedGitError("write-tree не удался — tree-хэш не посчитать")
-        return r.stdout.strip()
+            got = _tree_entry(root, env, rel, tracked.get(rel), head)
+            if got is None:
+                continue                      # записи в дереве быть не должно (удаление)
+            mode, blob = got
+            _git_ok(root, env, f"update-index отверг {rel!r}",
+                    "update-index", "--add", "--cacheinfo", f"{mode},{blob},{rel}")
+        return _git_ok(root, env, "write-tree не удался", "write-tree").stdout.strip()
 
 
 def index_tree(root: Path) -> str:
     """git write-tree РЕАЛЬНОГО индекса (для pre-commit — ровно то, что закоммитится)."""
-    r = _git_mutate(root, None, "write-tree")
-    if r.returncode != 0:
-        raise TrustedGitError("write-tree реального индекса не удался")
-    return r.stdout.strip()
+    return _git_ok(root, None, "write-tree реального индекса не удался",
+                   "write-tree").stdout.strip()
 
 
 def read_marker(root: Path, pass_name: str) -> dict | None:
@@ -396,6 +599,47 @@ def _chain_valid_against(root: Path, expected_tree: str) -> bool:
     return markers[-1].get("tree_after") == expected_tree
 
 
+_ENGINE_BROKEN_BANNER = "[ladder-gate] ⛔ ДВИЖОК ГЕЙТА СЛОМАН — лесенка НЕИСПОЛНИМА"
+_GATE_REFUSAL_BANNER = "[ladder-gate] ⛔ ГЕЙТ ОТКАЗАЛСЯ РЕШАТЬ — доверие к git нарушено"
+
+
+def _engine_broken_message(exc: BaseException) -> str:
+    """Отказ движка обязан читаться иначе, чем непройденный проход.
+
+    Инцидент 0.9.0: сломанный `compute_tree` давал ровно то же «цепочка не подтверждена», что
+    и собственная забывчивость оператора, а подсказка в конце вела прямо к LADDER_SKIP. Отказ
+    инфраструктуры выглядел как забытый проход и подталкивал к обходу гейта — поломка прожила
+    двое суток незамеченной.
+
+    Ловим ЛЮБОЕ исключение, а не перечень типов: форм отказа нашлось четыре за один день
+    (симлинк-на-директорию, битый симлинк, не-UTF-8 цель, sparse checkout), а не-UTF-8 ИМЯ
+    файла на APFS даже не воспроизводится. Аллоулист форм тут невозможен. Это не
+    проглатывание: печатается и баннер, и полный трейсбек, код возврата ненулевой, ни одна
+    ветка не начинает пропускать коммит — меняется только то, что оператор читает первым."""
+    refusal = isinstance(exc, GateRefusal)
+    head = (_GATE_REFUSAL_BANNER if refusal else _ENGINE_BROKEN_BANNER)
+    tail = ([
+        "Обходить НЕЛЬЗЯ: обход — ровно то, чего добивается подмена. Разберись, почему git",
+        "разрешается не туда, и только потом коммить.",
+    ] if refusal else [
+        "Если коммит нужен ДО починки — это осознанный обход ОТКАЗА ДВИЖКА, с аудитом:",
+        '  LADDER_SKIP=1 LADDER_SKIP_REASON="движок гейта сломан: <причина>" git commit ...',
+    ])
+    return "\n".join([
+        head,
+        f"Причина: {exc}",
+        *([] if refusal else [
+            "Это ОТКАЗ ИНФРАСТРУКТУРЫ, а не непройденный проход: ни begin, ни mark не могут",
+            "отработать, пока причина не устранена. Проходы тут ни при чём — чинить движок.",
+        ]),
+        "Диагностика:",
+        # format_exception(exc), а не format_exc(): функция не обязана вызываться внутри
+        # except-блока и не должна молча печатать "NoneType: None" вне его.
+        "".join(traceback.format_exception(exc)).rstrip(),
+        *tail,
+    ])
+
+
 def check_precommit(root: Path) -> int:
     """Pre-commit гейт (спека §2). Порядок: (1) staged не трогает код → exempt; (2)
     ladder.enabled=false → пропуск; (3) LADDER_SKIP=1 → пропуск + аудит; (4) chain-валидация
@@ -414,8 +658,33 @@ def check_precommit(root: Path) -> int:
         _audit_line(root, f"LADDER_SKIP=1 session={_env_session()!r} reason={reason!r} — "
                           "pre-commit ladder-проверка ПРОПУЩЕНА")
         return 0
-    if _chain_valid_against(root, index_tree(root)):
-        return 0
+    try:
+        if _chain_valid_against(root, index_tree(root)):
+            # Решение по НЕВИДИМЫМ записям принимал compute_tree в момент mark — против HEAD,
+            # каким он был ТОГДА. А HEAD — обычная ссылка: её переставляют на чужую ветку
+            # (`git symbolic-ref`) НЕ трогая ни индекс, ни рабочее дерево, проводят лесенку и
+            # возвращают обратно. Маркеры честные, ledger полный, деплой-гейт доволен — а в
+            # коммит уезжает содержимое, которого никто не видел (находка security-ревью
+            # 2026-08-13, воспроизведена end-to-end). Поэтому там, где исключение вообще
+            # применялось, оно перепроверяется ЗДЕСЬ — против того HEAD, на который коммит
+            # реально ложится. Сверять целиком compute_tree == index_tree нельзя: незастейдженная
+            # правка в дереве законна и коммита не касается, а блокировала бы его.
+            drift = _unseen_drift(root)
+            if drift is not None:
+                print(_engine_broken_message(GateRefusal(
+                    f"{drift!r}: невидимое содержимое (нет на диске, есть в индексе) разошлось "
+                    f"с HEAD, на который ложится коммит. Лесенка могла быть пройдена против "
+                    f"ДРУГОГО HEAD. Верни содержимое в рабочее дерево и пройди заново")),
+                    file=sys.stderr)
+                return 2
+            return 0
+        # Прежде чем звать «пройди лесенку», убедись, что её физически МОЖНО пройти: маркеров
+        # нет ровно тогда, когда begin/mark падали. Проба стоит один tree-хэш и только здесь,
+        # на уже-провальной ветке.
+        compute_tree(root)
+    except Exception as e:                      # noqa: BLE001 — граница хука, см. баннер
+        print(_engine_broken_message(e), file=sys.stderr)
+        return 2                                # fail-closed: коммит по-прежнему блокирован
     print(_chain_instructions(root), file=sys.stderr)
     return 2
 
@@ -444,9 +713,18 @@ def _write_ledger(root: Path, sha: str, payload: dict) -> None:
     tmp.replace(p)   # атомарная публикация
 
 
-def _git_mutate(root: Path, env: "dict | None", *args: str):
+def _git_mutate(root: Path, env: "dict | None", *args: str,
+                stdin_bytes: "bytes | None" = None):
     """Мутации индекса/дерева: абсолютный бинарь и санированное окружение, как в слое.
-    Отдельно от `_trusted_git`, потому что нуждается в GIT_INDEX_FILE."""
+    Отдельно от `_trusted_git`, потому что нуждается в GIT_INDEX_FILE.
+
+    Канал ВСЕГДА двоичный, декодируем сами. `text=True` кодирует stdin и декодирует stdout
+    локалью и строго: цель симлинка может содержать любые байты кроме NUL, и surrogate-escape
+    от `os.readlink` ронял его `UnicodeEncodeError` — мимо диагностики, потому что это не
+    `TrustedGitError` (находка дизайн-ревью 2026-08-13). Путь от git'а тоже не обязан быть
+    валидным UTF-8, поэтому stdout — `surrogateescape` (суррогаты возвращаются в исходные
+    байты при передаче строки обратно аргументом subprocess), а stderr — `replace`, чтобы
+    диагностика печаталась всегда."""
     git = _trusted_git_bin()
     if git is None:
         raise TrustedGitError("доверенный git недоступен — индекс/дерево не построить")
@@ -456,8 +734,11 @@ def _git_mutate(root: Path, env: "dict | None", *args: str):
     base.update(_GIT_SAFE_ENV)
     if env and env.get("GIT_INDEX_FILE"):
         base["GIT_INDEX_FILE"] = env["GIT_INDEX_FILE"]
-    return subprocess.run([git, *_GIT_NEUTRALIZE, *args], cwd=root,
-                          capture_output=True, text=True, env=base)
+    r = subprocess.run([git, *_GIT_NEUTRALIZE, *args], cwd=root,
+                       capture_output=True, input=stdin_bytes, env=base)
+    return subprocess.CompletedProcess(r.args, r.returncode,
+                                       r.stdout.decode("utf-8", "surrogateescape"),
+                                       r.stderr.decode("utf-8", "replace"))
 
 
 def _git_out(root: Path, args: list[str]) -> str:
@@ -639,6 +920,17 @@ def range_skips(root: Path, baseline: str) -> "list[str]":
 
 
 def main(argv: list[str]) -> int:
+    try:
+        return _dispatch(argv)
+    except LadderError as e:
+        print(f"[ladder-gate] {e}", file=sys.stderr)
+        return 2
+    except Exception as e:                      # noqa: BLE001 — граница CLI, не глотание:
+        print(_engine_broken_message(e), file=sys.stderr)   # баннер + трейсбек + код 3
+        return 3
+
+
+def _dispatch(argv: list[str]) -> int:
     if argv and argv[0] == "check-precommit":
         return check_precommit(_repo_root())
     if argv and argv[0] == "record-commit":
@@ -655,14 +947,10 @@ def main(argv: list[str]) -> int:
         return 1
     cmd, pass_name = argv[0], argv[1]
     root = _repo_root()
-    try:
-        if cmd == "begin":
-            begin_pass(root, pass_name)
-        else:
-            mark_pass(root, pass_name)
-    except LadderError as e:
-        print(f"[ladder-gate] {e}", file=sys.stderr)
-        return 2
+    if cmd == "begin":
+        begin_pass(root, pass_name)
+    else:
+        mark_pass(root, pass_name)
     return 0
 
 
