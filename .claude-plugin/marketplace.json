@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Личный маркетплейс: переносимые ревью-гейты Claude↔Codex",
-    "version": "0.9.3"
+    "version": "0.9.4"
   },
   "plugins": [
     {
       "name": "gates",
       "description": "Ревью-гейты Claude↔Codex: дизайн-ревью до кода (G1), enforced-лесенка /simplify→/code-review, commit-bound деплой-гейт с протоколом сходимости.",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "author": {
         "name": "Ленар"
       },

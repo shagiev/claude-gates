@@ -1348,3 +1348,88 @@ def test_precommit_unseen_recheck_leaves_normal_flow_alone(repo, monkeypatch):
     _git(repo, "add", "app/x.py")
     (repo / "app" / "x.py").write_text("правка ПОСЛЕ mark, не застейджена\n")
     assert lg.check_precommit(repo) == 0
+
+
+# --- пакетное хэширование (0.9.4): скорость без потери точности ---
+
+def test_hostile_path_names_do_not_get_neighbours_oid(tmp_path):
+    """`hash-object --stdin-paths` C-unquote'ит строки и режет CRLF: файл `"victim"` получал
+    OID соседнего `victim`, а `victim\r` — тоже его, ПРИ СОВПАДАЮЩЕЙ длине вывода. То есть
+    тихо неверный хэш под правильным путём, и правки в таком файле невидимы для гейта.
+    Обе формы воспроизведены на дизайн-ревью 2026-08-14."""
+    r = _mkrepo(tmp_path, "hostile")
+    (r / "victim").write_text("НАСТОЯЩИЙ\n")
+    (r / '"victim"').write_text("ПОДМЕНА\n")
+    with open(os.path.join(r, "victim\r"), "w") as f:
+        f.write("С ВОЗВРАТОМ КАРЕТКИ\n")
+    with open(os.path.join(r, "victim\nnewline"), "w") as f:
+        f.write("С ПЕРЕВОДОМ СТРОКИ\n")                    # S3: ломает пакет, если попадёт
+    _commit_all(r)
+
+    tree = lg.compute_tree(r)
+    assert tree == _add_all_tree(r)                        # оракул на враждебных именах
+    entries = _git(r, "ls-tree", "-r", tree).stdout.splitlines()
+    oids = [e.split()[2] for e in entries if "victim" in e]
+    assert len(oids) == 4 and len(set(oids)) == 4, "файлы получили общий OID"
+
+
+def test_batch_partial_output_is_refused(repo, monkeypatch):
+    """Частичный вывод сдвинул бы ВСЕ последующие oid на чужие пути — тихо неверный tree-хэш,
+    ровно класс инцидента 0.9.1. Расхождение длин обязано быть отказом."""
+    real = lg._git_mutate
+
+    def short(root, env, *args, stdin_bytes=None):
+        r = real(root, env, *args, stdin_bytes=stdin_bytes)
+        if "--stdin-paths" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")   # ноль oid на N путей
+        return r
+
+    monkeypatch.setattr(lg, "_git_mutate", short)
+    with pytest.raises(lg.TrustedGitError, match="разъехались"):
+        lg.compute_tree(repo)
+
+
+def test_batching_keeps_process_count_flat(tmp_path, monkeypatch):
+    """Смысл правки — не «меньше строк», а меньше ЗАПУСКОВ git: 12,3 с на 579 файлов на маке
+    против 2,6 с на Linux (телеметрия) — это цена спавна процесса. Считаем на границе запуска,
+    а не в одном хелпере: линейный цикл через другой launcher оставил бы тест зелёным."""
+    real = lg.subprocess.run
+    spawned = []
+
+    def counting(cmd, *a, **k):
+        if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("git"):
+            spawned.append(cmd)
+        return real(cmd, *a, **k)
+
+    totals = {}
+    for n in (20, 80):
+        r = _mkrepo(tmp_path, f"scale{n}")
+        for i in range(n):
+            (r / f"f{i}.py").write_text(f"v = {i}\n")
+        _commit_all(r)
+        spawned.clear()
+        with monkeypatch.context() as m:
+            m.setattr(lg.subprocess, "run", counting)
+            lg.compute_tree(r)
+        totals[n] = len(spawned)
+
+    assert totals[80] <= totals[20] + 2, (
+        f"процессов git: N=20 → {totals[20]}, N=80 → {totals[80]} — растёт с числом файлов")
+    assert totals[80] < 15, f"на 80 файлов {totals[80]} процессов — пакетирование не работает"
+
+
+def test_index_info_accepts_file_directory_collision(tmp_path):
+    """Единственное расхождение с поштучной реализацией, найденное код-ревью, и оно в
+    ЛУЧШУЮ сторону: `--cacheinfo` падал `rc=128` на паре «tracked `a/b`, каталог `a` заменён
+    симлинком на `d`», то есть лесенка в таком дереве была неисполнима. `--index-info` такую
+    пару принимает, и дерево совпадает с `git add -A`. Закрепляю, чтобы поведение не уехало
+    обратно молча."""
+    r = _mkrepo(tmp_path, "collision")
+    (r / "a").mkdir()
+    (r / "a" / "b").write_text("из a\n")
+    (r / "d").mkdir()
+    (r / "d" / "b").write_text("из d\n")
+    _commit_all(r)
+    shutil.rmtree(r / "a")
+    os.symlink("d", r / "a")                     # каталог заменён симлинком на соседний
+    assert lg.compute_tree(r) == _add_all_tree(r)

@@ -122,7 +122,8 @@ def test_summary_separates_self_time_from_root_latency(tele_repo, monkeypatch):
 def test_summary_rejects_corrupt_records(tele_repo):
     shard = g._telemetry_shard()
     shard.parent.mkdir(parents=True, exist_ok=True)
-    good = {"ts": "2026-08-14T00:00:00+00:00", "session": "abc123", "trace": "a" * 32,
+    good = {"ts": "2026-08-14T00:00:00+00:00", "host": "0" * 16, "session": "abc123",
+            "trace": "a" * 32,
             "span": "b" * 32, "parent": None, "phase": "compute_tree",
             "dur_ms": 5, "self_ms": 5, "scale": 3, "outcome": "ok", "pid": 1}
     shard.write_text(
@@ -285,3 +286,67 @@ def test_prune_floor_protects_a_live_writer(tele_repo):
     shard = g._telemetry_shard()
     assert g.telemetry_prune([shard], days=0) == 0
     assert shard.exists()
+
+
+def test_host_groups_machines_and_never_mixes_them(tele_repo):
+    """12-секундный compute_tree мака и 2,6-секундный на Linux в одной медиане дали бы число,
+    которого нет ни на одной машине — замерено на двух реальных машинах."""
+    shard = g._telemetry_shard()
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    base = {"ts": "2026-08-14T00:00:00+00:00", "session": "c" * 16, "parent": None,
+            "phase": "compute_tree", "self_ms": 0, "scale": 500, "outcome": "ok", "pid": 1}
+    lines = []
+    for host, dur in (("a" * 16, 12275), ("b" * 16, 2627)):
+        lines.append(json.dumps({**base, "host": host, "trace": host * 2, "span": host * 2,
+                                 "dur_ms": dur, "self_ms": dur}))
+    shard.write_text("\n".join(lines) + "\n")
+    out = g.telemetry_summary([shard])
+    assert "машина " + "a" * 16 in out and "машина " + "b" * 16 in out
+    assert "12275" in out and "2627" in out          # обе цифры видны, не усреднены
+
+
+def test_machine_id_is_stable_and_carries_no_name(tele_repo, monkeypatch):
+    """Id переживает переименование машины (в отличие от hostname) и имени не несёт."""
+    first = g._machine_id()
+    assert re.fullmatch(r"[0-9a-f]{16}", first)
+    monkeypatch.setattr(g.os, "uname", lambda: type("U", (), {"nodename": "другое-имя"})())
+    assert g._machine_id() == first                  # переименование не дробит историю
+    import socket
+    # machine-id общий на все репозитории машины: он лежит РЯДОМ с per-repo каталогами
+    stored = (g._gate_state_dir().parent / "machine-id").read_text()
+    assert stored.strip() == first
+    assert socket.gethostname() not in stored
+
+
+def test_two_installations_get_distinct_ids(tmp_path):
+    """S7b: разные установки — разные id. Иначе сводка снова смешает машины."""
+    a = g._machine_id_at(str(tmp_path / "инсталляция-a"))
+    b = g._machine_id_at(str(tmp_path / "инсталляция-b"))
+    assert a and b and a != b
+
+
+def test_existing_machine_id_is_never_overwritten(tmp_path):
+    """Детерминированная проверка вместо гоночной: прошлый тест был зелёным и на НАИВНОЙ
+    реализации (импорт модуля сериализует процессы, окно гонки не открывается), то есть
+    утверждал гарантию, которой не проверял. Суть свойства — «второй не перезаписывает
+    первого» — проверяется прямо."""
+    state = tmp_path / "state"
+    first = g._machine_id_at(str(state))
+    g._machine_id_at.cache_clear()               # как будто это другой процесс
+    assert g._machine_id_at(str(state)) == first
+    (state / "machine-id").write_text("0123456789abcdef")
+    g._machine_id_at.cache_clear()
+    assert g._machine_id_at(str(state)) == "0123456789abcdef"
+
+
+def test_pre_0_9_4_events_are_not_discarded(tele_repo):
+    """События 0.9.3 не знают поля `host`, а схема закрыта по ключам — они выбрасывались
+    целиком. Это ровно те двухмашинные замеры, которыми обоснован релиз: база «до»."""
+    shard = g._telemetry_shard()
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    old_event = {"ts": "2026-08-14T00:00:00+00:00", "session": "a" * 16, "trace": "b" * 32,
+                 "span": "c" * 32, "parent": None, "phase": "compute_tree",
+                 "dur_ms": 12275, "self_ms": 12275, "scale": 579, "outcome": "ok", "pid": 1}
+    shard.write_text(json.dumps(old_event) + "\n")
+    out = g.telemetry_summary([shard])
+    assert "событий: 1" in out and "12275" in out

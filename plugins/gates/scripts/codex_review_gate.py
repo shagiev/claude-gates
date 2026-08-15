@@ -868,6 +868,70 @@ def _exec_companion(args: list[str], *, allow_env_override: bool = True,
         return None
 
 
+#: Маркеры markdown-чеклиста: пусто, `x`/`v`/`-`, только цифры. Всё остальное — находка.
+_CHECKLIST_MARKERS = frozenset(("", "x", "v", "-", "*", "✓"))
+
+
+def _is_checklist_marker(label: str) -> bool:
+    t = (label or "").strip().lower()
+    return t in _CHECKLIST_MARKERS or t.isdigit()
+
+
+def _reviews_only_the_design_file(passthrough: "list[str]",
+                                  design_file: "str | None") -> bool:
+    """Действительно ли ревьюер получил ТОЛЬКО объявленный дизайн-файл.
+
+    Нельзя верить самому флагу `--design-file`: он снимается до вызова движка, а тот всё равно
+    ревьюит ДИАПАЗОН. Поэтому «дизайн» в качестве оправдания прозаичного ответа проходило и
+    тогда, когда рядом лежал изменённый код, — то есть слепое КОДОВОЕ ревью принималось за
+    дизайнерскую прозу (находка код-ревью 14.08.2026; мой же тест это закреплял).
+
+    Судим по разрешённому входу: исключение действует, только если в диффе нет ничего, кроме
+    самого дизайн-файла."""
+    if not design_file:
+        return False
+    paths = _review_input_paths(passthrough)
+    if paths is None:
+        return False                     # не смогли определить — считаем кодовым (строже)
+    want = os.path.relpath(os.path.abspath(design_file), str(REPO_ROOT or "."))
+    return bool(paths) and set(paths) <= {want}
+
+
+def _review_says_nothing(raw: str) -> "str | None":
+    """`needs-attention` БЕЗ единой находки — ревью не состоялось, а не «замечаний нет».
+
+    Это самопротиворечие: если внимание требуется, то к ЧЕМУ? Так выглядит ревьюер, который не
+    смог прочитать артефакт (устаревший кэш собственного плагина, недоступный инструмент,
+    пустой вход): он пишет «не смог» ПРОЗОЙ и возвращает КОД 0 с валидным `Verdict:`. За
+    14.08.2026 так вышло четырежды, и механика не поймала ни разу — ловили глаза по тексту.
+    Прозу разбирать нельзя, она произвольна; а «не-approve и ноль находок» проверяется машинно.
+
+    Две границы правила, обе оплачены ошибками:
+
+    * `approve` (и любой незнакомый вердикт) — не наше дело. Сначала здесь стоял выдуманный
+      `ship`, и чистое ревью без замечаний гвард объявил бы несостоявшимся, заблокировав
+      законную работу.
+    * Находкой считается ЛЮБОЙ ярлык, кроме узкого закрытого перечня чеклист-маркеров.
+      Сначала я сверял с `KNOWN_SEVERITIES` — и `[urgent]` объявлялся слепым ответом; потом
+      требовал «слово из трёх букв» — и отсекались `[P1]`, `[sev-1]`, `[high-impact]`. Каждый
+      раз настоящая находка НЕ попадала в реестр (гвард возвращает 2 ДО записи), то есть
+      претензия молча исчезала. Здесь денилист уместен, и это осознанное исключение: перечень
+      чеклист-маркеров закрыт и общеизвестен, а цена ошибок несимметрична — пропустить слепой
+      ответ дешевле, чем потерять реальную находку.
+    """
+    v = parse_review_output(raw or "")
+    if not v.verdict:
+        return None                      # без `Verdict:` — не наш контракт, это другая ветка
+    if v.verdict.strip().lower() not in RECOGNIZED_VERDICTS - {"approve"}:
+        return None
+    if [f for f in v.findings if not _is_checklist_marker(f[0])]:
+        return None
+    # `no_findings_marker` тут НЕ оправдание: «требуется внимание» + явное «замечаний нет» —
+    # это и есть противоречие, а не согласованный ответ.
+    return (f"вердикт {v.verdict!r} без единой находки — если внимание требуется, то к чему? "
+            "Так выглядит ревьюер, который не смог прочитать артефакт")
+
+
 def companion_outage_reason(out: str) -> str | None:
     """Причина, по которой вывод companion НЕ является ревью (пусто либо деградировавший
     конверт: quota, ошибка модели, отсутствующий result), иначе None.
@@ -896,6 +960,44 @@ def companion_outage_reason(out: str) -> str | None:
     return outage_details(raw) or "деградировавший конверт companion (result отсутствует)"
 
 
+def _review_base_scope(passthrough: "list[str]") -> "tuple[str | None, str | None]":
+    """`--base` и `--scope` из argv, обе формы (`--x val` и `--x=val`). Один разбор на всех
+    потребителей: два парсера одного argv с разными правилами уже расходились."""
+    base = scope = None
+    for i, a in enumerate(passthrough):
+        if a == "--base" and i + 1 < len(passthrough):
+            base = passthrough[i + 1]
+        elif a.startswith("--base="):
+            base = a.split("=", 1)[1]
+        elif a == "--scope" and i + 1 < len(passthrough):
+            scope = passthrough[i + 1]
+        elif a.startswith("--scope="):
+            scope = a.split("=", 1)[1]
+    return base, scope
+
+
+def _review_input_paths(passthrough: "list[str]") -> "list[str] | None":
+    """Пути, которые РЕАЛЬНО увидит ревьюер. None = определить не удалось (судим строже).
+
+    Приоритет как у движка: при заданном `--base` он возвращает `mode: branch` ДО того, как
+    посмотрит на `--scope`."""
+    # `-z` обязателен: без него git экранирует не-ASCII пути по `core.quotepath`, и
+    # `дизайн.md` приезжает как `"\320\264..."` — сравнение с реальным именем не сойдётся.
+    base, scope = _review_base_scope(passthrough)
+    if base:
+        d = _trusted_git("diff", "--name-only", "-z", f"{base}...HEAD")
+        if d is None or d.returncode != 0:
+            return None
+        return [x for x in d.stdout.split("\0") if x]
+    if scope == "working-tree":
+        d = _trusted_git("status", "--porcelain", "-z", "--untracked-files=all")
+        if d is None or d.returncode != 0:
+            return None
+        # `-z`: записи разделены NUL, путь начинается с 4-го символа (`XY `).
+        return [e[3:] for e in d.stdout.split("\0") if len(e) > 3]
+    return None
+
+
 def review_input_empty(passthrough: "list[str]", design_file: "str | None") -> "str | None":
     """Причина, по которой ревьюеру НЕЧЕГО смотреть, либо None. Проверяется ДО запуска движка.
 
@@ -916,17 +1018,7 @@ def review_input_empty(passthrough: "list[str]", design_file: "str | None") -> "
         # игра в денилист; отвергаем неоднозначную форму и просим написать канонически.
         return (f"неоднозначная форма аргумента {single_dash[0]!r}: движок её понимает, а гейт "
                 "проверить не берётся. Напиши `--base` / `--scope`")
-    base = None
-    scope = None
-    for i, a in enumerate(passthrough):
-        if a == "--base" and i + 1 < len(passthrough):
-            base = passthrough[i + 1]
-        elif a.startswith("--base="):
-            base = a.split("=", 1)[1]
-        elif a == "--scope" and i + 1 < len(passthrough):
-            scope = passthrough[i + 1]
-        elif a.startswith("--scope="):
-            scope = a.split("=", 1)[1]
+    base, scope = _review_base_scope(passthrough)
     if base and scope == "working-tree":
         # Не «проверим что-нибудь», а отказ: пользователь просит одно, движок сделает другое.
         return ("одновременно заданы --base и --scope working-tree: движок при заданном --base "
@@ -937,10 +1029,10 @@ def review_input_empty(passthrough: "list[str]", design_file: "str | None") -> "
         if rev is None or rev.returncode != 0 or not rev.stdout.strip():
             return (f"--base {base!r} не разрешается в коммит (сокращённый sha? опечатка?) — "
                     "диапазон ревью построить не из чего")
-        d = _trusted_git("diff", "--name-only", f"{base}...HEAD")
-        if d is None:
+        paths = _review_input_paths(passthrough)
+        if paths is None:
             return "доверенный git недоступен — вход ревью не проверить"
-        if not d.stdout.strip():
+        if not paths:
             # Дизайн-файл проверяется ДОПОЛНИТЕЛЬНО, а не ВМЕСТО: `--design-file` — флаг гейта,
             # до движка он не доезжает, и ревьюер всё равно получит ДИАПАЗОН. Ветка, которая
             # при наличии файла возвращала None, пропускала ровно инцидент №2 (незакоммиченный
@@ -948,10 +1040,10 @@ def review_input_empty(passthrough: "list[str]", design_file: "str | None") -> "
             return (f"диапазон {base}..HEAD ПУСТ — ревьюеру нечего показать. Закоммить артефакт "
                     "(или ревьюй незакоммиченное через `--scope working-tree` БЕЗ `--base`)")
     elif scope == "working-tree":
-        d = _trusted_git("status", "--porcelain", "--untracked-files=all")
-        if d is None:
+        paths = _review_input_paths(passthrough)
+        if paths is None:
             return "доверенный git недоступен — вход ревью не проверить"
-        if not d.stdout.strip():
+        if not paths:
             return "рабочее дерево чисто — ревьюеру нечего показать"
     if design_file:
         p = Path(design_file)
@@ -3147,7 +3239,7 @@ _TELEMETRY_PHASES = frozenset((
     "compute_tree", "index_tree", "begin_pass", "mark_pass", "check_precommit",
     "prepush_fetch", "predict_merge", "merge_probe", "reviewer_call",
 ))
-_TELEMETRY_KEYS = ("ts", "session", "trace", "span", "parent", "phase",
+_TELEMETRY_KEYS = ("ts", "host", "session", "trace", "span", "parent", "phase",
                    "dur_ms", "self_ms", "scale", "outcome", "pid")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 #: Стек открытых span'ов ТЕКУЩЕГО процесса. Trace = одна CLI-инвокация, а не цикл лесенки:
@@ -3173,6 +3265,51 @@ class _Span:
 
     def __init__(self) -> None:
         self.scale = None
+
+
+def _machine_id() -> str:
+    """Устойчивый идентификатор УСТАНОВКИ для группировки телеметрии по машинам.
+
+    Не имя машины и не его хэш: `uname().nodename` совпадает у клонов VM (сводка молча
+    смешала бы машины) и меняется при переименовании (история одной машины раздробилась бы) —
+    хэш не чинит ни того, ни другого, лишь скрывает имя. Случайный id имени не несёт вовсе.
+
+    Граница сужена ЯВНО: id различает установки, инициализированные ОТДЕЛЬНО. Клон, снятый
+    ПОСЛЕ первого запуска, унесёт файл с собой, и две машины отчитаются одним id — принято
+    осознанно: телеметрия это приборная панель, а не учёт парка. Лечится удалением файла."""
+    d = _gate_state_dir()
+    if d is None:
+        return ""
+    return _machine_id_at(str(d.parent))
+
+
+@functools.lru_cache(maxsize=8)
+def _machine_id_at(state_dir: str) -> str:
+    """Кэш по СТРОКЕ каталога, а не беспараметрический: conftest подменяет каталог на тест,
+    и общий кэш протёк бы между ними. Иначе id читался бы с диска на КАЖДОЕ событие."""
+    f = Path(state_dir) / "machine-id"           # общий на все репозитории этой машины
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if not f.exists():
+            # Публикация ЖЁСТКОЙ ССЫЛКОЙ на уже заполненный файл. `write_text` неатомарен:
+            # читатель может увидеть пустой файл, а last-wins семантика `os.replace` не
+            # сходится к одному id. Честно: воспроизвести расхождение на этой машине не
+            # удалось — импорт модуля сериализует процессы и окно не открывается, — поэтому
+            # утверждение «столько-то разных id» из ревью я не переписываю как факт. Ссылка
+            # строго безопаснее и стоит те же три строки, так что оставлена по построению,
+            # а не по замеру.
+            tmp = f.with_name(f"machine-id.{os.getpid()}.tmp")
+            tmp.write_text(secrets.token_hex(8))
+            try:
+                os.link(tmp, f)                  # первый победил, остальные получают его id
+            except OSError:
+                pass
+            finally:
+                tmp.unlink(missing_ok=True)
+        got = f.read_text().strip()
+        return got if re.fullmatch(r"[0-9a-f]{16}", got) else ""
+    except OSError:
+        return ""
 
 
 def _telemetry_dir() -> "Path | None":
@@ -3219,6 +3356,8 @@ def _telemetry_valid(e: "dict") -> bool:
     if not (e["parent"] is None or (isinstance(e["parent"], str) and _HEX32.match(e["parent"]))):
         return False
     if not (isinstance(e["session"], str) and re.fullmatch(r"[0-9a-f]{0,32}", e["session"])):
+        return False
+    if not (isinstance(e["host"], str) and re.fullmatch(r"[0-9a-f]{0,32}", e["host"])):
         return False
     return isinstance(e["ts"], str) and bool(re.fullmatch(r"[0-9T:.+\-]{10,40}", e["ts"]))
 
@@ -3286,6 +3425,7 @@ def _timed(phase: str):
                 # но оставляет имя: `CLAUDE_CODE_SESSION_ID=/Users/x/clients/acme-private`
                 # превращается в `_Users_x_clients_acme-private` и утекает в файл, который
                 # потом приложат к отчёту (поймано позитивным тестом).
+                "host": _machine_id(),
                 "session": hashlib.sha256(_env_session().encode()).hexdigest()[:16],
                 "trace": _TRACE_ID, "span": span, "parent": frame["parent"],
                 "phase": phase, "dur_ms": dur_ns // 1_000_000,
@@ -3309,6 +3449,8 @@ def telemetry_summary(paths: "list[Path]") -> str:
             except ValueError:
                 bad += 1
                 continue
+            if isinstance(e, dict):
+                e.setdefault("host", "")     # события до 0.9.4 поля не знают; они и есть база «до»
             if isinstance(e, dict) and _telemetry_valid(e):
                 events.append(e)
             else:
@@ -3322,23 +3464,33 @@ def telemetry_summary(paths: "list[Path]") -> str:
         xs = sorted(xs)
         return xs[min(len(xs) - 1, int(len(xs) * q))]
 
-    by: "dict[str, list]" = {}
-    for e in events:
-        by.setdefault(e["phase"], []).append(e)
     head = f"{'фаза':<16}{'n':>5}{'self, с':>10}{'p50 dur':>9}{'p90 dur':>9}{'масштаб':>9}"
     out = [f"событий: {len(events)}   инвокаций: {len({e['trace'] for e in events})}"
            + (f"   отброшено: {bad}" if bad else "")
-           + (f"   ORPHAN-parent: {orphans}" if orphans else ""),
-           "", head, "-" * len(head)]
-    for ph, es in sorted(by.items(), key=lambda kv: -sum(x["self_ms"] for x in kv[1])):
-        durs = [x["dur_ms"] for x in es]
-        scales = [x["scale"] for x in es if isinstance(x["scale"], int)]
-        out.append(f"{ph:<16}{len(es):>5}{sum(x['self_ms'] for x in es) / 1000:>10.1f}"
-                   f"{_pct(durs, .5):>9}{_pct(durs, .9):>9}"
-                   f"{(sum(scales) // len(scales)) if scales else '—':>9}")
-    roots = [e["dur_ms"] for e in events if not e["parent"]]
-    if roots:
-        out += ["", f"латентность КОРНЕВЫХ фаз, мс: p50 {_pct(roots, .5)}  "
+           + (f"   ORPHAN-parent: {orphans}" if orphans else "")]
+    # По МАШИНАМ отдельно: 12-секундный compute_tree мака и 2,6-секундный на Linux в одной
+    # медиане дали бы число, которого нет ни на одной машине (замерено на двух машинах).
+    hosts: "dict[str, list]" = {}
+    for e in events:
+        hosts.setdefault(e["host"] or "?", []).append(e)
+    for host, hev in sorted(hosts.items()):
+        by: "dict[str, list]" = {}
+        for e in hev:
+            by.setdefault(e["phase"], []).append(e)
+        out += ([f"", f"машина {host} — событий {len(hev)}"] if len(hosts) > 1 else [""])
+        out += [head, "-" * len(head)]
+        for ph, es in sorted(by.items(), key=lambda kv: -sum(x["self_ms"] for x in kv[1])):
+            durs = [x["dur_ms"] for x in es]
+            scales = [x["scale"] for x in es if isinstance(x["scale"], int)]
+            out.append(f"{ph:<16}{len(es):>5}{sum(x['self_ms'] for x in es) / 1000:>10.1f}"
+                       f"{_pct(durs, .5):>9}{_pct(durs, .9):>9}"
+                       f"{(sum(scales) // len(scales)) if scales else '—':>9}")
+        # Латентность — ТОЖЕ по машинам. Она считалась по всем событиям сразу, то есть строка,
+        # которую и цитируют в споре «сколько гейты добавляют на инвокацию», смешивала мак с
+        # Linux — ровно тот дефект, ради которого вводился `host`.
+        roots = [e["dur_ms"] for e in hev if not e["parent"]]
+        if roots:
+            out += [f"латентность КОРНЕВЫХ фаз, мс: p50 {_pct(roots, .5)}  "
                     f"p90 {_pct(roots, .9)}  макс {max(roots)}"]
     if _SPAN_DISORDER:
         out += [f"⚠️ рассинхрон стека span'ов: {_SPAN_DISORDER} — self_ms этого процесса неточен"]
@@ -5484,6 +5636,17 @@ def main(argv: list[str]) -> int:
             print(f"[codex-gate] companion exit={r.returncode}: {reason}", file=sys.stderr)
             return 2
         outage = companion_outage_reason(r.stdout)
+        if outage is None and not _reviews_only_the_design_file(passthrough, design_file):
+            # Только для КОДОВОГО ревью: дизайн-ревью по построению возвращает прозу, его
+            # находки нигде не сохраняются, и один оплаченный раунд терять нельзя.
+            blind = _review_says_nothing(r.stdout)
+            if blind is not None:
+                # Тело печатаем: иначе оператор не отличит слепого ревьюера от законного
+                # ревью, чьи находки не распарсились, — и не сможет ничего сделать.
+                print(f"[codex-gate] ревью НЕ выполнено: {blind}\n"
+                      f"  ответ ревьюера (усечённо): "
+                      f"{redact_secrets((r.stdout or '').strip())[:400]}", file=sys.stderr)
+                return 2
         if outage is not None:
             # Код 0 ≠ ревью состоялось: при исчерпанной квоте companion выходит нулём и отдаёт
             # деградировавший конверт. Без этой ветки он читался бы как «замечаний нет».
