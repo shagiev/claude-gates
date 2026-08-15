@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -327,9 +328,56 @@ def _unseen_drift(root: Path) -> "str | None":
     return next((rel for rel, e in unseen if head.get(rel) != (e.mode, e.oid)), None)
 
 
+#: Путь, который безопасно отдать `hash-object --stdin-paths`. Аллоулист по КЛАССАМ СИМВОЛОВ,
+#: а не перечень спецслучаев git: `--stdin-paths` читает строки через `strbuf_getline` и
+#: C-unquote'ит их, поэтому `\n` ломает пакет, завершающий `\r` съедается (CRLF — один
+#: терминатор), а строка с ведущей кавычкой раскавычивается, и файл `"victim"` получает OID
+#: СОСЕДНЕГО `victim` — при совпадающей длине вывода, то есть тихо неверный хэш под правильным
+#: путём (обе формы воспроизведены на дизайн-ревью 2026-08-14). Перечислять их по одной —
+#: денилист над чужим парсером, он в этом репозитории проигрывал пять раз.
+#:
+#: Поэтому: ни одного управляющего символа (закрывает `\n`, `\r` и всё, чего я не знаю), ни
+#: кавычки, ни обратного слэша — где угодно в пути, а не только в начале. UTF-8 при этом
+#: остаётся в пакете: git его не переинтерпретирует, а имена с кириллицей частотны, и выносить
+#: их поштучно значило бы потерять оптимизацию там, где она нужна.
+_UNSAFE_FOR_BATCH = frozenset('"\\') | {chr(c) for c in range(0x20)} | {chr(0x7f)}
+
+
+#: Метка «oid посчитает пакет». Не None и не пустая строка: обе формы уже что-то значат.
+_BATCH = "\0batch"
+
+
+def _batchable(rel: str) -> bool:
+    return bool(rel) and not (_UNSAFE_FOR_BATCH & set(rel))
+
+
+def _batch_hash(root: Path, env: dict, paths: "list[str]") -> "list[str]":
+    """OID для списка обычных файлов ОДНИМ вызовом. Порядок вывода = порядок ввода.
+
+    `2N+3` подпроцессов на дерево стоили 12,3 с на 579 файлов на маке против 2,6 с на Linux
+    (замерено телеметрией) — разница в цене запуска процесса, а лесенка зовёт `compute_tree`
+    шесть раз за цикл."""
+    if not paths:
+        return []
+    r = _git_ok(root, env, "пакетный hash-object не удался",
+                "hash-object", "--no-filters", "-w", "--stdin-paths",
+                stdin_bytes=b"".join(os.fsencode(p) + b"\n" for p in paths))
+    oids = r.stdout.split()
+    if len(oids) != len(paths):
+        # Частичный вывод сдвинул бы ВСЕ последующие oid на чужие пути — тихо неверный
+        # tree-хэш на chokepoint'е целостности, ровно класс инцидента 0.9.1.
+        raise TrustedGitError(
+            f"пакетный hash-object вернул {len(oids)} oid на {len(paths)} путей — "
+            "записи разъехались бы по путям; tree-хэш не посчитать")
+    return oids
+
+
 def _tree_entry(root: Path, env: dict, rel: str, entry: "_IndexEntry | None",
                 head: "dict[str, tuple[str, str]]") -> "tuple[str, str] | None":
-    """(mode, oid) для одной записи дерева. None = записи в дереве быть не должно.
+    """(mode, oid) для одной записи дерева. None = записи быть не должно.
+
+    Для обычного файла oid может быть маркером `_BATCH` — его проставит пакетный хэш у
+    вызывающего: спавн процесса на файл и был главной статьёй расхода.
 
     Реализует таблицу «источник правды» из дизайна СВЕРХУ ВНИЗ и целиком: раньше решение
     «индекс или диск» принималось в трёх местах (цикл `compute_tree`, эта функция,
@@ -368,9 +416,12 @@ def _tree_entry(root: Path, env: dict, rel: str, entry: "_IndexEntry | None",
         # уходит из дерева, а файлы внутри приезжают своими путями, как у `git add -A`.
         return _gitlink_entry(root, rel) if (full / ".git").exists() else None
     if full.is_file():
+        mode = "100755" if os.access(full, os.X_OK) else "100644"
+        if _batchable(rel):
+            return mode, _BATCH                 # oid проставит пакетный хэш ниже
         h = _git_ok(root, env, f"не посчитать хэш {rel!r}",
                     "hash-object", "--no-filters", "-w", "--", rel)
-        return ("100755" if os.access(full, os.X_OK) else "100644"), h.stdout.strip()
+        return mode, h.stdout.strip()
     # Ни файла, ни симлинка, ни каталога: удалённый путь (запись обязана уйти из дерева) либо
     # спецфайл, который `git add -A` тоже не берёт. Обе ветки совпадают с git — тихо пропустить
     # здесь ЗНАЧИТ то же, что делает git, а не «не поняли и потеряли».
@@ -417,7 +468,8 @@ def compute_tree(root: Path) -> str:
         env["GIT_INDEX_FILE"] = str(tmp_index)
         # `git add` ЗАПУСКАЕТ clean-фильтры репозитория (`.gitattributes`), поэтому дерево
         # считалось бы от преобразованного содержимого, а не от того, что лежит на диске.
-        # Собираем индекс plumbing'ом: hash-object --no-filters + update-index --cacheinfo.
+        # Собираем индекс plumbing'ом: пакетный hash-object --no-filters + один
+        # update-index -z --index-info (2N+3 подпроцесса стоили 12,3 с на 579 файлов на маке).
         tracked = _index_entries(root)
         # HEAD нужен для любой невидимой записи. Условной загрузки нет сознательно: она уже
         # один раз протухла, когда к skip-worktree добавились неинициализированные подмодули.
@@ -426,15 +478,26 @@ def compute_tree(root: Path) -> str:
         # dict.fromkeys — дедуп с сохранением порядка git'а (он уже отсортирован)
         listing = dict.fromkeys([*tracked, *_untracked_paths(root)])
         _span.scale = len(listing)              # то, что РЕАЛЬНО хэшируется, а не только tracked
+        entries: "list[tuple[str, str, str]]" = []      # (mode, oid|_BATCH, rel)
         for rel in listing:
             if rel in skip:
                 continue
             got = _tree_entry(root, env, rel, tracked.get(rel), head)
             if got is None:
                 continue                      # записи в дереве быть не должно (удаление)
-            mode, blob = got
-            _git_ok(root, env, f"update-index отверг {rel!r}",
-                    "update-index", "--add", "--cacheinfo", f"{mode},{blob},{rel}")
+            entries.append((got[0], got[1], rel))
+        batched = [rel for _, blob, rel in entries if blob is _BATCH]
+        oids = dict(zip(batched, _batch_hash(root, env, batched)))
+        # Один `update-index --index-info` вместо N вызовов `--cacheinfo`. `-z` обязателен:
+        # без него git разбирает записи построчно и спотыкается на тех же путях, что и
+        # `--stdin-paths`, — только уже на стороне ЗАПИСИ.
+        payload = b"".join(
+            b"%s %s\t%s\0" % (mode.encode(), (oids[rel] if blob is _BATCH else blob).encode(),
+                               os.fsencode(rel))
+            for mode, blob, rel in entries)
+        if payload:
+            _git_ok(root, env, "update-index отверг набор записей",
+                    "update-index", "-z", "--index-info", stdin_bytes=payload)
         return _git_ok(root, env, "write-tree не удался", "write-tree").stdout.strip()
 
 
