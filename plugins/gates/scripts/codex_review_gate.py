@@ -877,6 +877,14 @@ def _is_checklist_marker(label: str) -> bool:
     return t in _CHECKLIST_MARKERS or t.isdigit()
 
 
+def _real_findings(v) -> "list":
+    """Находки без чеклист-маркеров. Один счёт на гвард слепоты и на телеметрию: иначе
+    «Verdict: approve» с прогонным чеклистом `- [x] дифф прочитан` уезжал в данные как
+    `findings=3` и выпадал из счётчика пустых раундов — той самой метрики, ради которой
+    поле и заводилось (находка код-ревью 22.08.2026)."""
+    return [f for f in v.findings if not _is_checklist_marker(f[0])]
+
+
 def _reviews_only_the_design_file(passthrough: "list[str]",
                                   design_file: "str | None") -> bool:
     """Действительно ли ревьюер получил ТОЛЬКО объявленный дизайн-файл.
@@ -924,7 +932,7 @@ def _review_says_nothing(raw: str) -> "str | None":
         return None                      # без `Verdict:` — не наш контракт, это другая ветка
     if v.verdict.strip().lower() not in RECOGNIZED_VERDICTS - {"approve"}:
         return None
-    if [f for f in v.findings if not _is_checklist_marker(f[0])]:
+    if _real_findings(v):
         return None
     # `no_findings_marker` тут НЕ оправдание: «требуется внимание» + явное «замечаний нет» —
     # это и есть противоречие, а не согласованный ответ.
@@ -1514,6 +1522,7 @@ class AdjudicationError(Exception):
     """Невалидная адъюдикация (critical→residual, пустая причина, неизвестный id)."""
 
 
+import collections
 import contextlib
 import fcntl
 
@@ -3237,10 +3246,17 @@ _GIT_SAFE_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
 #: пользователя, ни имя приватного репозитория (находка дизайн-ревью 2026-08-14).
 _TELEMETRY_PHASES = frozenset((
     "compute_tree", "index_tree", "begin_pass", "mark_pass", "check_precommit",
-    "prepush_fetch", "predict_merge", "merge_probe", "reviewer_call",
+    "prepush_fetch", "predict_merge", "merge_probe", "reviewer_call", "review_round",
 ))
+#: `review_round` — раунд цикла с бюджетом (`companion-review`); `reviewer_call` — один вызов
+#: сертифицированного ревьюера в деплой-панели. Это РАЗНЫЕ операции, и в одной строке сводки
+#: они дали бы медиану, которой ни у кого нет.
+#: `kind` разделяет дизайн и код: у дизайн-ревью потолок ОДИН раунд, у кодового три, и без
+#: разделения «доля раундов 3+» отражала бы состав работы, а не сходимость цикла.
+_REVIEW_KINDS = frozenset(("", "design", "code"))
 _TELEMETRY_KEYS = ("ts", "host", "session", "trace", "span", "parent", "phase",
-                   "dur_ms", "self_ms", "scale", "outcome", "pid")
+                   "dur_ms", "self_ms", "scale", "kind", "round", "findings",
+                   "outcome", "pid")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 #: Стек открытых span'ов ТЕКУЩЕГО процесса. Trace = одна CLI-инвокация, а не цикл лесенки:
 #: `begin`, `mark` и `check-precommit` — разные процессы, связать их стеком нельзя в принципе.
@@ -3257,14 +3273,17 @@ _TELEMETRY_SHARD: "Path | None | str" = "?"
 
 
 class _Span:
-    """Ручка открытой фазы: тело проставляет `scale` там, где стоимость линейна.
-
-    Параметром это выразить нельзя — масштаб известен только В СЕРЕДИНЕ тела (`len(tracked)`
-    в `compute_tree`), поэтому ручка, а не аргумент."""
-    __slots__ = ("scale",)
+    """Ручка открытой фазы: тело проставляет поля, известные только В СЕРЕДИНЕ него —
+    `scale` (масштаб, `len(tracked)` в `compute_tree`), а для раунда ревью ещё `kind`,
+    `round` и `findings`. Параметрами это не выразить."""
+    __slots__ = ("scale", "kind", "round", "findings", "outcome")
 
     def __init__(self) -> None:
         self.scale = None
+        self.kind = ""
+        self.round = None
+        self.findings = None
+        self.outcome = None          # тело может пометить исход, не бросая исключение
 
 
 def _machine_id() -> str:
@@ -3347,7 +3366,10 @@ def _telemetry_valid(e: "dict") -> bool:
         return False
     if not all(isinstance(e[k], int) and e[k] >= 0 for k in ("dur_ms", "self_ms", "pid")):
         return False
-    if not (e["scale"] is None or (isinstance(e["scale"], int) and e["scale"] >= 0)):
+    for k in ("scale", "round", "findings"):
+        if not (e[k] is None or (isinstance(e[k], int) and e[k] >= 0)):
+            return False
+    if e["kind"] not in _REVIEW_KINDS:
         return False
     if not (isinstance(e["trace"], str) and _HEX32.match(e["trace"])):
         return False
@@ -3396,6 +3418,7 @@ def _timed(phase: str):
     outcome = "ok"
     try:
         yield handle
+        outcome = handle.outcome or outcome
     except BaseException:
         outcome = "error"                       # KeyboardInterrupt тоже измеряем и пробрасываем
         raise
@@ -3430,7 +3453,8 @@ def _timed(phase: str):
                 "trace": _TRACE_ID, "span": span, "parent": frame["parent"],
                 "phase": phase, "dur_ms": dur_ns // 1_000_000,
                 "self_ms": max(0, dur_ns - frame["children_ns"]) // 1_000_000,
-                "scale": handle.scale, "outcome": outcome, "pid": os.getpid(),
+                "scale": handle.scale, "kind": handle.kind, "round": handle.round,
+                "findings": handle.findings, "outcome": outcome, "pid": os.getpid(),
             })
         except Exception:                       # noqa: BLE001 — измеритель не ломает измеряемое
             pass
@@ -3450,7 +3474,13 @@ def telemetry_summary(paths: "list[Path]") -> str:
                 bad += 1
                 continue
             if isinstance(e, dict):
-                e.setdefault("host", "")     # события до 0.9.4 поля не знают; они и есть база «до»
+                # События прошлых версий новых полей не знают, а схема закрыта по ключам —
+                # без значений по умолчанию они отбрасывались бы целиком вместе с базой «до»
+                # (так уже случилось при вводе `host`).
+                e.setdefault("host", "")
+                e.setdefault("kind", "")
+                e.setdefault("round", None)
+                e.setdefault("findings", None)
             if isinstance(e, dict) and _telemetry_valid(e):
                 events.append(e)
             else:
@@ -3488,6 +3518,29 @@ def telemetry_summary(paths: "list[Path]") -> str:
         # Латентность — ТОЖЕ по машинам. Она считалась по всем событиям сразу, то есть строка,
         # которую и цитируют в споре «сколько гейты добавляют на инвокацию», смешивала мак с
         # Linux — ровно тот дефект, ради которого вводился `host`.
+        # Раунды ревью — отдельной таблицей и СТРАТИФИЦИРОВАННО по kind: у дизайн-ревью
+        # потолок один раунд, у кодового три, и общая «доля раундов 3+» отражала бы состав
+        # работы, а не сходимость цикла (находка дизайн-ревью 22.08.2026).
+        rounds = [e for e in hev if e["phase"] == "review_round"
+                  and e["round"] is not None]
+        if rounds:
+            out.append("")
+            for kind in sorted({e["kind"] for e in rounds}):
+                ks = [e for e in rounds if e["kind"] == kind]
+                # Распределение и ожидание — ТОЛЬКО по состоявшимся раундам. Неудавшаяся
+                # попытка бюджет не жжёт, поэтому повтор идёт под ТЕМ ЖЕ номером: считая их
+                # все, «доля раундов 3+» систематически занижается, а «ожидание» смешивает
+                # реальные минуты с мгновенными отказами (находка код-ревью 22.08.2026).
+                done = [e for e in ks if e["outcome"] == "ok"]
+                dist = collections.Counter(e["round"] for e in done)
+                empty = sum(1 for e in done if e["findings"] == 0)
+                spent = sum(e["dur_ms"] for e in done) / 1000 / 60
+                line = (f"раунды {kind or '?'}: " +
+                        (" ".join(f"№{r}×{n}" for r, n in sorted(dist.items())) or "—") +
+                        f"   пустых {empty}/{len(done)}   ожидание {spent:.1f} мин")
+                if len(ks) > len(done):
+                    line += f"   отклонено {len(ks) - len(done)}"
+                out.append(line)
         roots = [e["dur_ms"] for e in hev if not e["parent"]]
         if roots:
             out += [f"латентность КОРНЕВЫХ фаз, мс: p50 {_pct(roots, .5)}  "
@@ -5052,6 +5105,123 @@ def review_round_record(artifact: str) -> None:
     _atomic_write_json(p, state)
 
 
+def _companion_review(passthrough: "list[str]", span) -> int:
+    """Один раунд цикла ревью. Вынесен из `main`, чтобы span покрывал раунд ЦЕЛИКОМ —
+    включая проверку бюджета и разбор ответа, а не только сетевой вызов: оператор ждёт
+    раунд целиком, и мерить надо то, что он ждёт."""
+    # Дизайн-ревью для скилла: подкоманда ВЫПОЛНЯЕТ ревью, а не печатает argv.
+    # Печать argv (прошлая companion-path) обходила редакцию — в argv может лежать
+    # `--api-key=…` (тот же класс, что R5-F2), и вдобавок вынуждала скилл пересобирать
+    # команду шеллом. Здесь остаётся тестируемый путь: таймаут, редакция, fail-closed.
+    if not passthrough:
+        print("usage: companion-review [--base <ref>] [--scope <scope>] \"<фокус-текст>\"",
+              file=sys.stderr)
+        return 1
+    # Артефакт цикла: файл дизайна, если он назван, иначе диапазон кода.
+    artifact = _review_artifact_key(passthrough)
+    span.kind = "design" if is_design_artifact(artifact) else "code"
+    # `--design-file` — флаг ГЕЙТА, не companion'а: он объявляет вид артефакта и до
+    # внешнего движка не доезжает.
+    design_file = None
+    if "--design-file" in passthrough:
+        i = passthrough.index("--design-file")
+        design_file = passthrough[i + 1] if i + 1 < len(passthrough) else None
+        passthrough = passthrough[:i] + passthrough[i + 2:]
+    # ДО списания раунда: пустой вход — это отказ гейта, а не «ревью без замечаний».
+    empty = review_input_empty(passthrough, design_file)
+    if empty is not None:
+        span.outcome = "error"
+        print(f"[codex-gate] ✗ ревью НЕ запускается: {empty}.\n"
+              "  Это отказ ГЕЙТА, а не вердикт: ревьюер на пустом входе ответил бы "
+              "«замечаний нет» с кодом 0, и это невозможно отличить от состоявшегося "
+              "ревью. Раунд бюджета НЕ израсходован.", file=sys.stderr)
+        return 2
+    with findings_lock():            # check+increment одной транзакцией: две сессии иначе
+        rnd, budget, refusal = review_round_check(artifact)   # проходили обе
+        # У дизайна бюджет не ведётся и `review_round_check` отдаёт 0, а ноль ложен — фильтр
+        # сводки выбрасывал ВСЕ дизайн-события, то есть стратификация по `kind`, ради которой
+        # поле и заводилось, для дизайна не работала ни при каких данных. Нумеруем номинально:
+        # потолок дизайн-ревью — ОДИН раунд, поэтому `№1×5` читается как «правило нарушено».
+        span.round = rnd or 1
+        if refusal:
+            # Отказ бюджета тоже измеряется: «сколько раз бюджет реально кусался» иначе нигде
+            # не видно. Отличим по outcome и почти нулевой длительности.
+            span.outcome = "error"
+            print(refusal, file=sys.stderr)
+            return 2
+    if is_design_artifact(artifact):
+        print(f"[codex-gate] дизайн-ревью {artifact}: бюджет не применяется (ОДИН раунд по "
+              "подходу — правило скилла, а не механика: находки дизайна нигде не "
+              "сохраняются).", file=sys.stderr)
+    else:
+        print(f"[codex-gate] ревью {artifact}: раунд {rnd} из {budget} "
+              f"(ярус {review_tier()})", file=sys.stderr)
+    if rnd >= 3:
+        # Класс находок машинно не размечен (это потребовало бы менять контракт ревьюера —
+        # ровно то изменение, от которого отказались как от несоразмерного). Поэтому
+        # напоминание прозой: два раунда одного класса — сигнал переформулировать правило.
+        print("[codex-gate] ⚠️ третий раунд и дальше: если находки повторяют ОДИН класс — "
+              "переформулируй правило на верном уровне общности либо режь фичу, а не чини "
+              "экземпляры по одному.", file=sys.stderr)
+    r = _exec_companion(["adversarial-review", "--wait", *passthrough])
+    if r is None:
+        span.outcome = "error"
+        return 2                     # отказ уже объяснён в stderr, дальше — fail-closed
+    if r.returncode != 0:
+        # Причина отказа рендерится в stdout (конверт), а не в stderr (шум прогресса) —
+        # выбрасывать stdout здесь значило бы вернуть регрессию «причина outage невидима».
+        reason = outage_details(r.stdout) or redact_secrets(r.stderr.strip())[:400]
+        print(f"[codex-gate] companion exit={r.returncode}: {reason}", file=sys.stderr)
+        span.outcome = "error"
+        return 2
+    parsed = parse_review_output(r.stdout or "")
+    span.findings = len(_real_findings(parsed))   # тем же счётом, что и гвард слепоты
+    outage = companion_outage_reason(r.stdout)
+    if outage is None and not _reviews_only_the_design_file(passthrough, design_file):
+        # Только для КОДОВОГО ревью: дизайн-ревью по построению возвращает прозу, его
+        # находки нигде не сохраняются, и один оплаченный раунд терять нельзя.
+        blind = _review_says_nothing(r.stdout)
+        if blind is not None:
+            # Тело печатаем: иначе оператор не отличит слепого ревьюера от законного
+            # ревью, чьи находки не распарсились, — и не сможет ничего сделать.
+            print(f"[codex-gate] ревью НЕ выполнено: {blind}\n"
+                  f"  ответ ревьюера (усечённо): "
+                  f"{redact_secrets((r.stdout or '').strip())[:400]}", file=sys.stderr)
+            span.outcome = "error"       # раунд отвергнут — в данных это не «ok»
+            return 2
+    if outage is not None:
+        # Код 0 ≠ ревью состоялось: при исчерпанной квоте companion выходит нулём и отдаёт
+        # деградировавший конверт. Без этой ветки он читался бы как «замечаний нет».
+        print(f"[codex-gate] ревью НЕ выполнено: {outage}", file=sys.stderr)
+        span.outcome = "error"
+        return 2
+    # Тело ревью печатается дословно: это вход для читателя-агента, а не диагностика,
+    # и порча текста редакцией исказила бы находки (источник #10 реестра ниже).
+    # Раунд засчитывается ТОЛЬКО здесь: аутэйдж (таймаут, квота, ненулевой код,
+    # деградировавший конверт) не должен жечь бюджет — иначе три сбоя подряд на ярусе
+    # decision отказывают в ПЕРВОМ же состоявшемся ревью (код-ревью 11.08.2026).
+    # Тот же принцип уже действует для счётчика раундов сходимости при partial-прогоне.
+    # Непустой текст с кодом 0 («You have hit your usage limit», traceback) — не ревью.
+    # Без этой проверки первая же деградация на ярусе convenience съедала весь бюджет и
+    # оператору предлагали принять несуществующие остатки (код-ревью 11.08.2026).
+    # Ответ НЕ отвергается: дизайн-ревью возвращает прозу без `Verdict:`, и она обязана
+    # проходить. Но и раунд за неё не засчитывается — иначе «You have hit your usage
+    # limit» с кодом 0 съедал бы бюджет и оператору предлагали принять несуществующие
+    # остатки (код-ревью 11.08.2026). Дёшево и без слома существующего контракта.
+    counts = not is_design_artifact(artifact) and parsed.valid
+    if not counts and not is_design_artifact(artifact):
+        span.outcome = "error"     # раунд НЕ засчитан — в данных это не успешный раунд
+        print("[codex-gate] ⚠️ ответ не по контракту ревью (нет валидного `Verdict:`) — "
+              "раунд НЕ засчитан, бюджет не израсходован.", file=sys.stderr)
+    if counts:
+        with findings_lock():
+            review_round_record(artifact)
+        audit(f"review-round artifact={artifact} round={rnd}/{budget} "
+              f"tier={review_tier()}")
+    print(r.stdout, end="")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[0] if argv else ""
     if cmd == "check-reviewed":
@@ -5581,101 +5751,14 @@ def main(argv: list[str]) -> int:
               "они продолжают блокировать деплой.")
         return 0
     if cmd == "companion-review":
-        # Дизайн-ревью для скилла: подкоманда ВЫПОЛНЯЕТ ревью, а не печатает argv.
-        # Печать argv (прошлая companion-path) обходила редакцию — в argv может лежать
-        # `--api-key=…` (тот же класс, что R5-F2), и вдобавок вынуждала скилл пересобирать
-        # команду шеллом. Здесь остаётся тестируемый путь: таймаут, редакция, fail-closed.
-        passthrough = argv[1:]
-        if not passthrough:
+        if len(argv) < 2:
+            # Валидация аргументов — ДО span'а: иначе не-раунд навсегда остаётся событием
+            # фазы `review_round` (докстринг `_timed` этого и требует).
             print("usage: companion-review [--base <ref>] [--scope <scope>] \"<фокус-текст>\"",
                   file=sys.stderr)
             return 1
-        # Артефакт цикла: файл дизайна, если он назван, иначе диапазон кода.
-        artifact = _review_artifact_key(passthrough)
-        # `--design-file` — флаг ГЕЙТА, не companion'а: он объявляет вид артефакта и до
-        # внешнего движка не доезжает.
-        design_file = None
-        if "--design-file" in passthrough:
-            i = passthrough.index("--design-file")
-            design_file = passthrough[i + 1] if i + 1 < len(passthrough) else None
-            passthrough = passthrough[:i] + passthrough[i + 2:]
-        # ДО списания раунда: пустой вход — это отказ гейта, а не «ревью без замечаний».
-        empty = review_input_empty(passthrough, design_file)
-        if empty is not None:
-            print(f"[codex-gate] ✗ ревью НЕ запускается: {empty}.\n"
-                  "  Это отказ ГЕЙТА, а не вердикт: ревьюер на пустом входе ответил бы "
-                  "«замечаний нет» с кодом 0, и это невозможно отличить от состоявшегося "
-                  "ревью. Раунд бюджета НЕ израсходован.", file=sys.stderr)
-            return 2
-        with findings_lock():            # check+increment одной транзакцией: две сессии иначе
-            rnd, budget, refusal = review_round_check(artifact)   # проходили обе
-            if refusal:
-                print(refusal, file=sys.stderr)
-                return 2
-        if is_design_artifact(artifact):
-            print(f"[codex-gate] дизайн-ревью {artifact}: бюджет не применяется (ОДИН раунд по "
-                  "подходу — правило скилла, а не механика: находки дизайна нигде не "
-                  "сохраняются).", file=sys.stderr)
-        else:
-            print(f"[codex-gate] ревью {artifact}: раунд {rnd} из {budget} "
-                  f"(ярус {review_tier()})", file=sys.stderr)
-        if rnd >= 3:
-            # Класс находок машинно не размечен (это потребовало бы менять контракт ревьюера —
-            # ровно то изменение, от которого отказались как от несоразмерного). Поэтому
-            # напоминание прозой: два раунда одного класса — сигнал переформулировать правило.
-            print("[codex-gate] ⚠️ третий раунд и дальше: если находки повторяют ОДИН класс — "
-                  "переформулируй правило на верном уровне общности либо режь фичу, а не чини "
-                  "экземпляры по одному.", file=sys.stderr)
-        r = _exec_companion(["adversarial-review", "--wait", *passthrough])
-        if r is None:
-            return 2                     # отказ уже объяснён в stderr, дальше — fail-closed
-        if r.returncode != 0:
-            # Причина отказа рендерится в stdout (конверт), а не в stderr (шум прогресса) —
-            # выбрасывать stdout здесь значило бы вернуть регрессию «причина outage невидима».
-            reason = outage_details(r.stdout) or redact_secrets(r.stderr.strip())[:400]
-            print(f"[codex-gate] companion exit={r.returncode}: {reason}", file=sys.stderr)
-            return 2
-        outage = companion_outage_reason(r.stdout)
-        if outage is None and not _reviews_only_the_design_file(passthrough, design_file):
-            # Только для КОДОВОГО ревью: дизайн-ревью по построению возвращает прозу, его
-            # находки нигде не сохраняются, и один оплаченный раунд терять нельзя.
-            blind = _review_says_nothing(r.stdout)
-            if blind is not None:
-                # Тело печатаем: иначе оператор не отличит слепого ревьюера от законного
-                # ревью, чьи находки не распарсились, — и не сможет ничего сделать.
-                print(f"[codex-gate] ревью НЕ выполнено: {blind}\n"
-                      f"  ответ ревьюера (усечённо): "
-                      f"{redact_secrets((r.stdout or '').strip())[:400]}", file=sys.stderr)
-                return 2
-        if outage is not None:
-            # Код 0 ≠ ревью состоялось: при исчерпанной квоте companion выходит нулём и отдаёт
-            # деградировавший конверт. Без этой ветки он читался бы как «замечаний нет».
-            print(f"[codex-gate] ревью НЕ выполнено: {outage}", file=sys.stderr)
-            return 2
-        # Тело ревью печатается дословно: это вход для читателя-агента, а не диагностика,
-        # и порча текста редакцией исказила бы находки (источник #10 реестра ниже).
-        # Раунд засчитывается ТОЛЬКО здесь: аутэйдж (таймаут, квота, ненулевой код,
-        # деградировавший конверт) не должен жечь бюджет — иначе три сбоя подряд на ярусе
-        # decision отказывают в ПЕРВОМ же состоявшемся ревью (код-ревью 11.08.2026).
-        # Тот же принцип уже действует для счётчика раундов сходимости при partial-прогоне.
-        # Непустой текст с кодом 0 («You have hit your usage limit», traceback) — не ревью.
-        # Без этой проверки первая же деградация на ярусе convenience съедала весь бюджет и
-        # оператору предлагали принять несуществующие остатки (код-ревью 11.08.2026).
-        # Ответ НЕ отвергается: дизайн-ревью возвращает прозу без `Verdict:`, и она обязана
-        # проходить. Но и раунд за неё не засчитывается — иначе «You have hit your usage
-        # limit» с кодом 0 съедал бы бюджет и оператору предлагали принять несуществующие
-        # остатки (код-ревью 11.08.2026). Дёшево и без слома существующего контракта.
-        counts = not is_design_artifact(artifact) and parse_review_output(r.stdout or "").valid
-        if not counts and not is_design_artifact(artifact):
-            print("[codex-gate] ⚠️ ответ не по контракту ревью (нет валидного `Verdict:`) — "
-                  "раунд НЕ засчитан, бюджет не израсходован.", file=sys.stderr)
-        if counts:
-            with findings_lock():
-                review_round_record(artifact)
-            audit(f"review-round artifact={artifact} round={rnd}/{budget} "
-                  f"tier={review_tier()}")
-        print(r.stdout, end="")
-        return 0
+        with _timed("review_round") as _round:
+            return _companion_review(argv[1:], _round)
     print(f"codex_review_gate: неизвестная команда {cmd!r}", file=sys.stderr)
     return 1
 
