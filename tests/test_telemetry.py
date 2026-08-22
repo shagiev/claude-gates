@@ -350,3 +350,146 @@ def test_pre_0_9_4_events_are_not_discarded(tele_repo):
     shard.write_text(json.dumps(old_event) + "\n")
     out = g.telemetry_summary([shard])
     assert "событий: 1" in out and "12275" in out
+
+
+# --- раунды ревью (0.9.5): узкое место переехало сюда ---
+
+def _fake_review(monkeypatch, repo, stdout, rc=0):
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    monkeypatch.setattr(g, "_exec_companion",
+                        lambda *a, **k: subprocess.CompletedProcess(a, rc, stdout, ""))
+
+
+def test_review_round_is_measured_with_kind_and_findings(tele_repo, monkeypatch):
+    """Путь `companion-review` не измерялся ВООБЩЕ: все события `reviewer_call` приходили из
+    деплой-панели, а десятки раундов дизайн- и код-ревью были невидимы — тот же провал, что
+    был у лесенки до 0.9.3."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    real = ("Verdict: needs-attention\n\nFindings:\n"
+            "- [high] Раз (a.py:1)\n  Т.\n- [medium] Два (a.py:2)\n  Т.\n")
+    _fake_review(monkeypatch, tele_repo, real)
+    g.main(["companion-review", "--scope", "working-tree", "фокус"])
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["kind"] == "code" and e["round"] == 1 and e["findings"] == 2
+    assert e["outcome"] == "ok"
+
+
+def test_design_round_is_tagged_design(tele_repo, monkeypatch):
+    """`kind` обязателен: у дизайн-ревью потолок ОДИН раунд, у кодового три, и без разделения
+    «доля раундов 3+» отражала бы состав работы, а не сходимость цикла."""
+    d = tele_repo / "дизайн.md"
+    d.write_text("# д\nтекст\n")
+    _fake_review(monkeypatch, tele_repo, "Verdict: needs-attention\n\n## Замечание\nX.\n")
+    g.main(["companion-review", "--design-file", str(d), "--scope", "working-tree", "ф"])
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["kind"] == "design"
+
+
+def test_budget_refusal_is_measured_as_error(tele_repo, monkeypatch):
+    """«Сколько раз бюджет реально кусался» иначе нигде не видно."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    monkeypatch.setattr(g, "REPO_ROOT", tele_repo)
+    monkeypatch.setattr(g, "review_round_check", lambda a: (4, 3, "[codex-gate] бюджет исчерпан"))
+    assert g.main(["companion-review", "--scope", "working-tree", "ф"]) == 2
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["outcome"] == "error" and e["round"] == 4
+
+
+def test_summary_stratifies_rounds_by_kind(tele_repo, monkeypatch):
+    """Фикстура строится ПРОГОНОМ, а не литералами: прошлая версия собирала дизайн-строку
+    руками с `round=1` — значением, которое код произвести не мог (`review_round_check` для
+    дизайна отдаёт 0, а ноль ложен, и сводка выбрасывала ВСЕ дизайн-события). Тест был
+    зелёным на неработающей фиче — ровно «мок скрывает сломанное»."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    d = tele_repo / "дизайн.md"
+    d.write_text("# д\nтекст\n")
+    real = "Verdict: needs-attention\n\nFindings:\n- [high] Раз (a.py:1)\n  Т.\n"
+    _fake_review(monkeypatch, tele_repo, real)
+    g.main(["companion-review", "--scope", "working-tree", "ф"])
+    _fake_review(monkeypatch, tele_repo, "Verdict: needs-attention\n\n## Замечание\nX.\n")
+    g.main(["companion-review", "--design-file", str(d), "--scope", "working-tree", "ф"])
+    out = g.telemetry_summary([g._telemetry_shard()])
+    assert "раунды code:" in out and "раунды design:" in out
+
+
+def test_checklist_does_not_inflate_findings(tele_repo, monkeypatch):
+    """`Verdict: approve` с прогонным чеклистом уезжал как `findings=3` и выпадал из счётчика
+    пустых раундов — метрики, ради которой поле и заводилось."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    _fake_review(monkeypatch, tele_repo,
+                 "Verdict: approve\n\nЧеклист:\n- [x] дифф прочитан\n- [ ] бенчмарк\n\n"
+                 "No material findings.\n")
+    g.main(["companion-review", "--scope", "working-tree", "ф"])
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["findings"] == 0, "чеклист-маркеры посчитаны находками"
+
+
+def test_rejected_rounds_do_not_inflate_the_distribution(tele_repo, monkeypatch):
+    """Отклонённая попытка бюджет не жжёт, поэтому повтор идёт под ТЕМ ЖЕ номером: считая их
+    все, «доля раундов 3+» занижается, а «ожидание» смешивает минуты с мгновенными отказами."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    blind = "Verdict: needs-attention\n\nНе смог.\n"
+    _fake_review(monkeypatch, tele_repo, blind)
+    g.main(["companion-review", "--scope", "working-tree", "ф"])
+    g.main(["companion-review", "--scope", "working-tree", "ф"])
+    _fake_review(monkeypatch, tele_repo,
+                 "Verdict: needs-attention\n\nFindings:\n- [high] Раз (a.py:1)\n  Т.\n")
+    g.main(["companion-review", "--scope", "working-tree", "ф"])
+    out = g.telemetry_summary([g._telemetry_shard()])
+    assert "пустых 0/1" in out and "отклонено 2" in out
+
+
+def test_pre_0_9_5_events_still_read(tele_repo):
+    """Схема закрыта по ключам: без значений по умолчанию события 0.9.4 отбрасывались бы
+    целиком вместе с базой «до» — так уже случилось при вводе `host`."""
+    shard = g._telemetry_shard()
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    old = {"ts": "2026-08-20T00:00:00+00:00", "host": "b" * 16, "session": "c" * 16,
+           "trace": "d" * 32, "span": "e" * 32, "parent": None, "phase": "compute_tree",
+           "dur_ms": 275, "self_ms": 275, "scale": 621, "outcome": "ok", "pid": 1}
+    shard.write_text(json.dumps(old) + "\n")
+    out = g.telemetry_summary([shard])
+    assert "событий: 1" in out and "275" in out
+
+
+def test_rejected_round_is_not_recorded_as_ok(tele_repo, monkeypatch):
+    """Найдено на ЖИВЫХ данных сразу после выката: отвергнутый раунд писал `findings=None` и
+    `outcome=ok`, то есть телеметрия говорила «всё хорошо» там, где гейт возвращал 2. Счёт
+    находок берётся ДО решений, а каждый путь отказа помечает исход."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    blind = "Verdict: needs-attention\n\nНе смог прочитать дерево.\n"
+    _fake_review(monkeypatch, tele_repo, blind)
+    assert g.main(["companion-review", "--scope", "working-tree", "ф"]) == 2
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["outcome"] == "error", "отвергнутый раунд помечен как успешный"
+    assert e["findings"] == 0, "у отвергнутого раунда потерян счёт находок"
+
+
+def test_engine_failure_round_is_marked_error(tele_repo, monkeypatch):
+    """Ненулевой код движка — тоже не «ok»: иначе сводка покажет успешные раунды там, где
+    ревью не состоялось ни разу."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    _fake_review(monkeypatch, tele_repo, "", rc=1)
+    assert g.main(["companion-review", "--scope", "working-tree", "ф"]) == 2
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["outcome"] == "error"
+
+
+@pytest.mark.parametrize("stdout,rc,want_rc,want_outcome", [
+    ("Verdict: needs-attention\n\nFindings:\n- [high] X (a.py:1)\n  T.\n", 0, 0, "ok"),
+    ("Verdict: needs-attention\n\nНе смог прочитать.\n", 0, 2, "error"),
+    ("просто проза без вердикта\n", 0, 0, "error"),
+    ("", 1, 2, "error"),
+])
+def test_blocking_is_never_recorded_as_a_successful_round(
+        tele_repo, monkeypatch, stdout, rc, want_rc, want_outcome):
+    """Инвариант: код 2 НИКОГДА не записывается как состоявшийся раунд, иначе сводка покажет
+    успешные раунды там, где ревью не состоялось. Обратное намеренно неверно: «ответ не по
+    контракту» возвращает 0 (гейт не блокирует, отдаёт текст агенту), но раунд НЕ засчитан —
+    в данных это не успех."""
+    (tele_repo / "b.py").write_text("y = 2\n")
+    _fake_review(monkeypatch, tele_repo, stdout, rc=rc)
+    assert g.main(["companion-review", "--scope", "working-tree", "ф"]) == want_rc
+    e = [x for x in _events(g._telemetry_shard()) if x["phase"] == "review_round"][-1]
+    assert e["outcome"] == want_outcome
+    assert not (want_rc == 2 and e["outcome"] == "ok")
