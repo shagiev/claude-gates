@@ -3,6 +3,7 @@
 sys.path: скрипты живут в plugins/gates/scripts (не в пакете `scripts` целевого репо,
 как в проекте-источнике) — тесты импортируют их напрямую.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,55 @@ import codex_review_gate as g  # noqa: E402
 # попадала в ревьюируемый дифф и создавала неоднозначность, которую строгий
 # парсер обязан отвергать (находка F12).
 _VT = "Verd" + "ict:"
+
+
+#: CLI, мутирующие установку плагина на РЕАЛЬНОЙ машине. Тест уже снёс живой плагин один раз
+#: (`claude plugin uninstall`, 23.08.2026): спек отката без явной цели по умолчанию бил в
+#: текущий `~`. Структурно это закрыто явным адресом в спеке; здесь — вторая линия, потому что
+#: одна проверка в тестируемом коде не защищает от следующего такого умолчания.
+_FORBIDDEN_CLI = {"claude", "codex"}
+
+
+def _mentions_forbidden_cli(argv) -> "str | None":
+    """Имя ищется во ВСЕХ аргументах, включая строку команды, которую увозит ssh.
+
+    Первая версия смотрела только `argv[0]` у `subprocess.run` — и пропускала `Popen`,
+    `check_call`, `shell=True` и, главное, `["ssh", host, "claude plugin update …"]`, то есть
+    ровно ту форму, которой деплой мутирует УДАЛЁННЫЕ хосты (проверено: `Popen` и `check_call`
+    доходили до настоящего бинаря)."""
+    args = [argv] if isinstance(argv, (str, bytes, Path)) else list(argv or [])
+    for a in args:
+        if isinstance(a, bytes):
+            a = a.decode("utf-8", "replace")
+        if not isinstance(a, (str, Path)):
+            continue
+        for token in str(a).replace(";", " ").replace("&", " ").split():
+            if Path(token).name in _FORBIDDEN_CLI:
+                return Path(token).name
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _no_real_plugin_cli(monkeypatch, tmp_path):
+    import subprocess as _sp
+    real = _sp.Popen                       # всё (run/check_call/check_output) идёт через него
+
+    class Guarded(real):
+        def __init__(self, argv, *a, **k):
+            name = _mentions_forbidden_cli(argv)
+            if name:
+                # Опасен АДРЕС мутации, а не имя бинаря: подставной CLI в песочнице нужен
+                # сквозным тестам. HOME читается в момент вызова — снапшот окружения на импорте
+                # чужого модуля выворачивал прежнюю проверку в разрешение.
+                home = (k.get("env") or {}).get("HOME") or os.environ.get("HOME", "")
+                sandboxed = home and Path(home).resolve() != Path(os.path.expanduser("~")).resolve()
+                if not sandboxed:
+                    raise AssertionError(
+                        f"тест запускает {name} против настоящего ~ ({home}) — установка "
+                        "плагина на этой машине изменилась бы по-настоящему")
+            super().__init__(argv, *a, **k)
+
+    monkeypatch.setattr(_sp, "Popen", Guarded)
 
 
 @pytest.fixture(autouse=True)

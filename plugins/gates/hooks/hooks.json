@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" gate-edit",
+            "command": "python3 -B \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" gate-edit",
             "timeout": 10
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" gate-bash",
+            "command": "python3 -B \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" gate-bash",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" clear-marker",
+            "command": "python3 -B \"${CLAUDE_PLUGIN_ROOT}/scripts/codex_review_gate.py\" clear-marker",
             "timeout": 10
           }
         ]
