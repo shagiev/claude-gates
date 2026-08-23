@@ -7,7 +7,7 @@
 set -u
 SCRIPT="${1:?usage: gates-run <script.py> [args...]}"
 shift
-P=$(python3 - <<'EOF'
+P=$(python3 -B - <<'EOF'
 import json, os, sys
 meta = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
 try:
@@ -44,4 +44,7 @@ if [ ! -f "$P/$SCRIPT" ]; then
   echo "[gates] удали хук, который просит $SCRIPT, если он попал сюда раньше времени." >&2
   exit 1
 fi
-exec python3 "$P/$SCRIPT" "$@"
+# -B: байткод в каталог установки НЕ пишется. Подделанный `.pyc` грузится вместо
+# исходника (CPython сверяет лишь mtime+size из заголовка), то есть исполняется код,
+# которого нет в закреплённом дереве, при полностью сошедшемся дереве.
+exec python3 -B "$P/$SCRIPT" "$@"
