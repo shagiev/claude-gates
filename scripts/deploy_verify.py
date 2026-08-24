@@ -102,17 +102,22 @@ def _installed_claude():
     return _st("absent", registry=reg, why="плагин не значится установленным")
 
 
+def _codex_home() -> str:
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
 def _installed_codex():
     r = subprocess.run(["codex", "plugin", "list"], capture_output=True, text=True, env=E)
     if r.returncode != 0:
-        return _st("undetermined", why=f"codex plugin list rc={r.returncode}: "
-                                       f"{(r.stderr or '').strip()[:160]}")
+        return _st("undetermined", codex_home=_codex_home(),
+                   why=f"codex plugin list rc={r.returncode}: {(r.stderr or '').strip()[:160]}")
     if "lenar-gates" not in r.stdout:
         # Разбор здесь заведомо хрупкий, и непрочитанный вывод обязан отличаться от «плагина
         # нет»: иначе смена формата CLI даёт «первая установка», деплой мутирует канал без
         # доказанной цели отката — ровно тот пустой вывод, неотличимый от «уже свежее».
-        return _st("undetermined", why="вывод `codex plugin list` не опознан — маркетплейс "
-                                       "lenar-gates в нём не упомянут вовсе")
+        return _st("undetermined", codex_home=_codex_home(),
+                   why="вывод `codex plugin list` не опознан — маркетплейс lenar-gates в нём "
+                       "не упомянут вовсе")
     rows = []
     for line in r.stdout.splitlines():
         cols = re.split(r"\s{2,}", line.strip())
@@ -128,8 +133,9 @@ def _installed_codex():
                                        "какая установка активна, не определить")
     if not live:
         if rows:
-            return _st("absent", why=f"статус {rows[0][0]!r}")
-        return _st("undetermined", why="строка плагина в выводе не разобрана по колонкам")
+            return _st("absent", codex_home=_codex_home(), why=f"статус {rows[0][0]!r}")
+        return _st("undetermined", codex_home=_codex_home(),
+                   why="строка плагина в выводе не разобрана по колонкам")
     _status, col_version, path = live[0]
     # Версию берём из манифеста НА ДИСКЕ, а не из колонки: колоночный индекс — это парсинг
     # чужого вывода, а манифест лежит там же, куда всё равно смотрит дерево.
@@ -270,16 +276,23 @@ def check_tree(root: pathlib.Path, want: dict):
 
 
 # ── поведенческие smoke ────────────────────────────────────────────────────────────────────
-def _drop_gate_state(scripts_dir: pathlib.Path, repo: pathlib.Path):
+def _gate_state_of(scripts_dir: pathlib.Path, repo: pathlib.Path) -> str:
+    r = subprocess.run(
+        ["python3", "-B", "-c", f"import sys; sys.path.insert(0, {str(scripts_dir)!r});"
+                                "import codex_review_gate as g; print(g._gate_state_dir() or '')"],
+        cwd=repo, capture_output=True, text=True, env=E)
+    return r.stdout.strip()
+
+
+def _drop_gate_state(scripts_dir: pathlib.Path, repo: pathlib.Path, existed_before: bool):
     """Запуск лесенки создаёт каталог состояния гейта, ключ которого — путь временного репо.
     Спрашиваем адрес у САМОГО кода (правило ключа живёт там), иначе на каждом хосте флота от
     каждого деплоя оставался бы мусор, а прогон тестов писал бы в боевой корень."""
-    r = subprocess.run(
-        ["python3", "-c", f"import sys; sys.path.insert(0, {str(scripts_dir)!r});"
-                          "import codex_review_gate as g; print(g._gate_state_dir() or '')"],
-        cwd=repo, capture_output=True, text=True, env=E)
-    got = r.stdout.strip()
-    if got and os.sep in got and "claude-gates" in got:
+    # Условие «в пути есть claude-gates» защиты не давало: подстрока есть у КАЖДОГО репозитория,
+    # включая этот, а под его ключом лежат журналы гейта и сертификация флота. Удаляется только
+    # то, чего до прогона не существовало.
+    got = _gate_state_of(scripts_dir, repo)
+    if got and not existed_before:
         shutil.rmtree(got, ignore_errors=True)
 
 
@@ -353,6 +366,11 @@ def smoke_compute_tree(install_root):
     try:
         os.chmod(r / "exec.sh", 0o755)
         os.symlink("keep.py", r / "link.py")
+        # Симлинк на ДИРЕКТОРИЮ, а не только на файл: 0.9.0 падал именно на нём
+        # (BUG-0.9.0-symlink-tree-hash.md), а smoke проверяла лишь ссылку на файл.
+        (r / "pkg").mkdir()
+        (r / "pkg" / "mod.py").write_text("y = 1\n")
+        os.symlink("pkg", r / "link_dir")
         git(r, "add", "-A")
         git(r, "commit", "-qm", "i")
         (r / "gone.py").unlink()                       # удаление
@@ -389,6 +407,7 @@ def smoke_gate_blocks(install_root):
     install_root = pathlib.Path(install_root)
     base, r = _scratch_repo({".gitignore": ".claude/\nlogs/\n", "app/x.py": "x = 1\n",
                              ".codex-gate.yaml": "code_paths:\n  prefixes: [app/]\n"})
+    state_before = os.path.isdir(_gate_state_of(install_root / "scripts", r) or os.devnull)
     try:
         git(r, "add", "-A")
         git(r, "commit", "-qm", "i")
@@ -413,7 +432,7 @@ def smoke_gate_blocks(install_root):
                     f"{(allowed.stderr or allowed.stdout).strip()[:160]}")
         return None
     finally:
-        _drop_gate_state(install_root / "scripts", r)
+        _drop_gate_state(install_root / "scripts", r, state_before)
         shutil.rmtree(base, ignore_errors=True)
 
 
@@ -497,14 +516,27 @@ def cmd_restore(spec):
     # плагин. Пока адрес брался из окружения, никакая аккуратность в тестах этого не
     # исключала; теперь неполный спек не может ничего мутировать.
     target = snap.get("registry") if ch == "claude" else snap.get("toplevel")
+    if snap.get("state") == "absent":
+        # У ветки «снять канал» адрес не просто ОБЪЯВЛЕН, он УПРАВЛЯЕТ мутацией: раньше здесь
+        # проверялась непустота строки, значение которой игнорировалось, а команда била туда,
+        # куда смотрит `E["HOME"]`, зафиксированный на импорте. Формулировка «адрес обязан
+        # приехать в спеке» для этой ветки была декорацией — именно ей поверил бы следующий.
+        target = snap.get("registry") if ch == "claude" else snap.get("codex_home")
     if snap.get("state") in ("absent", "installed") and not target:
         return {"ok": False, "problems": [_problem(
             "no-target", ch, "в снапшоте нет адреса цели — мутация без явного адреса запрещена")]}
     if snap.get("state") == "absent":
         # Канал установлен ЭТИМ деплоем: вернуть состояние — значит снять его, иначе откат
         # отчитался бы успехом, оставив канал, которого до деплоя не было.
+        # Адрес превращается в окружение команды: для claude это дом над реестром
+        # (`<home>/.claude/plugins/installed_plugins.json`), для codex — его собственный корень.
+        env = dict(E)
+        if ch == "claude":
+            env["HOME"] = str(pathlib.Path(target).resolve().parents[2])
+        else:
+            env["CODEX_HOME"] = target
         r = subprocess.run([CHANNELS[ch]["cli"], *CHANNELS[ch]["remove"]],
-                           capture_output=True, text=True, env=E)
+                           capture_output=True, text=True, env=env)
         after = installed(ch)
         if after["state"] == "absent":
             return {"ok": True, "problems": []}
