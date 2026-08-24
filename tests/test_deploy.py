@@ -49,7 +49,8 @@ def harness(monkeypatch, tmp_path):
                                            "sha": "o" * 40, "path": "/p"}}})
     monkeypatch.setattr(dg, "check_rollback_target", lambda *a: None)
     monkeypatch.setattr(dg, "update", lambda h, c: None)
-    monkeypatch.setattr(dg, "verify", lambda *a: {"ok": True, "problems": []})
+    monkeypatch.setattr(dg, "verify", lambda *a: {"ok": True, "problems": [],
+                                                  "channels": {}})
     monkeypatch.setattr(dg, "rollback", lambda h, s: [])
     monkeypatch.setattr(dg, "_drop_mux", lambda hosts: None)
     return monkeypatch
@@ -884,7 +885,7 @@ def test_installed_channel_without_sha_blocks_rollback_confirmation(monkeypatch)
 def test_canary_failure_leaves_other_hosts_untouched(harness):
     touched = []
     harness.setattr(dg, "update", lambda h, c: touched.append(h) or None)
-    harness.setattr(dg, "verify", lambda *a: {"ok": False, "problems": [
+    harness.setattr(dg, "verify", lambda *a: {"ok": False, "channels": {}, "problems": [
         {"code": "smoke", "channel": "claude", "text": "сломано"}]})
     assert dg.main([]) == 2
     assert touched == ["canary"], f"тронуты лишние хосты: {touched}"
@@ -893,7 +894,7 @@ def test_canary_failure_leaves_other_hosts_untouched(harness):
 def test_second_host_failure_rolls_back_the_whole_cohort(harness):
     rolled = []
     harness.setattr(dg, "verify", lambda h, *a: {
-        "ok": h == "canary",
+        "ok": h == "canary", "channels": {},
         "problems": [] if h == "canary" else [{"code": "tree", "channel": "claude",
                                                "text": "сломано"}]})
     harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
@@ -1041,7 +1042,7 @@ def fake_host(tmp_path, monkeypatch):
         "version": {"claude": new_ver}, "sha": NEW_SHA, "tree": tree,
         "digest": dv.tree_digest(tree)})
     return {"home": home, "old": old, "new": new, "meta": meta, "state": tmp_path / "state",
-            "old_ver": old_ver, "new_ver": new_ver, "monkeypatch": monkeypatch}
+            "old_ver": old_ver, "new_ver": new_ver, "monkeypatch": monkeypatch, "env": env}
 
 
 def _registry(fh):
@@ -1069,6 +1070,25 @@ def test_cli_that_reports_success_without_updating_is_caught_and_rolled_back(fak
     assert dg.main([]) == 2
     assert _registry(fake_host)["version"] == fake_host["old_ver"], "хост не возвращён"
     assert not (fake_host["state"] / "stable").exists()
+
+
+def test_a_different_commit_with_the_same_shipped_tree_is_accepted(fake_host):
+    """Идентичность — ДЕРЕВО, а не коммит. Первая настоящая выкатка встала именно на этом: два
+    коммита подряд трогали только `tests/` и `scripts/`, поставка была побайтово одинакова, а
+    `gitCommitSha` отличался. CLI к тому же обновляет по ВЕРСИИ и при неизменной версии
+    законно не делает ничего."""
+    fake_host["env"]["FAKE_NEW_SHA"] = "f" * 40      # CLI запишет ДРУГОЙ коммит
+    assert dg.main([]) == 0, "деплой отверг совпадающее дерево из-за иного коммита"
+    assert _registry(fake_host)["version"] == fake_host["new_ver"]
+    assert _registry(fake_host)["gitCommitSha"] == "f" * 40
+    assert json.loads((fake_host["state"] / "stable").read_text())["sha"] == NEW_SHA
+
+
+def test_tree_difference_still_fails_even_at_the_right_commit(fake_host):
+    """Строгость не потеряна: расхождение ДЕРЕВА блокирует, даже когда коммит верный."""
+    (fake_host["new"] / "hooks" / "hooks.json").write_text("{}\n")
+    assert dg.main([]) == 2
+    assert _registry(fake_host)["version"] == fake_host["old_ver"]
 
 
 def test_tampered_file_on_the_host_fails_the_deploy(fake_host):
