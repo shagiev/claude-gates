@@ -24,6 +24,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "plugins" / "gates" / "scripts"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import codex_review_gate as g                                                    # noqa: E402
+import prepush_gate                                                              # noqa: E402
 from deploy_verify import CHANNELS, tree_digest                                  # noqa: E402
 
 AGENT = ROOT / "scripts" / "deploy_verify.py"
@@ -36,6 +37,7 @@ if _STATE_ROOT is None:                                # не git-репозит
     sys.exit(1)
 STATE = _STATE_ROOT / "deploy"
 LOCK = STATE / "lock"
+_FETCH_TIMEOUT_S = 120
 _SSH_MUX = ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/gates-cm-%C",
             "-o", "ControlPersist=60s", "-o", "ConnectTimeout=15"]
 #: Форма id — аллоулист: он идёт и в `ssh <host>`, и в ИМЯ ФАЙЛА снапшота, где `../` уже
@@ -169,9 +171,21 @@ def pinned_identity() -> dict:
     """Одна неизменяемая идентичность выкатки. Без свежего fetch `origin/main` — локальная
     копия, которая вместе с устаревшим маркетплейсом даёт согласованную СТАРУЮ пару
     версия+sha и зелёный результат."""
-    if (g._trusted_git("fetch", "-q", "origin", "main", cwd=ROOT) or
-            subprocess.CompletedProcess([], 1)).returncode != 0:
-        fail("git fetch не удался — идентичность выкатки не зафиксировать")
+    # `_trusted_git` для fetch НЕ годится: слой намеренно глушит сеть (`protocol.allow=never`),
+    # и вызов падал с `transport 'ssh' not allowed`. Сетевая операция в проекте уже есть —
+    # закалённый адаптер pre-push гейта: закреплённые бинарь git и ssh, аллоулист окружения,
+    # валидация URL против `ext::`, разрешение РОВНО схемы провалидированного URL, отклонение
+    # `remote.<name>.vcs`/`uploadpack`, нейтральный cwd. Третий способ ходить в сеть означал бы
+    # третью копию правил доверия, которая разъедется первой (R-TRUSTED-LAYER-DUPLICATION).
+    try:
+        fetched = prepush_gate._prepush_fetch(ROOT, "origin", "main", _FETCH_TIMEOUT_S)
+    except Exception as exc:                          # noqa: BLE001 — причина в диагностику
+        fail(f"fetch отклонён политикой доверенного слоя: {type(exc).__name__}: {exc}")
+    if fetched.returncode != 0:
+        # Причина ОБЯЗАНА быть в сообщении: прежний текст «git fetch не удался» не давал ничего,
+        # и настоящая причина (`transport 'ssh' not allowed`) искалась вручную.
+        fail(f"git fetch не удался (rc={fetched.returncode}) — идентичность выкатки не "
+             f"зафиксировать: {g.redact_secrets(g.strip_ansi((fetched.stderr or '').strip()))[:300]}")
     sha = _git_out("rev-parse", "origin/main")
     head = _git_out("rev-parse", "HEAD")
     if sha != head:

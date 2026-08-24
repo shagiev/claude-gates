@@ -362,8 +362,8 @@ def test_version_mismatch_across_manifests_blocks(monkeypatch, tmp_path):
     (tmp_path / ".claude-plugin").mkdir(exist_ok=True)
     (tmp_path / ".claude-plugin/marketplace.json").write_text(json.dumps(
         {"metadata": {"version": "1.0.0"}, "plugins": [{"version": "1.0.0"}]}))
-    monkeypatch.setattr(dg.g, "_trusted_git", lambda *a, **k: subprocess.CompletedProcess(a, 0,
-                                                                                         "x", ""))
+    monkeypatch.setattr(dg.prepush_gate, "_prepush_fetch",
+                        lambda *a: subprocess.CompletedProcess([], 0, "", ""))
     monkeypatch.setattr(dg, "_git_out", lambda *a: "abc")
     with pytest.raises(SystemExit):
         dg.pinned_identity()
@@ -460,10 +460,47 @@ def test_codex_restore_reports_a_failed_checkout(monkeypatch):
     assert not out["ok"] and out["problems"][0]["code"] == "restore-failed"
 
 
+def test_fetch_goes_through_the_hardened_network_adapter(monkeypatch):
+    """`_trusted_git` для fetch не годится: слой намеренно глушит сеть, и вызов падал с
+    `transport 'ssh' not allowed`. Сетевой путь обязан быть ОДИН — закалённый адаптер pre-push
+    гейта, иначе появляется третья копия правил доверия."""
+    called = {}
+    monkeypatch.setattr(dg.prepush_gate, "_prepush_fetch",
+                        lambda root, remote, branch, timeout: called.update(
+                            root=root, remote=remote, branch=branch) or
+                        subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(dg, "_git_out", lambda *a: "a" * 40)
+    monkeypatch.setattr(dg, "expected_tree", lambda sha: {"x": "100644 " + "0" * 40})
+    dg.pinned_identity()
+    assert called == {"root": dg.ROOT, "remote": "origin", "branch": "main"}
+
+
+def test_failed_fetch_names_the_reason(monkeypatch, capsys):
+    """Прежний текст «git fetch не удался» не давал ничего, и настоящая причина искалась руками."""
+    monkeypatch.setattr(dg.prepush_gate, "_prepush_fetch",
+                        lambda *a: subprocess.CompletedProcess([], 128, "",
+                                                               "fatal: transport 'ssh' not allowed"))
+    with pytest.raises(SystemExit):
+        dg.pinned_identity()
+    assert "transport 'ssh' not allowed" in capsys.readouterr().err
+
+
+def test_fetch_rejected_by_policy_is_reported(monkeypatch, capsys):
+    """Адаптер бросает `TrustedGitError` на политике (`ext::`, пропавший ssh) — это отказ
+    деплоя с названной причиной, а не молчаливый проход."""
+    def boom(*a):
+        raise dg.prepush_gate.TrustedGitError("remote использует ext::")
+
+    monkeypatch.setattr(dg.prepush_gate, "_prepush_fetch", boom)
+    with pytest.raises(SystemExit):
+        dg.pinned_identity()
+    assert "ext::" in capsys.readouterr().err
+
+
 def test_unmerged_head_is_refused(monkeypatch, tmp_path):
     """Хосты ставят плагин ИЗ GITHUB: незамерженное выкатить нельзя."""
-    monkeypatch.setattr(dg.g, "_trusted_git",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(dg.prepush_gate, "_prepush_fetch",
+                        lambda *a: subprocess.CompletedProcess([], 0, "", ""))
     monkeypatch.setattr(dg, "_git_out", lambda *a: "a" * 40 if a[-1] == "origin/main" else "b" * 40)
     # Дерево подменено намеренно: иначе тест краснел от «дерево не прочитано» и про сверку
     # HEAD с origin/main не доказывал ничего.
