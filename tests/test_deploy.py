@@ -902,6 +902,16 @@ def test_second_host_failure_rolls_back_the_whole_cohort(harness):
     assert set(rolled) == {"canary", "vps"}, f"откачена не вся когорта: {rolled}"
 
 
+def test_every_host_reports_its_own_success(harness, capsys):
+    """Каждый хост обязан отчитаться СВОЕЙ строкой. Строка, выехавшая из цикла, печаталась один
+    раз после него значениями последнего хоста — канарейка отрабатывала и засчитывалась молча."""
+    assert dg.main([]) == 0
+    ok = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[deploy] ✓ ")
+          and "флот на" not in ln]
+    assert len(ok) == 2, f"строк успеха {len(ok)}, а хостов 2: {ok}"
+    assert any("canary" in ln for ln in ok) and any("vps" in ln for ln in ok)
+
+
 def test_stable_is_written_only_when_every_host_is_green(harness, tmp_path):
     assert dg.main([]) == 0
     stable = json.loads((tmp_path / "state" / "stable").read_text())

@@ -482,10 +482,14 @@ def main(argv=None) -> int:
                 if not rep["ok"]:
                     raise DeployAbort("; ".join(f"{h['id']}/{p['channel']}/{p['code']}: "
                                                 f"{p['text']}" for p in rep["problems"]))
-                drift = [f"{ch}: {(rep['channels'].get(ch) or {}).get('sha', '?')[:12]}"
-                     for ch in h["channels"]
-                     if (rep["channels"].get(ch) or {}).get("sha") not in (None, sha)]
-            print(f"[deploy] ✓ {h['id']}: версия {ver['claude']}, дерево сошлось, гейт "
+                # Строка успеха печатается ДЛЯ КАЖДОГО хоста, внутри цикла. Выйдя из него на
+                # один уровень, она печаталась один раз после цикла значениями ПОСЛЕДНЕГО
+                # хоста: канарейка отрабатывала и засчитывалась молча — тот самый класс «шаг
+                # зачтён, но не отчитался», ради которого весь этот файл и написан.
+                drift = [f"{ch}: {(rep['channels'].get(ch) or {}).get('sha') or '?'}"[:20]
+                         for ch in h["channels"]
+                         if (rep["channels"].get(ch) or {}).get("sha") not in (None, sha)]
+                print(f"[deploy] ✓ {h['id']}: версия {ver['claude']}, дерево сошлось, гейт "
                       "блокирует и пропускает как должен"
                       + (f"   (коммит установки иной: {', '.join(drift)} — поставка та же)"
                          if drift else ""))
