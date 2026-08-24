@@ -301,8 +301,19 @@ def update(host: str, channels: "list[str]") -> "str | None":
 
 
 def verify(host: str, channels, versions, sha, tree) -> dict:
+    """Идентичность выкатки — ДЕРЕВО, а не коммит. Коммит остаётся диагностикой.
+
+    Первая же настоящая выкатка это и показала: два коммита подряд трогали только `tests/` и
+    `scripts/`, которые на хост не едут, поэтому поставка была побайтово одинакова, а
+    `gitCommitSha` у установки отличался — и деплой блокировал различие без поведенческого
+    смысла. Хуже: CLI обновляет по ВЕРСИИ, поэтому при неизменной версии он законно ничего не
+    делает, и разойтись с закреплённым sha — норма, а не отказ.
+
+    Строгость при этом не потеряна. Дерево сверяется целиком (20 файлов, режим и содержимое
+    каждого), и «CLI отчитался успехом, ничего не сделав» ловится ровно тогда, когда это
+    меняет исполняемый код."""
     rep = agent(host, "verify", _spec(channels, versions, sha, tree,
-                                      ["version", "sha", "tree", "smoke"]))
+                                      ["version", "tree", "smoke"]))
     if "error" in rep:
         return {"ok": False, "problems": [{"code": "agent", "channel": "-",
                                            "text": rep["error"]}]}
@@ -471,8 +482,13 @@ def main(argv=None) -> int:
                 if not rep["ok"]:
                     raise DeployAbort("; ".join(f"{h['id']}/{p['channel']}/{p['code']}: "
                                                 f"{p['text']}" for p in rep["problems"]))
-                print(f"[deploy] ✓ {h['id']}: версия {ver['claude']}, дерево сошлось, гейт "
-                      "блокирует и пропускает как должен")
+                drift = [f"{ch}: {(rep['channels'].get(ch) or {}).get('sha', '?')[:12]}"
+                     for ch in h["channels"]
+                     if (rep["channels"].get(ch) or {}).get("sha") not in (None, sha)]
+            print(f"[deploy] ✓ {h['id']}: версия {ver['claude']}, дерево сошлось, гейт "
+                      "блокирует и пропускает как должен"
+                      + (f"   (коммит установки иной: {', '.join(drift)} — поставка та же)"
+                         if drift else ""))
         except DeployAbort as abort:
             print(f"[deploy] ✗ {abort}", file=sys.stderr)
             if not cohort:
