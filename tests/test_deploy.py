@@ -126,6 +126,204 @@ def test_tree_covers_the_whole_plugin_not_just_top_level_scripts():
     assert any(k.startswith("skills/") for k in tree)
 
 
+def test_real_plugin_cli_is_unreachable_from_tests():
+    """ГРАНИЦА — аллоулист формы: настоящий CLI управления плагинами не резолвится через PATH.
+
+    Формулировка узкая намеренно. «Недостижим вообще» было бы переоценкой: боевой код умеет
+    резолвить абсолютный путь мимо PATH (`_resolve_claude_bin`), и от него тесты держит подмена
+    резолверов в conftest, а не этот каталог. Переоценивающий комментарий — сам по себе
+    механизм, которым следующий автор пропустит мок.
+
+    Денилист написаний команды проваливался четыре раза подряд, и последний раз — разрушительно:
+    регресс-тест на страж исполнял `claude plugin uninstall` по-настоящему и снёс живой плагин
+    (24.08.2026). Поэтому проверяется не «страж узнал строку», а «настоящего бинаря нет»."""
+    import shutil
+    for cli in ("claude", "codex"):
+        resolved = shutil.which(cli)
+        assert resolved and Path(resolved).parent.name == "stub_bin", \
+            f"{cli} резолвится в {resolved} — это НАСТОЯЩИЙ бинарь"
+        # Форма без пары `<cli> plugin`: растяжка её не видит, отвечает именно граница.
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True)
+        assert r.returncode == 97 and "тест-страж" in r.stderr
+
+
+def test_stub_bin_contains_nothing_but_the_two_inert_stubs():
+    """Каталог стоит первым в PATH ВСЕЙ сессии и вклеивается детям: что угодно, положенное сюда,
+    затенит системный бинарь для всего прогона. Например `git` — conftest подменяет
+    `_trusted_git` на форму, резолвимую через PATH, тогда как боевой `_trusted_git_bin`
+    специально абсолютный."""
+    d = ROOT / "tests" / "stub_bin"
+    assert {f.name for f in d.iterdir()} == {"claude", "codex", "plugin-cli-stub"}
+    for link in ("claude", "codex"):
+        assert os.readlink(d / link) == "plugin-cli-stub"
+    body = (d / "plugin-cli-stub").read_text()
+    assert "exec" not in body and body.rstrip().endswith("exit 97")
+
+
+def test_installed_returning_a_production_address_is_refused(monkeypatch):
+    """Маршрут мутации БЕЗ subprocess: `_installed_claude` читает реестр чистым чтением и честно
+    возвращает боевой адрес, а `cmd_restore` затем в него пишет — мимо PATH-границы, растяжки и
+    подмены транспорта разом."""
+    with pytest.raises(AssertionError, match="НАСТОЯЩУЮ установку"):
+        dv.installed("claude")
+
+
+def test_codex_production_address_is_refused():
+    """Слой 4 на канале codex ловится растяжкой раньше проверки адреса, поэтому сам отказ по
+    адресу для codex был не покрыт."""
+    with pytest.raises(AssertionError, match="НАСТОЯЩУЮ установку"):
+        dv.cmd_restore(json.dumps({"channel": "codex", "snapshot": {
+            "state": "installed", "sha": "a" * 40, "version": "1",
+            "toplevel": os.path.expanduser("~/.codex/.tmp/marketplaces/lenar-gates")}}))
+
+
+def test_bytecode_removal_cannot_target_a_real_install():
+    """`check_tree` безусловно `rmtree`'ит `__pycache__` под своим аргументом, а он приходит ни
+    из `installed()`, ни из спека — единственный разрушительный примитив мимо остальных слоёв."""
+    with pytest.raises(AssertionError, match="НАСТОЯЩУЮ установку"):
+        dv.check_tree(Path(os.path.expanduser(
+            "~/.claude/plugins/cache/lenar-gates/gates/0.10.0")), {})
+
+
+def test_restore_aimed_at_the_real_home_is_refused(monkeypatch):
+    """Тест обязан быть БЕЗВРЕДЕН при снятой защите, а не благодаря ей.
+
+    Прошлая версия передавала боевой адрес и полагалась на то, что страж не пустит дальше. При
+    мутационной проверке самого стража она перестала падать до вызова, настоящий `cmd_restore`
+    выполнился и записал `installPath=/x, version=666` в РЕАЛЬНЫЙ реестр — тест, доказывающий
+    защиту, стал инцидентом ровно в тот момент, когда защиту снимали. Поэтому запись
+    нейтрализована здесь же, независимо от проверяемого стража."""
+    wrote = []
+    monkeypatch.setattr(dv, "_atomic_write", lambda path, text: wrote.append(path))
+    real = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+    with pytest.raises(AssertionError, match="НАСТОЯЩУЮ установку"):
+        dv.cmd_restore(json.dumps({"channel": "claude", "snapshot": {
+            "state": "installed", "version": "666", "path": "/x", "registry": real}}))
+    assert wrote == [], "запись всё равно состоялась — тест сам является инцидентом"
+
+
+def test_deploy_state_is_isolated_from_the_real_one(tmp_path):
+    """`STATE`/`LOCK` связываются на импорте с боевым каталогом. Забытый патч в тесте, зовущем
+    `main()`, записал бы боевой `stable` — сфабрикованную сертификацию флота, которую потом
+    печатает `make deploy-status`."""
+    # Сверять с `g._gate_state_dir()` бессмысленно: conftest его тоже изолирует, и сравнение
+    # проходило бы при снятой изоляции. Утверждается прямое: STATE лежит во временном каталоге
+    # ЭТОГО теста.
+    assert dg.STATE.is_relative_to(tmp_path), f"STATE вне песочницы теста: {dg.STATE}"
+
+
+def test_drop_mux_does_not_reach_the_network():
+    """`_drop_mux` зовёт `ssh` напрямую, мимо `on_host`: подмена транспорта его не покрывает, а
+    инвентарь содержит реально достижимый дев-сервер."""
+    # Проверяется НАСТОЯЩИЙ `_drop_mux`, сохранённый фикстурой: вызов заглушки был бы
+    # тавтологией — тест утверждал бы то, что сам же и подменил.
+    spawned = []
+    real_popen = subprocess.Popen
+    try:
+        subprocess.Popen = lambda argv, *a, **k: spawned.append(list(argv)) or real_popen(
+            ["true"], *a, **k)
+        dg._REAL_DROP_MUX(["gates-no-such-host.invalid"])
+    finally:
+        subprocess.Popen = real_popen
+    assert spawned and spawned[0][0] == "ssh", "_drop_mux больше не ходит наружу — тест устарел"
+    # ...а подменённый в тестах — не порождает НИЧЕГО. Сравнивать возвращаемое значение
+    # бессмысленно: настоящий тоже отдаёт None, и проверка проходила бы при снятой подмене.
+    spawned.clear()
+    try:
+        subprocess.Popen = lambda argv, *a, **k: spawned.append(list(argv)) or real_popen(
+            ["true"], *a, **k)
+        dg._drop_mux(["gates-no-such-host.invalid"])
+    finally:
+        subprocess.Popen = real_popen
+    assert spawned == [], f"в тестах _drop_mux обязан быть инертен, а он породил {spawned}"
+
+
+def test_gate_state_left_by_someone_else_is_not_removed(tmp_path, monkeypatch):
+    """Прежний фильтр «в пути есть claude-gates» защиты не давал: подстрока есть у КАЖДОГО
+    репозитория, включая этот, а под его ключом лежат журналы гейта и сертификация флота.
+    Удаляется только то, чего до прогона не существовало."""
+    victim = tmp_path / "claude-gates" / "чужое"
+    victim.mkdir(parents=True)
+    (victim / "stable").write_text("сертификация")
+    monkeypatch.setattr(dv, "_gate_state_of", lambda scripts, repo: str(victim))
+    dv._drop_gate_state(tmp_path, tmp_path, existed_before=True)
+    assert victim.exists(), "снесён каталог, существовавший до прогона"
+    dv._drop_gate_state(tmp_path, tmp_path, existed_before=False)
+    assert not victim.exists(), "созданный прогоном каталог не убран"
+
+
+def test_the_boundary_covers_grandchildren():
+    """Форма, до которой разбор argv не достаёт в принципе: деплой шлёт агента как
+    `python3 - restore …`, и уже ВНУК зовёт `claude plugin uninstall`. Страж видит только
+    `python3 -` и пропускает; недостижимость бинаря — видит."""
+    r = subprocess.run(
+        ["python3", "-c", "import subprocess as s;"
+                          "print(s.run(['claude','plugin','list'],"
+                          "capture_output=True).returncode)"],
+        capture_output=True, text=True)
+    assert r.stdout.strip() == "97", f"внук достучался до настоящего CLI: {r.stdout!r}"
+
+
+def test_the_boundary_covers_shell_forms():
+    """Шелл, обёртка `env`, подстановка — всё то, что денилист пропускал.
+
+    Оболочка НЕ логин-овая осознанно: `bash -lc` перезапускает профиль, а `~/.profile` на
+    дев-сервере кладёт `~/.local/bin` впереди PATH — там настоящие бинари, и тест исполнил бы
+    `claude plugin uninstall` по-настоящему. Это третий случай живобоевого регресс-теста в
+    этой работе; форма `-lc` границей не покрывается и объявлена вне её (см. conftest)."""
+    # Подкоманды НЕразрушительные: граница именная (стаб отвечает одинаково на любой argv),
+    # поэтому `list` доказывает ровно то же, а при снятой границе не сносит ничего. Безвредность
+    # через «имя плагина всё равно не существует» опиралась на непроверенное поведение CLI.
+    for cmd in ("claude plugin list",
+                "env FOO=1 sh -c 'codex plugin list'",
+                "true | claude plugin list"):
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+        assert "тест-страж" in r.stderr, f"форма прошла мимо границы: {cmd}"
+
+
+def test_the_boundary_travels_with_a_replaced_path():
+    """Тест, заменивший PATH целиком (так делают четыре теста в наборе) или боевой код с
+    константным PATH — граница обязана доехать вместе с ребёнком, иначе её просто нет."""
+    r = subprocess.run(["claude", "--version"], capture_output=True, text=True,
+                       env={"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]})
+    assert r.returncode == 97 and "тест-страж" in r.stderr
+
+
+def test_remote_transport_refuses_without_an_explicit_mock():
+    """ssh-вектор: `on_host` увозит агента на хост, и `claude plugin uninstall` зовёт уже внук
+    ТАМ. Граница локальна, растяжка видит только `python3 -`, а в инвентаре стоит реально
+    достижимый дев-сервер."""
+    # Хост заведомо нерезолвимый (RFC 2606): при снятой фикстуре тест обязан покраснеть, а не
+    # уйти настоящим ssh на боевой дев-сервер, подняв там процесс и мастер-сокет.
+    with pytest.raises(AssertionError, match="без подмены"):
+        dg.on_host("gates-no-such-host.invalid", ["python3", "-", "--version"])
+
+
+def test_tripwire_names_the_direct_form_early():
+    """Растяжка поверх границы: прямая форма обязана дать внятную ошибку сразу, а не `rc=97`
+    из стаба где-то в глубине. Путь заведомо несуществующий — тест не должен БЫТЬ инцидентом,
+    он должен его обнаруживать."""
+    with pytest.raises(AssertionError, match="настоящего"):
+        subprocess.Popen(["/нет/такого/claude", "plugin", "uninstall", "gates@lenar-gates"])
+
+
+def test_tripwire_does_not_fire_on_free_text():
+    """Промпт ревьюера содержит слова «claude plugin»; разбор свободного текста уже ронял
+    четыре давних теста."""
+    from conftest import _mentions_forbidden_cli as m
+    assert m(["bash", "-c", "exit 99", "task", "--json", "Review: claude plugin install"]) is None
+    assert m(["codex", "exec", "как работает claude plugin update в этом репо"]) is None
+    assert m(["claude", "--debug", "plugin", "uninstall", "x"]) == "claude"  # не только смежные
+    assert m(["sh", "-c", 'grep -n "claude plugin" AGENTS.md']) is None
+    assert m(["python3", "/p/scripts/codex_review_gate.py", "check-reviewed"]) is None
+
+
+def test_tripwire_does_not_break_generator_argv():
+    """`Popen` принимает генератор; вычерпав его, страж отдавал бы дальше пустой argv."""
+    r = subprocess.Popen((x for x in ["echo", "привет"]), stdout=subprocess.PIPE)
+    assert r.communicate()[0].strip() == "привет".encode()
+
+
 def test_agent_source_comes_from_the_commit(monkeypatch):
     """`make gates-restore` увозил на хост НЕЗАКОММИЧЕННЫЙ рабочий код и исполнял его там:
     путь `--restore` не зовёт pre-deploy гейт, а агент читался с диска."""
@@ -473,6 +671,19 @@ def test_smoke_compute_tree_on_hostile_shapes(install):
     assert dv.smoke_compute_tree(install) is None
 
 
+def test_smoke_covers_symlinks_to_directories(install):
+    """0.9.0 падал именно на симлинке НА ДИРЕКТОРИЮ (BUG-0.9.0-symlink-tree-hash.md), а smoke
+    проверяла только ссылку на файл. Мутация: лесенка перестаёт учитывать такие ссылки — smoke
+    обязана это увидеть, иначе её покрытие мнимое."""
+    lg = install / "scripts" / "ladder_gate.py"
+    src = lg.read_text()
+    lg.write_text(src.replace(
+        "    if full.is_symlink():",
+        "    if full.is_symlink() and full.resolve().is_dir():\n        return None\n"
+        "    if full.is_symlink():", 1))
+    assert dv.smoke_compute_tree(install), "симлинк на директорию smoke не покрывает"
+
+
 def test_smoke_detects_restored_filter_hole(install):
     """Если кто-то вернёт применение clean-фильтра, деплой обязан покраснеть."""
     src = (install / "scripts" / "ladder_gate.py").read_text()
@@ -586,8 +797,26 @@ def test_restore_to_absence_removes_the_channel(monkeypatch):
                         subprocess.CompletedProcess(argv, 0, "", ""))
     monkeypatch.setattr(dv, "installed", lambda ch: {"state": "absent"})
     out = dv.cmd_restore(json.dumps({"channel": "codex", "snapshot": {
-        "state": "absent", "toplevel": "/песочница"}}))
+        "state": "absent", "codex_home": "/песочница"}}))
     assert out["ok"] and seen == [["codex", "plugin", "remove", "gates@lenar-gates"]]
+
+
+def test_absent_restore_address_actually_governs_the_command(monkeypatch):
+    """Адрес не просто ОБЪЯВЛЕН — он превращается в окружение команды. Раньше здесь
+    проверялась непустота строки, значение которой игнорировалось, а команда била туда, куда
+    смотрит `HOME`, зафиксированный на импорте модуля."""
+    seen = {}
+    monkeypatch.setattr(dv.subprocess, "run", lambda argv, **k: seen.update(k.get("env") or {})
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(dv, "installed", lambda ch: {"state": "absent"})
+    dv.cmd_restore(json.dumps({"channel": "codex", "snapshot": {
+        "state": "absent", "codex_home": "/песочница/codex"}}))
+    assert seen.get("CODEX_HOME") == "/песочница/codex"
+    seen.clear()
+    dv.cmd_restore(json.dumps({"channel": "claude", "snapshot": {
+        "state": "absent",
+        "registry": "/песочница/дом/.claude/plugins/installed_plugins.json"}}))
+    assert seen.get("HOME") == "/песочница/дом"
 
 
 def test_restore_without_an_explicit_target_refuses_to_mutate():
@@ -602,7 +831,7 @@ def test_restore_to_absence_reports_failure_if_the_channel_survives(monkeypatch)
                         subprocess.CompletedProcess(argv, 0, "", ""))
     monkeypatch.setattr(dv, "installed", lambda ch: {"state": "installed", "version": "1"})
     out = dv.cmd_restore(json.dumps({"channel": "codex", "snapshot": {
-        "state": "absent", "toplevel": "/песочница"}}))
+        "state": "absent", "codex_home": "/песочница"}}))
     assert not out["ok"] and out["problems"][0]["code"] == "remove-failed"
 
 
