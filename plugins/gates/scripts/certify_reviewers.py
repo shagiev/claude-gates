@@ -87,7 +87,7 @@ _RUNNERS = {
               "codex-companion", gate.codex_model),
     "claude": (lambda diff: gate.run_claude_review_text(diff, role="blocking",
                                                         allow_candidate=True)[:4],
-               "claude-cli", lambda: gate._CLAUDE_REQUESTED_MODEL),
+               "claude-cli", lambda: gate.claude_blocking_model(allow_candidate=True)),
 }
 
 
