@@ -28,18 +28,18 @@
       "adapter": "claude-cli",
       "requested_model": "opus",
       "actual_models": [
-        "claude-opus-5"
+        "claude-opus-5-5"
       ],
       "family": "anthropic",
       "roles": [
         "blocking"
       ],
-      "certification_id": "claude-opus-5-blocking-20260807",
+      "certification_id": "claude-opus-5-5-blocking-20260929",
       "status": "certified",
       "attestation": "verified",
       "report": {
-        "path": "reports/claude-opus-5-blocking-20260807.json",
-        "sha256": "5aa0bc6ae152674747f0a662bccf77fcf97e58ac17dc0d9e6131d1c4d900149e",
+        "path": "reports/claude-opus-5-5-blocking-20260929.json",
+        "sha256": "99cd5d101dc8567b143835160dc07ecae7ece16bdde197cd1abb15f4f7f93692",
         "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
         "repetitions": 2
       }

@@ -26,6 +26,15 @@ _REAL_TRUSTED_GIT = g._trusted_git
 _REAL_GIT_HEAD = g.git_head
 _CLEAN = f"{_VT} approve\n\nNo material findings.\n"
 _BLOCK = f"{_VT} needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
+# Сертифицированная Claude-модель берётся из ПОСТАВЛЯЕМОГО реестра, а не литералом: иначе
+# каждая перекалибровка ломает тесты, а негативные кейсы (ничья по выходу, нет счётчиков)
+# начинают проходить по чужой причине — «модель не сертифицирована» вместо проверяемой ветки.
+# Чистое чтение JSON, а не загрузчик: на импорте изоляция conftest ещё не действует, а загрузчик
+# при протухшем отчёте пишет `certification-demoted` в аудит — то есть в боевой лог.
+CLAUDE_MODEL, = [c["actual_models"][0]
+                 for c in json.loads(g._CERTIFICATION_REGISTRY.read_text())["certifications"]
+                 if c["provider"] == "claude" and c["requested_model"] == g._CLAUDE_REQUESTED_MODEL
+                 and c["roles"] == ["blocking"] and c["status"] == "certified"]
 
 
 class _HTTPResponse:
@@ -400,7 +409,7 @@ def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
             stdout=json.dumps({
                 "is_error": False,
                 "result": _BLOCK,
-                "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}},
+                "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}},
                 "usage": {"input_tokens": 1},
             }),
             stderr="",
@@ -411,7 +420,7 @@ def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
                             "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "ok"
     assert run.role == "blocking"
-    assert run.actual_models == ("claude-opus-5",)
+    assert run.actual_models == (CLAUDE_MODEL,)
     assert run.verdict is not None and run.verdict.blocking
 
 
@@ -679,7 +688,7 @@ def test_default_portable_enters_real_dispatch_and_both_adapters(
             seen.append("claude")
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
                 "is_error": False, "result": _CLEAN,
-                "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+                "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
         return _fake_git(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(g, "_exec_companion", fake_companion)
@@ -886,7 +895,7 @@ def test_f8_claude_does_not_run_inside_reviewed_repo(monkeypatch, tmp_path):
         seen["cwd"] = kwargs.get("cwd")
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN,
-            "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+            "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     g.run_claude_review_text("diff", role="blocking", allow_candidate=True)
@@ -982,7 +991,7 @@ def test_f8_executes_resolved_target_not_the_link(monkeypatch, tmp_path):
         seen["argv0"] = cmd[0]
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN,
-            "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+            "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
 
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: str(link))
     monkeypatch.setattr(g.subprocess, "run", fake_run)
@@ -1015,7 +1024,7 @@ def test_claude_reviewer_runs_without_user_hooks_plugins_or_mcp(monkeypatch, tmp
         seen["argv"] = list(cmd)
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN,
-            "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+            "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     g.run_claude_review_text("diff", role="blocking", allow_candidate=True)
@@ -1033,11 +1042,11 @@ def test_auxiliary_same_family_model_is_accepted(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stderr="", stdout=_claude_envelope({
             "claude-haiku-4-5-20251001": {"inputTokens": 5893, "outputTokens": 16},
-            "claude-opus-5": {"inputTokens": 2, "outputTokens": 224}})))
+            CLAUDE_MODEL: {"inputTokens": 2, "outputTokens": 224}})))
     text, actual, detail, _u, status = g.run_claude_review_text(
         "diff", role="blocking", allow_candidate=True)
     assert status == "ok" and text is not None, detail
-    assert "claude-opus-5" in actual
+    assert CLAUDE_MODEL in actual
 
 
 def test_foreign_family_model_in_usage_is_rejected(monkeypatch):
@@ -1046,7 +1055,7 @@ def test_foreign_family_model_in_usage_is_rejected(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stderr="", stdout=_claude_envelope({
             "gpt-5.6-sol": {"inputTokens": 10, "outputTokens": 300},
-            "claude-opus-5": {"inputTokens": 2, "outputTokens": 224}})))
+            CLAUDE_MODEL: {"inputTokens": 2, "outputTokens": 224}})))
     text, _a, detail, _u, status = g.run_claude_review_text(
         "diff", role="blocking", allow_candidate=True)
     assert text is None and status == "invalid" and "чужого семейства" in detail
@@ -1058,17 +1067,17 @@ def test_certified_model_must_write_the_verdict(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stderr="", stdout=_claude_envelope({
             "claude-haiku-4-5-20251001": {"inputTokens": 10, "outputTokens": 900},
-            "claude-opus-5": {"inputTokens": 2, "outputTokens": 3}})))
+            CLAUDE_MODEL: {"inputTokens": 2, "outputTokens": 3}})))
     text, _a, detail, _u, status = g.run_claude_review_text(
         "diff", role="blocking", allow_candidate=True)
     assert text is None and status == "invalid" and "не писала вердикт" in detail
 
 
 @pytest.mark.parametrize("usage,reason", [
-    ({"claude-opus-5": {"outputTokens": 100}, "claude-haiku-4-5-20251001": {"outputTokens": 100}},
+    ({CLAUDE_MODEL: {"outputTokens": 100}, "claude-haiku-4-5-20251001": {"outputTokens": 100}},
      "ничья: атрибуции нет"),
-    ({"claude-opus-5": {}, "claude-haiku-4-5-20251001": {}}, "счётчиков нет вовсе"),
-    ({"claude-opus-5": {"outputTokens": 0}, "claude-haiku-4-5-20251001": {"outputTokens": 0}},
+    ({CLAUDE_MODEL: {}, "claude-haiku-4-5-20251001": {}}, "счётчиков нет вовсе"),
+    ({CLAUDE_MODEL: {"outputTokens": 0}, "claude-haiku-4-5-20251001": {"outputTokens": 0}},
      "нулевые счётчики"),
 ])
 def test_model_attribution_requires_strict_unique_maximum(monkeypatch, usage, reason):
