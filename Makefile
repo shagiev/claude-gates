@@ -3,7 +3,7 @@
 # Pre-deploy гейт (чистое дерево + тесты) живёт В САМОМ скрипте, а не здесь: цель `deploy` —
 # удобная обёртка, а не точка контроля. Когда гейт стоял в Makefile, документированный прямой
 # вызов `python3 scripts/deploy_gates.py` мутировал флот вообще без проверок.
-.PHONY: test check deploy gates-restore deploy-status
+.PHONY: test check deploy gates-restore deploy-status recertify
 
 test:
 	python3 -m pytest tests/ -q
@@ -23,3 +23,9 @@ gates-restore:               ## вернуть хост на прошлую ве
 
 deploy-status:               ## что сейчас на флоте
 	@python3 scripts/deploy_gates.py --status
+
+# Без параметров НАМЕРЕННО: make раскрывает `$(…)` в значениях переменных до любой валидации.
+# Явная цель — только argv скрипта: python3 -B scripts/recertify.py --model claude-…
+# (`make recertify MODEL=…` скрипт отвергает, а не молча игнорирует.)
+recertify:                   ## перекалибровать Claude-ревьюера на модель, куда указывает алиас
+	python3 -B scripts/recertify.py

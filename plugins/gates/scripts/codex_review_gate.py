@@ -2407,7 +2407,6 @@ _CODEX_DIFF_LIMIT = 600_000
 _GEMINI_THINKING_BUDGET = 16_384
 _GEMINI_MAX_OUTPUT_TOKENS = 65_536
 _GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_CLAUDE_REQUESTED_MODEL = "opus"
 #: Арбитр — ТРЕТЬЯ модель, отличная от обоих членов панели (правило 1 §2.3). Семейство у неё
 #: общее с Claude, поэтому терминальность его вердиктов ограничена правилом 2 (см. arbitrate).
 _ARBITER_REQUESTED_MODEL = "fable"
@@ -2611,11 +2610,41 @@ def load_reviewer_certifications() -> "tuple[str | None, tuple[ReviewerCertifica
     return (str(raw["policy_id"]), tuple(parsed))
 
 
-def reviewer_certification(provider: str, requested_model: str, role: str,
+def claude_blocking_model(*, allow_candidate: bool = False) -> "str | None":
+    """Точный id Claude-ревьюера — из поставляемого реестра, а не алиас в коде.
+
+    Алиас (`opus`) двигает вендор: 29.09.2026 он уехал на новую модель, фактическая модель
+    разошлась с сертифицированной, и гейт встал у всех, хотя сертифицированная модель
+    продолжала работать. Ровно одна запись; ноль или несколько РАЗНЫХ моделей → None
+    (fail-closed): при недоделанной перекалибровке порядок JSON не выбирает ревьюера."""
+    models = _claude_blocking_models(allow_candidate)
+    return models[0] if len(models) == 1 else None
+
+
+def _claude_blocking_models(allow_candidate: bool) -> "list[str]":
+    """По ЗАПИСИ, а не по имени: две записи одной модели с разными отчётами — тоже
+    неоднозначность (иначе evidence выбирал бы порядок JSON)."""
+    _policy, certs = load_reviewer_certifications()
+    return [c.requested_model for c in certs
+            if c.provider == "claude" and "blocking" in c.roles
+            and (c.status == "certified" or allow_candidate)]
+
+
+def _claude_registry_ambiguity() -> str:
+    """Подсказка для оператора: имена моделей, между которыми реестр не выбрал."""
+    models = sorted(_claude_blocking_models(False))
+    return (f" В реестре несколько Claude blocking-записей ({', '.join(models)}) — "
+            "недоделанная перекалибровка; оставь одну (`make recertify`)."
+            if len(models) > 1 else "")
+
+
+def reviewer_certification(provider: str, requested_model: "str | None", role: str,
                            *, allow_candidate: bool = False) -> "ReviewerCertification | None":
     """Валидация связки отчёта НЕ отключается флагом: раньше `require_report=False` выдавал
     `certified`-запись без доказательства — прямой обход. Инструменту сертификации хватает
     `allow_candidate=True`, потому что протухшая связка понижает запись, а не прячет её."""
+    if requested_model is None:          # модель не определена (напр. реестр неоднозначен)
+        return None
     _policy, certs = load_reviewer_certifications()
     for cert in certs:
         if (cert.provider == provider and cert.requested_model == requested_model
@@ -2992,12 +3021,13 @@ def resolve_portable_review_plan(profile: str
     # независимый ревьюер — при любом и недоказуемом авторстве. Определения хоста нет нигде:
     # хост сессии не доказывает авторство диапазона коммитов (возражение ревью ред. 1).
     codex = reviewer_certification("codex", codex_model(), "blocking")
-    claude = reviewer_certification("claude", _CLAUDE_REQUESTED_MODEL, "blocking")
+    claude = reviewer_certification("claude", claude_blocking_model(), "blocking")
     if codex is None or claude is None:
         missing = ", ".join(n for n, c in (("codex", codex), ("claude", claude)) if c is None)
         # Запись могла быть ПОНИЖЕНА из-за разошедшейся связки отчёта — без этой подсказки
         # оператор видит «нет certified записи» и вслепую перезапускает сертификацию.
-        demoted = [n for n, m in (("codex", codex_model()), ("claude", _CLAUDE_REQUESTED_MODEL))
+        claude_any = claude_blocking_model(allow_candidate=True)
+        demoted = [n for n, m in (("codex", codex_model()), ("claude", claude_any))
                    if reviewer_certification(n, m, "blocking") is None
                    and reviewer_certification(n, m, "blocking", allow_candidate=True) is not None]
         hint = (f" Записи {', '.join(demoted)} присутствуют, но НЕ certified: либо это ещё "
@@ -3007,7 +3037,8 @@ def resolve_portable_review_plan(profile: str
         return (None, f"[codex-gate] ✗ обязательная blocking-пара неполна: нет certified "
                       f"записи для {missing}. Панель не понижается до одного ревьюера — это "
                       "было бы саморевью на коде того же семейства. Прогони certification "
-                      f"suite (`certify_reviewers.py --provider <name>`) и закоммить отчёт.{hint}")
+                      f"suite (`certify_reviewers.py --provider <name>`) и закоммить отчёт.{hint}"
+                      f"{_claude_registry_ambiguity()}")
     panel = [codex, claude]
     # §4: REVIEW_PROVIDER больше НЕ выбирает панель — только ДОБАВЛЯЕТ сертифицированного
     # ревьюера. Раньше агент, запускающий деплой, отключал обязательность пары той же
@@ -3903,6 +3934,13 @@ def run_codex_review_text(diff_text: str, *, role: str = "blocking",
     return (normalized, requested, "", {}, "ok")
 
 
+def claude_cmd(binary: str, model: str) -> "list[str]":
+    """Изолированный вызов Claude CLI. Один на адаптер ревьюера и пробу `make recertify`:
+    копия флагов изоляции разъехалась бы молча (почему каждый флаг — см. адаптер ниже)."""
+    return [binary, "-p", "--output-format", "json", "--tools", "",
+            "--safe-mode", "--strict-mcp-config", "--model", model, "--no-session-persistence"]
+
+
 def run_claude_review_text(diff_text: str, *, role: str = "blocking",
                            allow_candidate: bool = False,
                            requested_model: "str | None" = None,
@@ -3914,9 +3952,8 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     адаптера — стерильный cwd, `--safe-mode`, запрет managed-политики, аттестация фактической
     модели — обязан быть ОДИН на все роли. Копия адаптера означала бы, что сертифицируется
     не то, что работает."""
-    requested = requested_model or _CLAUDE_REQUESTED_MODEL
-    cert = reviewer_certification("claude", requested, role,
-                                  allow_candidate=allow_candidate)
+    requested = requested_model or claude_blocking_model(allow_candidate=allow_candidate)
+    cert = reviewer_certification("claude", requested, role, allow_candidate=allow_candidate)
     if cert is None:
         return (None, "", f"нет certified Claude model {requested!r} для роли {role}",
                 {}, "unavailable")
@@ -3955,9 +3992,7 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     # F15: с Read/Glob/Grep ревьюер, читающий НЕДОВЕРЕННЫЙ дифф, дотягивался до кредов в
     # HOME — инъекция в проверяемом коде превращалась в эксфильтрацию. Дифф целиком лежит в
     # промпте, инструменты ревьюеру не нужны.
-    cmd = [resolved_binary, "-p", "--output-format", "json", "--tools", "",
-           "--safe-mode", "--strict-mcp-config",
-           "--model", requested, "--no-session-persistence"]
+    cmd = claude_cmd(resolved_binary, requested)
     # F8: cwd НЕ должен быть ревьюируемым репозиторием — иначе его `.claude/settings.json`
     # и хуки управляют ревьюером (маршрут, исполнение кода), то есть проверяемый контент
     # управляет проверяющим. Дифф передаётся в промпте, репозиторий читать не требуется.
@@ -4021,7 +4056,11 @@ def run_claude_review_text(diff_text: str, *, role: str = "blocking",
     if not certified or foreign or not unique_max:
         return (None, actual, "Claude actual model не совпал с certification registry "
                               "(сертифицированная модель отсутствует, не писала вердикт "
-                              "или в ответе модель чужого семейства)", {}, "invalid")
+                              "или в ответе модель чужого семейства): в ответе "
+                              f"{actual or 'нет моделей'}, сертифицирована "
+                              f"{','.join(cert.actual_models)}. Если закреплённую модель сняли "
+                              "с поддержки — перекалибровка `make recertify` в репозитории "
+                              "плагина", {}, "invalid")
     # «Фактическая модель» = та, что НАПИСАЛА артефакт. Служебные модели того же вендора
     # идут в usage для аудита, но не в идентичность прогона — иначе отчёт сертификации
     # содержал бы склейку имён и не сходился бы с записью реестра.
@@ -4078,7 +4117,10 @@ def run_certified_reviewer(cert: ReviewerCertification, base: str, head: str) ->
     if cert.provider == "gemini":
         return run_gemini_review(base, head)
     if cert.provider == "claude":
-        return _run_text_reviewer(cert, role, base, head, run_claude_review_text)
+        # модель — из ЭТОЙ записи: по умолчанию адаптер берёт blocking-модель реестра, и
+        # supplemental-запись другой модели искалась бы под чужим именем (всегда unavailable)
+        return _run_text_reviewer(cert, role, base, head, functools.partial(
+            run_claude_review_text, requested_model=cert.requested_model))
     if cert.provider == "codex":
         return _run_text_reviewer(cert, role, base, head, run_codex_review_text)
     if cert.provider == "cursor":
@@ -4665,8 +4707,25 @@ def has_marker(session: str) -> bool:
     return _marker_state(session) == "valid"
 
 
-def clear_marker() -> None:
-    _marker_path(_env_session()).unlink(missing_ok=True)   # только СВОЙ (пер-сессионный)
+def clear_marker(session: str) -> None:
+    _marker_path(session).unlink(missing_ok=True)   # только СВОЙ (пер-сессионный)
+
+
+def clear_marker_cli(raw: str) -> int:
+    """SessionStart: id сессии — ТОЛЬКО из payload хука, не из окружения.
+
+    29.09.2026: Codex, запущенный из Claude-сессии (companion-review), наследовал
+    `CLAUDE_CODE_SESSION_ID`, и его SessionStart-хук того же плагина стирал маркер ЧУЖОЙ
+    сессии — G1 начинал блокировать правки посреди работы. Нет payload/id — ничего не чистим:
+    маркер пер-сессионный, у новой сессии своего маркера и так нет."""
+    try:
+        data = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        data = None
+    session = data.get("session_id") if isinstance(data, dict) else None
+    if isinstance(session, str) and session:
+        clear_marker(session)
+    return 0
 
 
 def bash_touches_code(command: str) -> bool:
@@ -5720,8 +5779,11 @@ def main(argv: list[str]) -> int:
     if cmd == "clear-marker":
         if not _hooks_active():   # SessionStart в любом проекте: молча no-op вне онбординга
             return 0
-        clear_marker()
-        return 0
+        try:
+            raw = sys.stdin.read()
+        except (OSError, ValueError):      # stdin закрыт/не читается: payload нет — чистить нечего
+            raw = ""
+        return clear_marker_cli(raw)
     if cmd == "residuals-accept":              # стоп-политика v3: закрыть цикл ревью явно
         if not _require_repo():
             return 2

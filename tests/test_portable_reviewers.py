@@ -26,6 +26,15 @@ _REAL_TRUSTED_GIT = g._trusted_git
 _REAL_GIT_HEAD = g.git_head
 _CLEAN = f"{_VT} approve\n\nNo material findings.\n"
 _BLOCK = f"{_VT} needs-attention\n\n- [high] реальная проблема (app/x.py:1)\n"
+# Сертифицированная Claude-модель берётся из ПОСТАВЛЯЕМОГО реестра, а не литералом: иначе
+# каждая перекалибровка ломает тесты, а негативные кейсы (ничья по выходу, нет счётчиков)
+# начинают проходить по чужой причине — «модель не сертифицирована» вместо проверяемой ветки.
+# Чистое чтение JSON, а не загрузчик: на импорте изоляция conftest ещё не действует, а загрузчик
+# при протухшем отчёте пишет `certification-demoted` в аудит — то есть в боевой лог.
+(CLAUDE_REQUESTED, CLAUDE_MODEL), = [
+    (c["requested_model"], c["actual_models"][0])
+    for c in json.loads(g._CERTIFICATION_REGISTRY.read_text())["certifications"]
+    if c["provider"] == "claude" and c["roles"] == ["blocking"] and c["status"] == "certified"]
 
 
 class _HTTPResponse:
@@ -69,7 +78,7 @@ def test_shipped_registry_is_strict_and_gemini_stays_candidate():
         "cursor", "cursor-grok-4.5-high", "blocking") is None
     assert _cert(
         "cursor", "cursor-grok-4.5-high", "blocking", candidate=True).family == "xai"
-    assert _cert("claude", "opus", "blocking").roles == ("blocking",)
+    assert _cert("claude", CLAUDE_REQUESTED, "blocking").roles == ("blocking",)
 
 
 @pytest.mark.parametrize("content", ("{broken", "{}", '{"schema":1,"policy_id":"x","certifications":[{}]}'))
@@ -130,12 +139,12 @@ def test_b5_gemini_profile_adds_to_pair_never_replaces_it(monkeypatch):
 
 def test_portable_profiles_and_panel_guards(monkeypatch):
     codex = _cert("codex", g.codex_model(), "blocking")
-    claude = _cert("claude", "opus", "blocking")
+    claude = _cert("claude", CLAUDE_REQUESTED, "blocking")
     gemini = replace(_cert("gemini", "gemini-2.5-pro", "blocking", candidate=True),
                      status="certified")
     certs = {
         ("codex", g.codex_model(), "blocking"): codex,
-        ("claude", "opus", "blocking"): claude,
+        ("claude", CLAUDE_REQUESTED, "blocking"): claude,
         ("gemini", "gemini-2.5-pro", "blocking"): gemini,
     }
     monkeypatch.setattr(
@@ -160,7 +169,7 @@ def test_portable_profiles_and_panel_guards(monkeypatch):
 
     # отсутствие ЛЮБОГО члена пары → блок, без понижения до одиночного ревьюера
     certs[("gemini", "gemini-2.5-pro", "blocking")] = gemini
-    for missing in (("codex", g.codex_model(), "blocking"), ("claude", "opus", "blocking")):
+    for missing in (("codex", g.codex_model(), "blocking"), ("claude", CLAUDE_REQUESTED, "blocking")):
         saved = certs.pop(missing)
         plan, err = g.resolve_portable_review_plan("portable")
         assert plan is None and "не понижается" in err
@@ -387,7 +396,7 @@ def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
         fake = _fake_git(cmd)                      # git резолвится абсолютным путём (F19)
         if fake is not None:
             return fake
-        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "opus"
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == CLAUDE_REQUESTED
         # F15: инструментов нет — дифф целиком в промпте, а HOME несёт креды
         assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
         assert "diff" not in cmd
@@ -400,18 +409,18 @@ def test_claude_pins_actual_model_and_strict_contract(monkeypatch):
             stdout=json.dumps({
                 "is_error": False,
                 "result": _BLOCK,
-                "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}},
+                "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}},
                 "usage": {"input_tokens": 1},
             }),
             stderr="",
         )
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    run = g._run_text_reviewer(_cert("claude", "opus", "blocking"), "blocking",
+    run = g._run_text_reviewer(_cert("claude", CLAUDE_REQUESTED, "blocking"), "blocking",
                             "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "ok"
     assert run.role == "blocking"
-    assert run.actual_models == ("claude-opus-5",)
+    assert run.actual_models == (CLAUDE_MODEL,)
     assert run.verdict is not None and run.verdict.blocking
 
 
@@ -429,7 +438,7 @@ def test_claude_failure_diagnostic_is_redacted(monkeypatch):
         return SimpleNamespace(returncode=1, stdout="", stderr=f"token={secret}")
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    run = g._run_text_reviewer(_cert("claude", "opus", "blocking"), "blocking",
+    run = g._run_text_reviewer(_cert("claude", CLAUDE_REQUESTED, "blocking"), "blocking",
                             "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "invalid"
     assert secret not in run.detail
@@ -454,7 +463,7 @@ def test_claude_actual_model_mismatch_blocks(monkeypatch):
         )
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
-    run = g._run_text_reviewer(_cert("claude", "opus", "blocking"), "blocking",
+    run = g._run_text_reviewer(_cert("claude", CLAUDE_REQUESTED, "blocking"), "blocking",
                             "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status == "invalid"
     assert run.actual_models == ("claude-fable-5",)
@@ -490,7 +499,7 @@ def test_old_blocking_only_cache_cannot_satisfy_portable_panel(
         tmp_path, monkeypatch):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
     blocking = _cert("cursor", "cursor-grok-4.5-high", "blocking", candidate=True)
-    supplemental = _cert("claude", "opus", "blocking")
+    supplemental = _cert("claude", CLAUDE_REQUESTED, "blocking")
     old_panel = [g._cert_cache_record(blocking, "blocking")]
     portable_panel = old_panel + [g._cert_cache_record(supplemental, "supplemental")]
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), old_panel)
@@ -499,7 +508,7 @@ def test_old_blocking_only_cache_cannot_satisfy_portable_panel(
 
 def test_policy_change_invalidates_portable_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
-    supplemental = _cert("claude", "opus", "blocking")
+    supplemental = _cert("claude", CLAUDE_REQUESTED, "blocking")
     panel = [g._cert_cache_record(supplemental, "supplemental")]
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), panel)
     monkeypatch.setattr(
@@ -513,7 +522,7 @@ def test_policy_change_invalidates_portable_cache(tmp_path, monkeypatch):
 def test_malformed_actual_models_invalidates_cache_without_exception(
         tmp_path, monkeypatch, bad_actual):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
-    cert = _cert("claude", "opus", "blocking")
+    cert = _cert("claude", CLAUDE_REQUESTED, "blocking")
     panel = [g._cert_cache_record(cert, "supplemental")]
     g.write_ledger("a" * 40, "d" * 64, "HEAD~1", g.parse_review_output(_CLEAN), panel)
     record = json.loads(g.ledger_path("a" * 40).read_text())
@@ -585,7 +594,7 @@ def portable_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "_empirical_config", lambda root, ref: ("absent", None, 600))
     monkeypatch.setattr(g, "_ladder_range_skips", lambda baseline: [])
     codex = _cert("codex", g.codex_model(), "blocking")
-    claude = _cert("claude", "opus", "blocking")
+    claude = _cert("claude", CLAUDE_REQUESTED, "blocking")
     monkeypatch.setattr(
         g, "resolve_portable_review_plan",
         lambda profile: ((codex, claude), ""),
@@ -679,7 +688,7 @@ def test_default_portable_enters_real_dispatch_and_both_adapters(
             seen.append("claude")
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
                 "is_error": False, "result": _CLEAN,
-                "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+                "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
         return _fake_git(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(g, "_exec_companion", fake_companion)
@@ -738,7 +747,7 @@ def test_claude_model_mismatch_redacts_secret_in_model_key(monkeypatch, tmp_path
     monkeypatch.setattr(g.subprocess, "run", lambda cmd, **kw: _fake_git(cmd) or SimpleNamespace(
         returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN, "modelUsage": {secret: {"inputTokens": 1}}})))
-    cert = _cert("claude", "opus", "blocking")
+    cert = _cert("claude", CLAUDE_REQUESTED, "blocking")
     run = g._run_text_reviewer(cert, "blocking", "HEAD~1", "HEAD", g.run_claude_review_text)
     assert run.status != "ok"
     assert secret not in "".join(run.actual_models)
@@ -886,7 +895,7 @@ def test_f8_claude_does_not_run_inside_reviewed_repo(monkeypatch, tmp_path):
         seen["cwd"] = kwargs.get("cwd")
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN,
-            "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+            "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     g.run_claude_review_text("diff", role="blocking", allow_candidate=True)
@@ -982,7 +991,7 @@ def test_f8_executes_resolved_target_not_the_link(monkeypatch, tmp_path):
         seen["argv0"] = cmd[0]
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN,
-            "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+            "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
 
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: str(link))
     monkeypatch.setattr(g.subprocess, "run", fake_run)
@@ -1015,7 +1024,7 @@ def test_claude_reviewer_runs_without_user_hooks_plugins_or_mcp(monkeypatch, tmp
         seen["argv"] = list(cmd)
         return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
             "is_error": False, "result": _CLEAN,
-            "modelUsage": {"claude-opus-5": {"inputTokens": 1, "outputTokens": 200}}}))
+            "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
 
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     g.run_claude_review_text("diff", role="blocking", allow_candidate=True)
@@ -1033,11 +1042,11 @@ def test_auxiliary_same_family_model_is_accepted(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stderr="", stdout=_claude_envelope({
             "claude-haiku-4-5-20251001": {"inputTokens": 5893, "outputTokens": 16},
-            "claude-opus-5": {"inputTokens": 2, "outputTokens": 224}})))
+            CLAUDE_MODEL: {"inputTokens": 2, "outputTokens": 224}})))
     text, actual, detail, _u, status = g.run_claude_review_text(
         "diff", role="blocking", allow_candidate=True)
     assert status == "ok" and text is not None, detail
-    assert "claude-opus-5" in actual
+    assert CLAUDE_MODEL in actual
 
 
 def test_foreign_family_model_in_usage_is_rejected(monkeypatch):
@@ -1046,7 +1055,7 @@ def test_foreign_family_model_in_usage_is_rejected(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stderr="", stdout=_claude_envelope({
             "gpt-5.6-sol": {"inputTokens": 10, "outputTokens": 300},
-            "claude-opus-5": {"inputTokens": 2, "outputTokens": 224}})))
+            CLAUDE_MODEL: {"inputTokens": 2, "outputTokens": 224}})))
     text, _a, detail, _u, status = g.run_claude_review_text(
         "diff", role="blocking", allow_candidate=True)
     assert text is None and status == "invalid" and "чужого семейства" in detail
@@ -1058,17 +1067,17 @@ def test_certified_model_must_write_the_verdict(monkeypatch):
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stderr="", stdout=_claude_envelope({
             "claude-haiku-4-5-20251001": {"inputTokens": 10, "outputTokens": 900},
-            "claude-opus-5": {"inputTokens": 2, "outputTokens": 3}})))
+            CLAUDE_MODEL: {"inputTokens": 2, "outputTokens": 3}})))
     text, _a, detail, _u, status = g.run_claude_review_text(
         "diff", role="blocking", allow_candidate=True)
     assert text is None and status == "invalid" and "не писала вердикт" in detail
 
 
 @pytest.mark.parametrize("usage,reason", [
-    ({"claude-opus-5": {"outputTokens": 100}, "claude-haiku-4-5-20251001": {"outputTokens": 100}},
+    ({CLAUDE_MODEL: {"outputTokens": 100}, "claude-haiku-4-5-20251001": {"outputTokens": 100}},
      "ничья: атрибуции нет"),
-    ({"claude-opus-5": {}, "claude-haiku-4-5-20251001": {}}, "счётчиков нет вовсе"),
-    ({"claude-opus-5": {"outputTokens": 0}, "claude-haiku-4-5-20251001": {"outputTokens": 0}},
+    ({CLAUDE_MODEL: {}, "claude-haiku-4-5-20251001": {}}, "счётчиков нет вовсе"),
+    ({CLAUDE_MODEL: {"outputTokens": 0}, "claude-haiku-4-5-20251001": {"outputTokens": 0}},
      "нулевые счётчики"),
 ])
 def test_model_attribution_requires_strict_unique_maximum(monkeypatch, usage, reason):
@@ -1171,3 +1180,87 @@ def test_repo_root_discovery_rejects_root_not_containing_cwd(monkeypatch, tmp_pa
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
         returncode=0, stdout=str(other) + "\n", stderr=""))
     assert g._detect_repo_root(start) is None, "корень, не содержащий cwd, обязан отвергаться"
+
+
+# --- 2026-09-29: запрашиваемая модель Claude — из реестра (docs/2026-09-29-reviewer-recertify-design.md)
+
+def _claude_entry(model, *, status="certified", role="blocking"):
+    return g.ReviewerCertification(
+        provider="claude", adapter="claude-cli", requested_model=model, actual_models=(model,),
+        family="anthropic", roles=(role,), certification_id=f"{model}-{role}-1", status=status,
+        attestation="verified")
+
+
+@pytest.mark.parametrize("entries, allow_candidate, expected", [
+    ([_claude_entry("claude-x-1")], False, "claude-x-1"),
+    ([_claude_entry("claude-x-1"), _claude_entry("fable-9", role="arbiter")], False, "claude-x-1"),
+    ([], False, None),                                                        # E2: записи нет
+    ([_claude_entry("claude-x-1", status="candidate")], False, None),        # E2: candidate в проде
+    ([_claude_entry("claude-x-1", status="candidate")], True, "claude-x-1"),  # раннер сертификации
+    # E1: недоделанная перекалибровка — порядок JSON не должен решать, кто ревьюит
+    ([_claude_entry("claude-x-1"), _claude_entry("claude-x-2")], False, None),
+    ([_claude_entry("claude-x-1"), _claude_entry("claude-x-2", status="candidate")], True, None),
+    # две записи ОДНОЙ модели (разные отчёты) — тоже неоднозначно
+    ([_claude_entry("claude-x-1"), _claude_entry("claude-x-1")], False, None),
+    ([_claude_entry("claude-x-1"), _claude_entry("claude-x-1", status="candidate")], True, None),
+    ([_claude_entry("claude-x-1"), _claude_entry("claude-x-1", status="candidate")], False,
+     "claude-x-1"),
+])
+def test_claude_blocking_model_is_the_unique_registry_entry(monkeypatch, entries, allow_candidate,
+                                                             expected):
+    monkeypatch.setattr(g, "load_reviewer_certifications", lambda: ("p", tuple(entries)))
+    assert g.claude_blocking_model(allow_candidate=allow_candidate) == expected
+
+
+def test_ambiguous_claude_registry_fails_the_pair_closed(monkeypatch):
+    monkeypatch.setattr(g, "load_reviewer_certifications", lambda: ("p", (
+        _claude_entry("claude-x-1"), _claude_entry("claude-x-2"))))
+    plan, err = g.resolve_portable_review_plan("portable")
+    assert plan is None and "не понижается" in err
+    assert "claude-x-1" in err and "claude-x-2" in err     # причина названа, а не «записи нет»
+
+
+def test_claude_adapter_requests_the_pinned_registry_model(monkeypatch):
+    """S1: вендор двигает алиас — гейт спрашивает ТОЧНЫЙ id из реестра, а не алиас."""
+    monkeypatch.setattr(g, "load_reviewer_certifications",
+                        lambda: ("p", (_claude_entry("claude-x-1", status="candidate"),)))
+    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
+    seen = {}
+
+    def fake_run(cmd, **_kw):
+        seen["model"] = cmd[cmd.index("--model") + 1]
+        return SimpleNamespace(returncode=0, stderr="", stdout=_claude_envelope(
+            {"claude-x-1": {"inputTokens": 1, "outputTokens": 200}}))
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    text, actual, _detail, _usage, status = g.run_claude_review_text("diff", allow_candidate=True)
+    assert seen["model"] == "claude-x-1"
+    assert (status, actual) == ("ok", "claude-x-1") and text is not None
+
+
+def test_model_mismatch_names_seen_and_certified_models(monkeypatch):
+    """S5: закреплённую модель подменили/сняли — сообщение называет обе и путь лечения."""
+    monkeypatch.setattr(g, "load_reviewer_certifications",
+                        lambda: ("p", (_claude_entry("claude-x-1", status="candidate"),)))
+    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stderr="", stdout=_claude_envelope(
+            {"claude-y-2": {"inputTokens": 1, "outputTokens": 200}})))
+    text, _actual, detail, _usage, status = g.run_claude_review_text("diff", allow_candidate=True)
+    assert text is None and status == "invalid"
+    assert "claude-y-2" in detail and "claude-x-1" in detail and "make recertify" in detail
+
+
+def test_supplemental_claude_entry_runs_its_own_model(monkeypatch):
+    """Адаптер по умолчанию берёт blocking-модель реестра; диспетчер обязан передать модель
+    ИМЕННО той записи, которую он запускает."""
+    seen = {}
+
+    def fake_claude(diff, *, role, requested_model=None, **_kw):
+        seen.update(role=role, model=requested_model)
+        return (None, "", "stub", {}, "unavailable")
+    monkeypatch.setattr(g, "run_claude_review_text", fake_claude)
+    monkeypatch.setattr(g, "_diff_text", lambda base, head: ("diff", ""))
+    cert = replace(_claude_entry("claude-s-1", status="candidate"), roles=("supplemental",))
+    g.run_certified_reviewer(cert, "HEAD~1", "HEAD")
+    assert seen == {"role": "supplemental", "model": "claude-s-1"}
