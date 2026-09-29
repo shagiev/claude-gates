@@ -184,6 +184,7 @@ def test_resolve_companion_cmd_raises_when_no_plugin(monkeypatch):
 
 
 # --- Task 4: ledger + check-reviewed CLI (R1-2 baseline fail-closed, R1-3 clean tree) ---
+import io
 import json
 
 
@@ -341,7 +342,7 @@ def test_marker_lifecycle(tmp_path, monkeypatch):
     assert g.has_marker("s1") is False
     g.write_marker("design", "codex approved", design_hash="h1")
     assert g.has_marker("s1") is True
-    g.clear_marker()
+    g.clear_marker("s1")
     assert g.has_marker("s1") is False
 
 
@@ -454,6 +455,7 @@ def test_main_clear_and_write_marker(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
     assert g.main(["write-marker", "design", "ok", "hash123"]) == 0
     assert g.has_marker("s1") is True
+    monkeypatch.setattr(g.sys, "stdin", io.StringIO(json.dumps({"session_id": "s1"})))
     assert g.main(["clear-marker"]) == 0
     assert g.has_marker("s1") is False
 
@@ -644,8 +646,7 @@ def test_markers_are_per_session(tmp_path, monkeypatch):   # Codex P2: сесс�
     monkeypatch.setenv("CLAUDE_SESSION_ID", "A")
     g.write_marker("design", "a", "h")
     assert g.has_marker("A") is True
-    monkeypatch.setenv("CLAUDE_SESSION_ID", "B")
-    g.clear_marker()                    # старт сессии B чистит СВОЙ, не A
+    g.clear_marker("B")                 # старт сессии B чистит СВОЙ, не A
     assert g.has_marker("A") is True    # маркер A не тронут
     assert g.has_marker("B") is False
 
@@ -1090,3 +1091,25 @@ def test_adjudicated_without_reason_fail_closed(led):    # спор F7-4
     (d / "current.json").write_text(
         '{"baseline":"b","rounds":1,"findings":{"F1":{"status":"refuted","severity":"high"}}}')
     assert g.load_findings_ledger("b") is None
+
+
+
+@pytest.mark.parametrize("payload, cleared", [
+    (json.dumps({"session_id": "claude-A", "source": "startup"}), True),
+    # 29.09.2026: Codex, запущенный из Claude-сессии, наследует CLAUDE_CODE_SESSION_ID; его
+    # SessionStart-хук (тот же плагин) стирал ЧУЖОЙ маркер, и G1 блокировал правки кода
+    (json.dumps({"session_id": "codex-B", "source": "startup"}), False),
+    ("", False),                        # нет payload — не угадывать сессию по окружению
+    ("не json", False),
+    (json.dumps({"source": "startup"}), False),
+    (json.dumps(["session_id", "claude-A"]), False),
+])
+def test_clear_marker_takes_session_from_hook_payload_not_env(tmp_path, monkeypatch,
+                                                             payload, cleared):
+    monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".design-approved")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-A")
+    g.write_marker("design", "a", "h")
+    assert g.has_marker("claude-A") is True
+    monkeypatch.setattr(g.sys, "stdin", io.StringIO(payload))
+    assert g.main(["clear-marker"]) == 0
+    assert g.has_marker("claude-A") is (not cleared)

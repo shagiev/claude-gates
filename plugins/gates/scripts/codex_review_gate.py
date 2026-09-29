@@ -4707,8 +4707,25 @@ def has_marker(session: str) -> bool:
     return _marker_state(session) == "valid"
 
 
-def clear_marker() -> None:
-    _marker_path(_env_session()).unlink(missing_ok=True)   # только СВОЙ (пер-сессионный)
+def clear_marker(session: str) -> None:
+    _marker_path(session).unlink(missing_ok=True)   # только СВОЙ (пер-сессионный)
+
+
+def clear_marker_cli(raw: str) -> int:
+    """SessionStart: id сессии — ТОЛЬКО из payload хука, не из окружения.
+
+    29.09.2026: Codex, запущенный из Claude-сессии (companion-review), наследовал
+    `CLAUDE_CODE_SESSION_ID`, и его SessionStart-хук того же плагина стирал маркер ЧУЖОЙ
+    сессии — G1 начинал блокировать правки посреди работы. Нет payload/id — ничего не чистим:
+    маркер пер-сессионный, у новой сессии своего маркера и так нет."""
+    try:
+        data = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        data = None
+    session = data.get("session_id") if isinstance(data, dict) else None
+    if isinstance(session, str) and session:
+        clear_marker(session)
+    return 0
 
 
 def bash_touches_code(command: str) -> bool:
@@ -5762,8 +5779,11 @@ def main(argv: list[str]) -> int:
     if cmd == "clear-marker":
         if not _hooks_active():   # SessionStart в любом проекте: молча no-op вне онбординга
             return 0
-        clear_marker()
-        return 0
+        try:
+            raw = sys.stdin.read()
+        except (OSError, ValueError):      # stdin закрыт/не читается: payload нет — чистить нечего
+            raw = ""
+        return clear_marker_cli(raw)
     if cmd == "residuals-accept":              # стоп-политика v3: закрыть цикл ревью явно
         if not _require_repo():
             return 2
