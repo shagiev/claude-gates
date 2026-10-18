@@ -236,3 +236,58 @@ def test_refusal_message_quotes_the_artifact(repo):
     import shlex as _shlex
     line = next(l for l in refusal.splitlines() if "residuals-accept" in l)
     assert evil in _shlex.split(line), f"артефакт не пережил разбор шеллом: {line}"
+
+
+def _fake_git(monkeypatch, refs):
+    """rev-parse по словарю ref → sha; неизвестный ref — ошибка, как у настоящего git."""
+    from types import SimpleNamespace
+
+    def fake(*args, **_kw):
+        ref = args[-1].removesuffix("^{commit}")
+        if args[:1] == ("rev-parse",) and "--verify" in args and ref in refs:
+            return SimpleNamespace(returncode=0, stdout=refs[ref] + "\n", stderr="")
+        return SimpleNamespace(returncode=128, stdout="", stderr="unknown revision")
+    monkeypatch.setattr(g, "_trusted_git", fake)
+
+
+def test_budget_key_binds_to_the_commit_not_the_ref_name(repo, monkeypatch):
+    """29.09.2026: ключ `range:HEAD:working-tree` копил раунды ВСЕХ правок за всё время —
+    исчерпанный бюджет одной ветки отказал в ревью другой. Новый коммит — новый цикл."""
+    _fake_git(monkeypatch, {"HEAD": "a" * 40})
+    first = g._review_artifact_key(["--scope", "working-tree", "фокус"])
+    assert first == "range:" + "a" * 40 + ":working-tree"
+    # раунды над той же незакоммиченной правкой — один цикл
+    assert g._review_artifact_key(["--scope", "working-tree", "другой фокус"]) == first
+    _fake_git(monkeypatch, {"HEAD": "b" * 40})
+    assert g._review_artifact_key(["--scope", "working-tree", "фокус"]) != first
+
+
+def test_named_base_is_resolved_too(repo, monkeypatch):
+    """`--base main` — тот же класс: имя ветки не меняется, пока под ней меняется всё."""
+    _fake_git(monkeypatch, {"main": "c" * 40})
+    assert g._review_artifact_key(["--base", "main", "--scope", "branch", "ф"]) == \
+        "range:" + "c" * 40 + ":branch"
+
+
+def test_unresolvable_base_keeps_the_literal_shared_counter(repo, monkeypatch):
+    """Git не ответил — прежний (общий) ключ: лишний блок, но не недосчёт раундов."""
+    _fake_git(monkeypatch, {})
+    assert g._review_artifact_key(["--scope", "working-tree", "ф"]) == "range:HEAD:working-tree"
+    monkeypatch.setattr(g, "_trusted_git", lambda *a, **k: None)     # доверенного git нет
+    assert g._review_artifact_key(["--base", "main", "--scope", "branch", "ф"]) == "range:main:branch"
+
+
+def test_real_commit_starts_a_new_budget_cycle(repo, monkeypatch):
+    """Тот же сценарий на настоящем git (без подмены `_trusted_git`): ключ = OID HEAD."""
+    import subprocess
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
+                              text=True, env={"PATH": "/usr/bin:/bin", "HOME": str(repo),
+                                              "GIT_CONFIG_GLOBAL": "/dev/null"}).stdout.strip()
+    git("init", "-q")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "a")
+    first = g._review_artifact_key(["--scope", "working-tree", "ф"])
+    assert first == f"range:{git('rev-parse', 'HEAD')}:working-tree"
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "b")
+    assert g._review_artifact_key(["--scope", "working-tree", "ф"]) != first

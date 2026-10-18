@@ -5099,7 +5099,16 @@ def _review_artifact_key(args: "list[str]") -> str:
     design = opts.get("design-file")
     if design:
         return f"design:{design}"
-    return f"range:{opts.get('base', 'HEAD')}:{opts.get('scope', 'branch')}"
+    return f"range:{_budget_base_id(opts.get('base', 'HEAD'))}:{opts.get('scope', 'branch')}"
+
+
+def _budget_base_id(base: str) -> str:
+    """База цикла — КОММИТ, а не имя ref'а. 29.09.2026: `range:HEAD:working-tree` копил
+    раунды всех правок за всё время, и исчерпанный бюджет одной ветки отказал в ревью другой
+    (`--base main` — тот же класс). Раунды над одной незакоммиченной правкой по-прежнему один
+    цикл: HEAD под ней не двигается. Git не ответил — прежнее имя: общий счётчик даёт лишний
+    блок, но не недосчёт раундов."""
+    return _resolve_commit(base) or base
 
 
 def _rounds_path() -> "Path | None":
