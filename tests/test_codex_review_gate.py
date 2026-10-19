@@ -453,7 +453,7 @@ def test_main_gate_edit_denies(tmp_path, monkeypatch):
 def test_main_clear_and_write_marker(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".design-approved")
     monkeypatch.setenv("CLAUDE_SESSION_ID", "s1")
-    assert g.main(["write-marker", "design", "ok", "hash123"]) == 0
+    assert g.main(["write-marker", "trivial", "ok"]) == 0
     assert g.has_marker("s1") is True
     monkeypatch.setattr(g.sys, "stdin", io.StringIO(json.dumps({"session_id": "s1"})))
     assert g.main(["clear-marker"]) == 0

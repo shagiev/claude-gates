@@ -157,10 +157,13 @@ def test_gate_edit_denies_on_drift(env, monkeypatch):
 # ═══ CLI write-marker --file ═══
 
 def test_cli_write_marker_file(env):
-    h = _write_design(env, "design.md", "v1")
+    # CLI file-режим требует секцию альтернатив и квитанцию дизайн-ревью (Р1/Р2, 18.10.2026)
+    v1 = "v1\n## Решения и альтернативы\n- A против B\n"
+    h = _write_design(env, "design.md", v1)
+    g._record_design_receipt("design.md", h)
     assert g.main(["write-marker", "design", "approved", h, "--file", "design.md"]) == 0
     assert g.has_marker("s1") is True
-    (env / "design.md").write_text("v2")
+    (env / "design.md").write_text(v1 + "v2")
     assert g.main(["write-marker", "design", "approved", h, "--file", "design.md"]) == 2  # mismatch
 
 
@@ -174,11 +177,11 @@ def test_cli_file_flag_without_value_fails_no_marker(env):
     assert g.has_marker("s1") is False
 
 
-def test_cli_inline_still_works_and_warns(env, capsys):
-    # без --file — inline легаси, но с громким warning
-    assert g.main(["write-marker", "design", "approved", "deadbeef"]) == 0
-    assert g.has_marker("s1") is True
-    assert "защищён от дрейфа" in capsys.readouterr().err
+def test_cli_inline_design_marker_is_refused(env, capsys):
+    # Р5 (18.10.2026): inline обходил разбор альтернатив и квитанцию — создание убрано
+    assert g.main(["write-marker", "design", "approved", "deadbeef"]) == 2
+    assert g.has_marker("s1") is False
+    assert "--file" in capsys.readouterr().err
 
 
 def test_concurrent_bindings_all_survive(env):
