@@ -365,13 +365,62 @@ def test_receipt_state_dir_failure_is_reported_not_raised(env, monkeypatch, caps
     assert "квитанц" in capsys.readouterr().err
 
 
-def test_input_guard_sees_the_snapshotted_file_not_a_cwd_relative_one(env, monkeypatch, tmp_path):
-    """Относительный путь разрешался от cwd, снимок — от корня: два разных файла."""
+def test_input_guard_is_not_consulted_when_the_snapshot_is_the_input(env, monkeypatch, tmp_path):
+    """Снимок — сам вход: проверка диапазона не нужна (и раньше рассогласовывалась с cwd)."""
     _put(env, "docs/d.md", GOOD)
-    seen = {}
-    monkeypatch.setattr(g, "review_input_empty",
-                        lambda passthrough, design_file: seen.setdefault("f", design_file) and None)
+    called = []
+    monkeypatch.setattr(g, "review_input_empty", lambda *a, **k: called.append(a))
     monkeypatch.chdir(tmp_path)                                   # cwd ≠ корень репозитория
     _fake_companion(monkeypatch, 'printf "Verdict: approve\\n\\nNo material findings.\\n"')
-    g.main(["companion-review", "--design-file", "docs/d.md", "фокус"])
-    assert seen["f"] == str(env / "docs/d.md")
+    assert g.main(["companion-review", "--design-file", "docs/d.md", "фокус"]) == 0
+    assert called == []
+
+
+def test_committed_design_on_clean_tree_is_reviewable(tmp_path, monkeypatch, capsys):
+    """Живая проверка 0.10.5 (19.10.2026): повторное ревью ЗАКОММИЧЕННОГО дизайна на чистом
+    дереве отказывало «ревьюеру нечего показать» — хотя снимок целиком уже во входе. Без ревью
+    нет квитанции, без квитанции нет маркера: маршрут для закоммиченного дизайна был мёртв.
+    Настоящий git и настоящая проверка входа (без заглушки)."""
+    import subprocess
+    root = tmp_path / "repo"
+    (root / "docs").mkdir(parents=True)
+    (root / "docs/d.md").write_text(GOOD)
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_GLOBAL": "/dev/null"}
+    for a in (["init", "-q"], ["add", "-A"],
+              ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "d"]):
+        subprocess.run(["git", "-C", str(root), *a], check=True, env=env, capture_output=True)
+    monkeypatch.setattr(g, "REPO_ROOT", root)
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
+    monkeypatch.chdir(root)
+    _fake_companion(monkeypatch, 'printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    assert g.main(["companion-review", "--design-file", "docs/d.md", "--scope", "working-tree",
+                   "фокус"]) == 0, capsys.readouterr().err
+    assert _receipts() == {"docs/d.md": {"sha256": _h(GOOD), "policy": g.DESIGN_REVIEW_POLICY}}
+
+
+def test_code_review_on_clean_tree_is_still_refused(tmp_path, monkeypatch, capsys):
+    """Пропуск проверки входа — ТОЛЬКО при снимке: кодовое ревью пустоты по-прежнему отказ."""
+    import subprocess
+    root = tmp_path / "repo"
+    root.mkdir()
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_GLOBAL": "/dev/null"}
+    for a in (["init", "-q"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                               "--allow-empty", "-m", "e"]):
+        subprocess.run(["git", "-C", str(root), *a], check=True, env=env, capture_output=True)
+    monkeypatch.setattr(g, "REPO_ROOT", root)
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
+    monkeypatch.chdir(root)
+    _fake_companion(monkeypatch, "echo CALLED")
+    assert g.main(["companion-review", "--scope", "working-tree", "фокус"]) == 2
+    assert "CALLED" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("content", ["", "   \n\t\n"])
+def test_empty_design_snapshot_is_refused_end_to_end(env, monkeypatch, capsys, content):
+    (env / "docs/d.md").write_text(content)
+    _fake_companion(monkeypatch, 'echo CALLED; printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    assert g.main(["companion-review", "--design-file", "docs/d.md", "фокус"]) == 2
+    captured = capsys.readouterr()
+    assert "CALLED" not in captured.out and "пуст" in captured.err
+    assert _receipts() == {}
+    assert _mark("docs/d.md", _h(content), "--no-receipt", "x") == 2

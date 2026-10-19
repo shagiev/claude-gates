@@ -4701,6 +4701,11 @@ def _design_snapshot(rel: str) -> "tuple[str, str, str] | str":
         text = data.decode()
     except UnicodeError:
         return f"{norm} не UTF-8"
+    if not text.strip():
+        # Пустой снимок — пустой вход: ревьюер получил бы одно задание без дизайна, а квитанция
+        # засвидетельствовала бы ревью пустоты (код-ревью 0.10.6). Проверка диапазона при снимке
+        # не делается, поэтому отказ — здесь, в единственном источнике снимка.
+        return f"{norm} пуст — ревьюеру нечего показать"
     return norm, hashlib.sha256(data).hexdigest(), text
 
 
@@ -5392,9 +5397,11 @@ def _companion_review(passthrough: "list[str]", span) -> int:
         snapshot = snap
         passthrough = [*passthrough, _design_challenge(*snap)]
     # ДО списания раунда: пустой вход — это отказ гейта, а не «ревью без замечаний».
-    # Тот же файл, что в снимке: относительный путь иначе разрешался бы от cwd, а не от корня.
-    empty = review_input_empty(passthrough, str(REPO_ROOT / snapshot[0]) if snapshot
-                               else design_file)
+    # При снимке вход непуст по построению: полный текст дизайна уже в задании. Проверка
+    # диапазона тут отказывала бы законному повторному ревью ЗАКОММИЧЕННОГО дизайна на чистом
+    # дереве («ревьюеру нечего показать»), и маршрут квитанция → маркер был мёртв (живая
+    # проверка 0.10.5, 19.10.2026). Кодовое ревью проверяется как прежде.
+    empty = None if snapshot is not None else review_input_empty(passthrough, design_file)
     if empty is not None:
         span.outcome = "error"
         print(f"[codex-gate] ✗ ревью НЕ запускается: {empty}.\n"
