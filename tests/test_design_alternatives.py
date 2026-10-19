@@ -238,13 +238,60 @@ def test_s4_failed_companion_writes_no_receipt(env, monkeypatch):
     assert _receipts() == {}
 
 
-def test_s11_oversized_design_is_refused_before_review(env, monkeypatch, capsys):
-    (env / "docs/big.md").write_text("## Альтернативы\n" + "x" * (g._DESIGN_SNAPSHOT_MAX + 1))
-    _fake_companion(monkeypatch, "echo CALLED")
-    assert g.main(["companion-review", "--design-file", "docs/big.md", "фокус"]) == 2
+def test_s11_large_design_is_reviewed_by_path_without_receipt(env, monkeypatch, capsys):
+    """Гибрид Р2а: больше предела — ревью ИДЁТ (задание просит прочитать файл целиком по пути),
+    снимок не вкладывается, квитанции нет, гейт печатает команду маркера с `--no-receipt`."""
+    big = GOOD + "\n" + ("абзац дизайна " * 9000)          # > 100 КБ в UTF-8
+    _put(env, "docs/big.md", big)
+    assert len(big.encode()) > g._DESIGN_SNAPSHOT_MAX
+    _fake_companion(monkeypatch, 'printf "%s\\n" "$@"; printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    assert g.main(["companion-review", "--design-file", "docs/big.md", "фокус"]) == 0
     captured = capsys.readouterr()
-    assert "CALLED" not in captured.out and "раздел" in captured.err
+    assert "STRONGEST ALTERNATIVE" in captured.out              # задание ушло
+    assert "READ THE FILE" in captured.out and "docs/big.md" in captured.out
+    assert "абзац дизайна абзац дизайна" not in captured.out    # снимок НЕ вложен
     assert _receipts() == {}
+    assert "--no-receipt" in captured.err and "предел" in captured.err
+
+
+def test_s11_large_design_marker_needs_the_audited_escape(env, capsys):
+    big = GOOD + "\n" + ("абзац дизайна " * 9000)
+    h = _put(env, "docs/big.md", big)
+    assert _mark("docs/big.md", h) == 2                          # квитанции быть не может
+    assert "больше предела" in capsys.readouterr().err           # и сказано почему, а не «нет квитанции»
+    assert _mark("docs/big.md", h, "--no-receipt", "дизайн больше предела снимка") == 0
+    assert g._marker_state("s1") == "valid"
+
+
+def test_s11_large_design_still_needs_the_alternatives_section(env):
+    big = NO_ALTS + "\n" + ("абзац дизайна " * 9000)
+    h = _put(env, "docs/big.md", big)
+    assert _mark("docs/big.md", h, "--no-receipt", "больше предела") == 2
+
+
+def test_s11_large_committed_design_on_clean_tree_is_reviewed(tmp_path, monkeypatch, capsys):
+    """Как и для малого: вход — указание читать непустой файл, проверка диапазона не нужна."""
+    import subprocess
+    root = tmp_path / "repo"
+    (root / "docs").mkdir(parents=True)
+    (root / "docs/big.md").write_text(GOOD + "\n" + ("абзац " * 30000))
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "GIT_CONFIG_GLOBAL": "/dev/null"}
+    for a in (["init", "-q"], ["add", "-A"],
+              ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "d"]):
+        subprocess.run(["git", "-C", str(root), *a], check=True, env=env, capture_output=True)
+    monkeypatch.setattr(g, "REPO_ROOT", root)
+    monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit.log")
+    monkeypatch.chdir(root)
+    _fake_companion(monkeypatch, 'printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    assert g.main(["companion-review", "--design-file", "docs/big.md", "--scope", "working-tree",
+                   "фокус"]) == 0, capsys.readouterr().err
+
+
+def test_design_file_beyond_the_hard_limit_is_refused(env, monkeypatch, capsys):
+    (env / "docs/huge.md").write_text("## Альтернативы\n" + "x" * (g._DESIGN_FILE_MAX + 1))
+    _fake_companion(monkeypatch, "echo CALLED")
+    assert g.main(["companion-review", "--design-file", "docs/huge.md", "фокус"]) == 2
+    assert "CALLED" not in capsys.readouterr().out
 
 
 # ═══ E3a: снимок читается без следования symlink ═══
@@ -424,3 +471,82 @@ def test_empty_design_snapshot_is_refused_end_to_end(env, monkeypatch, capsys, c
     assert "CALLED" not in captured.out and "пуст" in captured.err
     assert _receipts() == {}
     assert _mark("docs/d.md", _h(content), "--no-receipt", "x") == 2
+
+
+EVIL = "docs/a $(touch PWNED) `id`;x.md"
+
+
+def test_large_design_marker_hint_is_shell_safe(env, monkeypatch, capsys):
+    """Подсказку копирует оператор: путь из имени файла не должен стать подстановкой команды."""
+    big = GOOD + "\n" + ("абзац дизайна " * 9000)
+    (env / EVIL).write_text(big)
+    _fake_companion(monkeypatch, 'printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    assert g.main(["companion-review", "--design-file", EVIL, "фокус"]) == 0
+    err = capsys.readouterr().err
+    assert shlex.quote(EVIL) in err
+    cmd = next(l for l in err.splitlines() if l.strip().startswith("write-marker design"))
+    args = shlex.split(cmd)
+    assert args[args.index("--file") + 1] == EVIL                 # разбор шеллом — ровно путь
+
+
+def test_no_receipt_hint_is_shell_safe(env, capsys):
+    h = _put(env, EVIL, GOOD)
+    assert _mark(EVIL, h) == 2
+    err = capsys.readouterr().err
+    cmd = next(l for l in err.splitlines() if l.strip().startswith("companion-review"))
+    assert shlex.split(cmd)[shlex.split(cmd).index("--design-file") + 1] == EVIL
+
+
+def test_design_review_runs_the_reviewer_from_the_repo_root(env, monkeypatch, capsys):
+    """Путь в задании — от корня: ревьюер, запущенный из подкаталога, его не нашёл бы."""
+    _put(env, "docs/d.md", GOOD)
+    monkeypatch.chdir(env / "docs")
+    _fake_companion(monkeypatch, 'echo "CWD=$(pwd -P)"; printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    assert g.main(["companion-review", "--design-file", "docs/d.md", "фокус"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert f"CWD={os.path.realpath(env)}" in lines       # строка целиком: подстрока «…/repo/docs» ложно проходила
+
+
+def test_large_design_reviewer_reads_a_gate_owned_copy_not_the_worktree(env, monkeypatch, capsys,
+                                                                         outside_secret):
+    """Код-ревью 0.10.7: указание читать путь В РАБОЧЕМ ДЕРЕВЕ открывало окно подмены — файл
+    после безопасного чтения заменяют symlink'ом на секрет. Фейковый ревьюер делает ровно это,
+    а затем читает файл, на который указало задание: обязан получить снимок, а не секрет."""
+    big = GOOD + "\n" + ("абзац дизайна " * 9000)
+    _put(env, "docs/big.md", big)
+    script = (
+        'rm -f docs/big.md; ln -s ' + shlex.quote(str(outside_secret)) + ' docs/big.md; '
+        'p=$(printf "%s\\n" "$@" | sed -n "s/.*READ THE FILE \\`\\([^\\`]*\\)\\`.*/\\1/p" | head -1); '
+        'echo "READ=$p"; head -n 5 "$p"; '
+        'printf "Verdict: approve\\n\\nNo material findings.\\n"')
+    _fake_companion(monkeypatch, script)
+    assert g.main(["companion-review", "--design-file", "docs/big.md", "фокус"]) == 0
+    out = capsys.readouterr().out
+    read_path = next(l for l in out.splitlines() if l.startswith("READ="))[5:]
+    assert read_path and not read_path.startswith(str(env))      # не путь в рабочем дереве
+    assert "Решения и альтернативы" in out and "СЕКРЕТ" not in out
+    assert not os.path.exists(read_path)                          # копия убрана после ревью
+
+
+def test_partial_design_copy_is_removed_on_write_failure(env, monkeypatch):
+    real_fdopen = os.fdopen
+
+    class Broken:
+        def __init__(self, f): self.f = f
+        def __enter__(self): return self
+        def __exit__(self, *a): self.f.close()
+        def write(self, _b): raise OSError(28, "No space left on device")
+    monkeypatch.setattr(g.os, "fdopen", lambda fd, mode: Broken(real_fdopen(fd, mode)))
+    made = g._materialize_design_copy("a" * 64, "текст")
+    assert isinstance(made, str) and "не записать" in made
+    assert list((g._gate_state_dir() / "design-snapshots").glob("*.md")) == []
+
+
+def test_stale_design_copies_are_swept(env):
+    d = g._gate_state_dir() / "design-snapshots"
+    d.mkdir(parents=True)
+    old, fresh = d / "old.md", d / "fresh.md"
+    old.write_text("x"); fresh.write_text("y")
+    os.utime(old, (1, 1))
+    made = g._materialize_design_copy("b" * 64, "текст")
+    assert not old.exists() and fresh.exists() and made.exists()

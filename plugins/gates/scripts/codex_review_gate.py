@@ -4614,8 +4614,10 @@ DESIGN_REVIEW_POLICY = "alternatives-v1"
 #: ограничен 128 КБ (MAX_ARG_STRLEN), и больший снимок падал бы E2BIG с невнятным «companion не
 #: запустился». Крупнее — делить дизайн (довод тот же, что у таймаута ревью 900 с в скилле).
 _DESIGN_SNAPSHOT_MAX = 100 * 1024
+#: Жёсткий предел чтения дизайн-файла (проверка секций, хэш): крупнее — не дизайн, а что-то другое.
+_DESIGN_FILE_MAX = 5 * 1024 * 1024
 
-_DESIGN_CHALLENGE = """ARCHITECTURE REVIEW TASK (added by the review gate, policy {policy}).
+_DESIGN_TASK = """ARCHITECTURE REVIEW TASK (added by the review gate, policy {policy}).
 Review the design the way an architecture review board would, in this order:
 1. Is the PROBLEM stated correctly and completely?
 2. For each key decision: are the rejected alternatives represented fairly, or are they strawmen?
@@ -4624,11 +4626,19 @@ Review the design the way an architecture review board would, in this order:
 4. Does each choice follow from its own stated criteria?
 Then judge the business scenarios and acceptance criteria: is every fail-open edge case listed
 and prevented?
+"""
+_DESIGN_CHALLENGE = _DESIGN_TASK + """\
 The FULL design file `{path}` (sha256 {sha}) follows verbatim. Review THIS text, not only a diff.
 <<<DESIGN-SNAPSHOT
 {text}
 DESIGN-SNAPSHOT>>>"""
-
+# Гибрид Р2а: дизайн больше предела снимка ревьюится по КОПИИ, принадлежащей гейту, — это
+# УКАЗАНИЕ прочитать, а не доставка байтов, поэтому квитанции нет (R-RECEIPT-TRUSTS-COMPANION-
+# DELIVERY). Копия, а не путь в рабочем дереве: тот после безопасного чтения можно подменить
+# symlink'ом на чужой файл, и ревьюер прочитал бы его (код-ревью 0.10.7, воспроизведено).
+_DESIGN_CHALLENGE_BY_PATH = _DESIGN_TASK + """\
+The design `{path}` ({size} KB, sha256 {sha}) is too large to embed. READ THE FILE `{copy}`
+IN FULL before answering (an immutable copy of exactly these bytes); judge the whole design."""
 
 def _normalize_design_rel(rel: str) -> "str | None":
     """Путь дизайна — относительный внутри репозитория, без `..`: `./docs/x.md` и `docs/x.md` —
@@ -4677,17 +4687,16 @@ def _design_snapshot(rel: str) -> "tuple[str, str, str] | str":
         st = os.fstat(fds[-1])
         if not stat.S_ISREG(st.st_mode):
             return f"{norm} — не обычный файл"
-        if st.st_size > _DESIGN_SNAPSHOT_MAX:
-            return (f"{norm} больше {_DESIGN_SNAPSHOT_MAX // 1024} КБ — раздели дизайн на части: "
-                    "снимок вкладывается в задание ревьюеру целиком")
+        if st.st_size > _DESIGN_FILE_MAX:
+            return f"{norm} больше {_DESIGN_FILE_MAX // (1024 * 1024)} МБ — это не дизайн-файл"
         chunks, total = [], 0
         while True:
             chunk = os.read(fds[-1], 65536)
             if not chunk:
                 break
             total += len(chunk)
-            if total > _DESIGN_SNAPSHOT_MAX:
-                return f"{norm} вырос во время чтения сверх предела — раздели дизайн на части"
+            if total > _DESIGN_FILE_MAX:
+                return f"{norm} вырос во время чтения сверх {_DESIGN_FILE_MAX // (1024 * 1024)} МБ"
             chunks.append(chunk)
     except OSError as exc:
         # ELOOP/ENOTDIR — symlink на пути; ENOENT — нет файла: в обоих случаях ревьюер не идёт
@@ -4709,8 +4718,54 @@ def _design_snapshot(rel: str) -> "tuple[str, str, str] | str":
     return norm, hashlib.sha256(data).hexdigest(), text
 
 
-def _design_challenge(norm: str, sha: str, text: str) -> str:
+def _design_embeddable(text: str) -> bool:
+    return len(text.encode()) <= _DESIGN_SNAPSHOT_MAX
+
+
+def _design_challenge(norm: str, sha: str, text: str, copy: "Path | None" = None) -> str:
+    if not _design_embeddable(text):
+        return _DESIGN_CHALLENGE_BY_PATH.format(policy=DESIGN_REVIEW_POLICY, path=norm, sha=sha,
+                                                size=len(text.encode()) // 1024, copy=copy)
     return _DESIGN_CHALLENGE.format(policy=DESIGN_REVIEW_POLICY, path=norm, sha=sha, text=text)
+
+
+def _materialize_design_copy(sha: str, text: str) -> "Path | str":
+    """Копия на ОДИН прогон в состоянии гейта (вне рабочего дерева): уже безопасно прочитанные
+    байты, 0600, O_EXCL|O_NOFOLLOW. Имя на прогон, а не на хэш: два ревью одного текста иначе
+    удаляли бы копию друг у друга. Песочница Codex read-only её читает (замер 2026-10-19)."""
+    try:
+        state = _gate_state_dir()
+    except TrustedGitError as exc:
+        return f"нет каталога состояния гейта для копии дизайна ({exc})"
+    if state is None:
+        return "нет каталога состояния гейта для копии дизайна"
+    d = state / "design-snapshots"
+    path = d / f"{sha}-{os.getpid()}-{secrets.token_hex(4)}.md"
+    try:
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _sweep_stale_design_copies(d)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        return f"копию дизайна не создать ({type(exc).__name__}: {exc.strerror})"
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode())
+    except OSError as exc:
+        path.unlink(missing_ok=True)          # частичная копия (ENOSPC) не остаётся на диске
+        return f"копию дизайна не записать ({type(exc).__name__}: {exc.strerror})"
+    return path
+
+
+def _sweep_stale_design_copies(d: Path, max_age_s: int = 86400) -> None:
+    """Копии, брошенные убитым процессом (SIGKILL между созданием и `finally`), — уборка при
+    следующем прогоне: содержимое — дизайн самого репозитория, 0600, это мусор, а не утечка."""
+    cutoff = time.time() - max_age_s
+    for p in d.glob("*.md"):
+        try:
+            if p.lstat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            continue                          # чужая гонка за тот же файл — не повод отказать в ревью
 
 
 def _design_receipts_path() -> "Path | None":
@@ -4770,13 +4825,21 @@ def write_design_file_marker_cli(detail: str, design_file: str, reviewed_hash: s
               file=sys.stderr)
     else:
         rec = _design_receipts().get(norm) or {}
+        if not _design_embeddable(text):
+            print(f"[codex-gate] ✗ дизайн {norm} ({len(text.encode()) // 1024} КБ) больше предела "
+                  f"снимка {_DESIGN_SNAPSHOT_MAX // 1024} КБ: ревью шло по пути к файлу, квитанции "
+                  "за него нет по построению. Маркер — с аудируемым выходом: `--no-receipt "
+                  "\"дизайн больше предела снимка\"`.", file=sys.stderr)
+            return 2
         if rec.get("sha256") != reviewed_hash or rec.get("policy") != DESIGN_REVIEW_POLICY:
             audit(f"design-marker NO-RECEIPT session={session} file={norm!r} "
                   f"reviewed={reviewed_hash[:12]} receipt={str(rec.get('sha256'))[:12]} "
                   f"policy={rec.get('policy')!r}")
+            # путь — имя файла из репозитория, а подсказку копирует оператор: только shlex.quote
             print(f"[codex-gate] ✗ нет квитанции дизайн-ревью на {norm} с этим хэшем и заданием "
-                  f"{DESIGN_REVIEW_POLICY}: прогони `companion-review --design-file {norm} …` "
-                  "на ЭТОМ тексте (правка после ревью — новое ревью). Codex недоступен — "
+                  f"{DESIGN_REVIEW_POLICY}: прогони на ЭТОМ тексте\n"
+                  f"  companion-review --design-file {shlex.quote(norm)} '<фокус>'\n"
+                  "(правка после ревью — новое ревью). Codex недоступен — "
                   "`--no-receipt \"<причина>\"` (аудируется).", file=sys.stderr)
             return 2
     return add_design_file_binding(detail, norm, reviewed_hash)
@@ -5385,6 +5448,7 @@ def _companion_review(passthrough: "list[str]", span) -> int:
         design_file = passthrough[i + 1] if i + 1 < len(passthrough) else None
         passthrough = passthrough[:i] + passthrough[i + 2:]
     snapshot = None
+    design_copy: "Path | None" = None
     if design_file is not None:
         # Снимок ОДИН раз и целиком во вход ревьюера: квитанция получает хэш ровно тех байтов,
         # что он видел (git-диапазон у существующего файла несёт только дельту). Отдельным
@@ -5395,7 +5459,6 @@ def _companion_review(passthrough: "list[str]", span) -> int:
             print(f"[codex-gate] ✗ дизайн-ревью НЕ запускается: {snap}.", file=sys.stderr)
             return 2
         snapshot = snap
-        passthrough = [*passthrough, _design_challenge(*snap)]
     # ДО списания раунда: пустой вход — это отказ гейта, а не «ревью без замечаний».
     # При снимке вход непуст по построению: полный текст дизайна уже в задании. Проверка
     # диапазона тут отказывала бы законному повторному ревью ЗАКОММИЧЕННОГО дизайна на чистом
@@ -5436,7 +5499,24 @@ def _companion_review(passthrough: "list[str]", span) -> int:
         print("[codex-gate] ⚠️ третий раунд и дальше: если находки повторяют ОДИН класс — "
               "переформулируй правило на верном уровне общности либо режь фичу, а не чини "
               "экземпляры по одному.", file=sys.stderr)
-    r = _exec_companion(["adversarial-review", "--wait", *passthrough])
+    # Путь в задании дизайна — от корня репозитория: ревьюер, запущенный из подкаталога, разрешил
+    # бы его не туда и ответил по одному диффу (код-ревью 0.10.7). Кодовое ревью — как прежде.
+    if snapshot is not None:
+        # Копия — вплотную к запуску ревьюера: любой ранний отказ выше её не оставит на диске.
+        if not _design_embeddable(snapshot[2]):
+            made = _materialize_design_copy(snapshot[1], snapshot[2])
+            if isinstance(made, str):
+                span.outcome = "error"
+                print(f"[codex-gate] ✗ дизайн-ревью НЕ запускается: {made}.", file=sys.stderr)
+                return 2
+            design_copy = made
+        passthrough = [*passthrough, _design_challenge(*snapshot, copy=design_copy)]
+    try:
+        r = _exec_companion(["adversarial-review", "--wait", *passthrough],
+                            cwd=str(REPO_ROOT) if snapshot is not None else None)
+    finally:
+        if design_copy is not None:
+            design_copy.unlink(missing_ok=True)
     if r is None:
         span.outcome = "error"
         return 2                     # отказ уже объяснён в stderr, дальше — fail-closed
@@ -5493,8 +5573,15 @@ def _companion_review(passthrough: "list[str]", span) -> int:
               f"tier={review_tier()}")
     # Ответ — первым: квитанция вторична, оплаченное ревью не должно теряться из-за её сбоя.
     print(r.stdout, end="")
-    if snapshot is not None:
+    if snapshot is not None and _design_embeddable(snapshot[2]):
         _issue_design_receipt(snapshot, parsed)
+    elif snapshot is not None:
+        print(f"[codex-gate] ⚠️ дизайн {snapshot[0]} больше предела снимка "
+              f"{_DESIGN_SNAPSHOT_MAX // 1024} КБ — ревьюеру дано указание прочитать файл, а не "
+              "сам текст; квитанции нет. Маркер (аудируется):\n"
+              f"  write-marker design '<кратко>' <hash> --file {shlex.quote(snapshot[0])} "
+              "--no-receipt 'дизайн больше предела снимка'",
+              file=sys.stderr)
     return 0
 
 
