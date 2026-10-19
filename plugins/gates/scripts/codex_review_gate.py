@@ -17,6 +17,7 @@ import secrets
 import time
 import shlex
 import signal
+import stat
 import shutil
 import subprocess
 import tempfile
@@ -4593,6 +4594,189 @@ def _has_bsac(text: str) -> bool:
     return any(m in low for m in _BSAC_MARKERS_CI) or bool(_EARS_RE.search(text))
 
 
+# Секция разбора альтернатив (docs/2026-10-18-design-alternatives-design.md, Р1): ЗАГОЛОВОК, а не
+# слово — «рассматривались альтернативы» в прозе без разбора не засчитывается. Код-блоки
+# вырезаются, иначе пример заголовка в листинге проходил бы за секцию.
+_ALTERNATIVES_HEADING_RE = re.compile(r"^#{1,6}[ \t]+[^\n]*(?:альтернатив|alternatives)",
+                                      re.IGNORECASE | re.MULTILINE)
+# Незакрытый блок тянется до конца файла — как его рендерит markdown.
+_FENCED_BLOCK_RE = re.compile(r"^(```|~~~).*?(?:^\1[^\n]*$|\Z)", re.MULTILINE | re.DOTALL)
+
+
+def _has_alternatives(text: str) -> bool:
+    return bool(_ALTERNATIVES_HEADING_RE.search(_FENCED_BLOCK_RE.sub("", text)))
+
+
+#: Версия архитектурного задания дизайн-ревью. Квитанция старой версии маркер не разблокирует:
+#: смена задания означает, что прежнее ревью отвечало на другие вопросы.
+DESIGN_REVIEW_POLICY = "alternatives-v1"
+#: Снимок вкладывается в задание целиком, ОДНИМ аргументом companion'а: на Linux один аргумент
+#: ограничен 128 КБ (MAX_ARG_STRLEN), и больший снимок падал бы E2BIG с невнятным «companion не
+#: запустился». Крупнее — делить дизайн (довод тот же, что у таймаута ревью 900 с в скилле).
+_DESIGN_SNAPSHOT_MAX = 100 * 1024
+
+_DESIGN_CHALLENGE = """ARCHITECTURE REVIEW TASK (added by the review gate, policy {policy}).
+Review the design the way an architecture review board would, in this order:
+1. Is the PROBLEM stated correctly and completely?
+2. For each key decision: are the rejected alternatives represented fairly, or are they strawmen?
+3. NAME THE STRONGEST ALTERNATIVE THAT IS MISSING for any key decision. A missing strong
+   alternative is a [high] finding: the design goes another round.
+4. Does each choice follow from its own stated criteria?
+Then judge the business scenarios and acceptance criteria: is every fail-open edge case listed
+and prevented?
+The FULL design file `{path}` (sha256 {sha}) follows verbatim. Review THIS text, not only a diff.
+<<<DESIGN-SNAPSHOT
+{text}
+DESIGN-SNAPSHOT>>>"""
+
+
+def _normalize_design_rel(rel: str) -> "str | None":
+    """Путь дизайна — относительный внутри репозитория, без `..`: `./docs/x.md` и `docs/x.md` —
+    один ключ квитанции. Абсолютный путь или выход наружу → None."""
+    if not rel:
+        return None
+    if os.path.isabs(rel):
+        # Абсолютный путь допустим, только если ЛЕКСИЧЕСКИ лежит под корнем (в обоих
+        # написаниях корня: на маке /var → /private/var). Дальше — тот же безопасный обход
+        # по компонентам, поэтому symlink внутри пути всё равно отвергается при открытии.
+        if REPO_ROOT is None:
+            return None
+        for root in {str(REPO_ROOT), os.path.realpath(REPO_ROOT)}:
+            if rel.startswith(root.rstrip("/") + "/"):
+                rel = rel[len(root.rstrip("/")) + 1:]
+                break
+        else:
+            return None
+    parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def _design_snapshot(rel: str) -> "tuple[str, str, str] | str":
+    """(нормализованный путь, sha256, текст) или причина отказа.
+
+    Путь — ввод, а байты уезжают внешнему ревьюеру: symlink `docs/d.md → ~/.ssh/id_ed25519`
+    отправил бы ключ (дизайн-ревью 18.10.2026). Поэтому каждый компонент открывается
+    относительно fd родителя с O_NOFOLLOW, размер и содержимое — из того же fd, без повторного
+    открытия по имени."""
+    if REPO_ROOT is None:
+        return "не git-репозиторий"
+    norm = _normalize_design_rel(rel)
+    if norm is None:
+        return f"путь {rel!r} обязан быть относительным внутри репозитория, без `..`"
+    parts = norm.split("/")
+    fds: list[int] = []
+    try:
+        fds.append(os.open(REPO_ROOT, os.O_RDONLY | os.O_DIRECTORY))
+        for comp in parts[:-1]:
+            fds.append(os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                               dir_fd=fds[-1]))
+        fds.append(os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                           dir_fd=fds[-1]))
+        st = os.fstat(fds[-1])
+        if not stat.S_ISREG(st.st_mode):
+            return f"{norm} — не обычный файл"
+        if st.st_size > _DESIGN_SNAPSHOT_MAX:
+            return (f"{norm} больше {_DESIGN_SNAPSHOT_MAX // 1024} КБ — раздели дизайн на части: "
+                    "снимок вкладывается в задание ревьюеру целиком")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fds[-1], 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _DESIGN_SNAPSHOT_MAX:
+                return f"{norm} вырос во время чтения сверх предела — раздели дизайн на части"
+            chunks.append(chunk)
+    except OSError as exc:
+        # ELOOP/ENOTDIR — symlink на пути; ENOENT — нет файла: в обоих случаях ревьюер не идёт
+        return (f"{norm} не открыть безопасно ({type(exc).__name__}: {exc.strerror}) — "
+                "symlink на пути, нет файла или нет доступа")
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+    data = b"".join(chunks)
+    try:
+        text = data.decode()
+    except UnicodeError:
+        return f"{norm} не UTF-8"
+    return norm, hashlib.sha256(data).hexdigest(), text
+
+
+def _design_challenge(norm: str, sha: str, text: str) -> str:
+    return _DESIGN_CHALLENGE.format(policy=DESIGN_REVIEW_POLICY, path=norm, sha=sha, text=text)
+
+
+def _design_receipts_path() -> "Path | None":
+    state = _gate_state_dir() if REPO_ROOT else None
+    return (state / "design_receipts.json") if state else None
+
+
+def _design_receipts() -> dict:
+    p = _design_receipts_path()
+    if p is None or not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError, UnicodeError):
+        return {}                      # битая квитанция не разблокирует: маркер получит отказ
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, dict)}
+
+
+def _record_design_receipt(rel: str, sha: str, policy: str = DESIGN_REVIEW_POLICY) -> None:
+    """Квитанция состоявшегося дизайн-ревью: этот путь, этот снимок, эта версия задания."""
+    norm = _normalize_design_rel(rel)
+    p = _design_receipts_path()
+    if norm is None or p is None:
+        return
+    receipts = _design_receipts()
+    receipts[norm] = {"sha256": sha, "policy": policy}
+    _atomic_write_json(p, receipts)
+
+
+def write_design_file_marker_cli(detail: str, design_file: str, reviewed_hash: str,
+                                 no_receipt: "str | None") -> int:
+    """Единая точка постановки design-маркера из CLI (Р2–Р4): безопасный снимок, секция
+    альтернатив, квитанция на ровно этот снимок — затем прежний биндинг с дрейф-защитой."""
+    snap = _design_snapshot(design_file)
+    if isinstance(snap, str):
+        print(f"[codex-gate] ✗ маркер не поставлен: {snap}.", file=sys.stderr)
+        return 2
+    norm, sha, text = snap
+    session = _env_session()
+    if not _has_alternatives(text):
+        audit(f"design-marker NO-ALTERNATIVES session={session} file={norm!r}")
+        print(f"[codex-gate] ✗ дизайн {norm} без секции разбора альтернатив (заголовок вида "
+              "«## Решения и альтернативы»): для каждого ключевого решения — проблема, варианты "
+              "(включая «оставить как есть»), критерии, что выбрано и почему. Для действительно "
+              "простой правки — `write-marker trivial \"<причина>\"`.", file=sys.stderr)
+        return 2
+    if no_receipt is not None:
+        reason = redact_secrets(no_receipt.strip())
+        if not reason:
+            print("usage: ... --no-receipt \"<причина>\" — причина обязательна", file=sys.stderr)
+            return 1
+        audit(f"DESIGN-NO-RECEIPT session={session} file={norm!r} sha={sha[:12]} "
+              f"reason={reason!r}")
+        print(f"[codex-gate] ⚠️ маркер БЕЗ квитанции дизайн-ревью ({reason}) — записано в аудит.",
+              file=sys.stderr)
+    else:
+        rec = _design_receipts().get(norm) or {}
+        if rec.get("sha256") != reviewed_hash or rec.get("policy") != DESIGN_REVIEW_POLICY:
+            audit(f"design-marker NO-RECEIPT session={session} file={norm!r} "
+                  f"reviewed={reviewed_hash[:12]} receipt={str(rec.get('sha256'))[:12]} "
+                  f"policy={rec.get('policy')!r}")
+            print(f"[codex-gate] ✗ нет квитанции дизайн-ревью на {norm} с этим хэшем и заданием "
+                  f"{DESIGN_REVIEW_POLICY}: прогони `companion-review --design-file {norm} …` "
+                  "на ЭТОМ тексте (правка после ревью — новое ревью). Codex недоступен — "
+                  "`--no-receipt \"<причина>\"` (аудируется).", file=sys.stderr)
+            return 2
+    return add_design_file_binding(detail, norm, reviewed_hash)
+
+
 def _read_design(path: Path) -> "tuple[str, str] | None":
     """(sha256_hex, текст) дизайн-файла; None при OSError/decode (fail-closed → дрейф)."""
     try:
@@ -5195,8 +5379,22 @@ def _companion_review(passthrough: "list[str]", span) -> int:
         i = passthrough.index("--design-file")
         design_file = passthrough[i + 1] if i + 1 < len(passthrough) else None
         passthrough = passthrough[:i] + passthrough[i + 2:]
+    snapshot = None
+    if design_file is not None:
+        # Снимок ОДИН раз и целиком во вход ревьюера: квитанция получает хэш ровно тех байтов,
+        # что он видел (git-диапазон у существующего файла несёт только дельту). Отдельным
+        # позиционным аргументом: companion склеивает их в фокус, фокус агента не трогается.
+        snap = _design_snapshot(design_file)
+        if isinstance(snap, str):
+            span.outcome = "error"
+            print(f"[codex-gate] ✗ дизайн-ревью НЕ запускается: {snap}.", file=sys.stderr)
+            return 2
+        snapshot = snap
+        passthrough = [*passthrough, _design_challenge(*snap)]
     # ДО списания раунда: пустой вход — это отказ гейта, а не «ревью без замечаний».
-    empty = review_input_empty(passthrough, design_file)
+    # Тот же файл, что в снимке: относительный путь иначе разрешался бы от cwd, а не от корня.
+    empty = review_input_empty(passthrough, str(REPO_ROOT / snapshot[0]) if snapshot
+                               else design_file)
     if empty is not None:
         span.outcome = "error"
         print(f"[codex-gate] ✗ ревью НЕ запускается: {empty}.\n"
@@ -5286,8 +5484,38 @@ def _companion_review(passthrough: "list[str]", span) -> int:
             review_round_record(artifact)
         audit(f"review-round artifact={artifact} round={rnd}/{budget} "
               f"tier={review_tier()}")
+    # Ответ — первым: квитанция вторична, оплаченное ревью не должно теряться из-за её сбоя.
     print(r.stdout, end="")
+    if snapshot is not None:
+        _issue_design_receipt(snapshot, parsed)
     return 0
+
+
+def _issue_design_receipt(snapshot: "tuple[str, str, str]", parsed) -> None:
+    """Квитанция — только за СОСТОЯВШЕЕСЯ ревью: строгий `Verdict:`. Ненулевой код, конверт
+    аутэйджа и пустой вывод вышли раньше, но квота простым текстом с кодом 0 («You have hit your
+    usage limit») — нет: без этой проверки она получала квитанцию, то есть гейт свидетельствовал
+    о ревью, которого не было (код-ревью 19.10.2026, воспроизведено)."""
+    norm, sha, _text = snapshot
+    if not parsed.valid:
+        print("[codex-gate] ⚠️ ответ без строки `Verdict:` — квитанция дизайн-ревью НЕ выдана: "
+              "это не доказательство состоявшегося ревью. Повтори ревью; Codex недоступен — "
+              "`--no-receipt \"<причина>\"` при постановке маркера.", file=sys.stderr)
+        return
+    # Движок, подставленный окружением (так держатся тесты), ревью не доказывает: квитанция
+    # выдаётся — G1 fail-open by design, — но подмена обязана оставить след в аудите.
+    engine = "override" if os.environ.get("CODEX_COMPANION_CMD") else "plugin"
+    if engine == "override":
+        print("[codex-gate] ⚠️ дизайн-ревью выполнил движок из CODEX_COMPANION_CMD, а не плагин "
+              "Codex — квитанция помечена в аудите как engine=override.", file=sys.stderr)
+    try:
+        _record_design_receipt(norm, sha)
+    except (OSError, TrustedGitError) as exc:
+        print(f"[codex-gate] ⚠️ квитанцию дизайн-ревью не записать ({type(exc).__name__}: {exc}) "
+              "— маркер без неё не встанет; повтори ревью или `--no-receipt`.", file=sys.stderr)
+        return
+    audit(f"design-receipt file={norm!r} sha={sha[:12]} policy={DESIGN_REVIEW_POLICY} "
+          f"engine={engine}")
 
 
 def main(argv: list[str]) -> int:
@@ -5772,17 +6000,26 @@ def main(argv: list[str]) -> int:
             i = rest.index("--file")
             design_file = rest[i + 1] if i + 1 < len(rest) else None
             rest = rest[:i] + rest[i + 2:]
+        no_receipt = None
+        if "--no-receipt" in rest:                  # аудируемый выход на аутэйдж Codex (Р2)
+            i = rest.index("--no-receipt")
+            no_receipt = rest[i + 1] if i + 1 < len(rest) else ""
+            rest = rest[:i] + rest[i + 2:]
         reviewed_hash = rest[0] if rest else None
         if file_flag:      # code-R1 F1: --file задан → СТРОГО file-режим, НЕ проваливаться в inline
             if kind != "design" or not design_file or not reviewed_hash:
-                print("usage: write-marker design <detail> <reviewed_hash> --file <path>",
-                      file=sys.stderr)
+                print("usage: write-marker design <detail> <reviewed_hash> --file <path> "
+                      "[--no-receipt \"<причина>\"]", file=sys.stderr)
                 return 1                            # ошибка аргументов НЕ пишет маркер (fail-closed)
-            return add_design_file_binding(detail, design_file, reviewed_hash)
-        if kind == "design":       # F2 (altitude): inline design без --file = БЕЗ дрейф-защиты —
-            print("[codex-gate] ⚠️ inline design-маркер (без --file) НЕ защищён от дрейфа: "  # громко, не молча
-                  "пост-ревью правка дизайна не будет поймана. Для нетривиального/actuator/"
-                  "data-loss дизайна используй `--file <path>` (см. /design-review).", file=sys.stderr)
+            return write_design_file_marker_cli(detail, design_file, reviewed_hash, no_receipt)
+        if kind == "design":
+            # Р5 (18.10.2026): inline design-маркер обходил и разбор альтернатив, и квитанцию —
+            # достаточно было опустить `--file`. Уже записанные читаются как раньше.
+            print("[codex-gate] ✗ design-маркер ставится только в file-режиме: "
+                  "`write-marker design <detail> <hash> --file <путь>` после "
+                  "`companion-review --design-file <путь>`; простая правка — "
+                  "`write-marker trivial \"<причина>\"`.", file=sys.stderr)
+            return 2
         write_marker(kind, detail, reviewed_hash)
         return 0
     if cmd == "clear-marker":
