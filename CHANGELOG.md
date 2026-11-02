@@ -12,6 +12,12 @@ coexistence требуют одинаковый delivery digest. Поставл�
 Server API, машиночитаемый transcript и crash-safe API-owned recovery без raw rewrite общего
 `installed.json`. Дизайн: `docs/2026-11-01-kimi-host-support-design.md`.
 
+## 0.10.9 — 2026-11-03
+
+Таймаут Cursor reviewer увеличен с 600 до 1800 секунд: замер Grok 4.7 на полном deploy-диффе
+показал, что прежний лимит обрывал ревью до ответа. Семейство, certification corpus, declared-
+политика и изоляция не меняются; timeout по-прежнему fail-closed.
+
 ## 0.10.8 — 2026-11-02
 
 Portable deploy-review работает без Anthropic API: при единственной certified Cursor-записи
