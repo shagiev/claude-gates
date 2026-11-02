@@ -37,7 +37,7 @@ def _providers(monkeypatch, codex=None, cursor=None):
     monkeypatch.setattr(g, "run_companion_review",
                         lambda base, scope: codex)
     monkeypatch.setattr(g, "run_cursor_review",
-                        lambda base, head: ((cursor, "model=cursor-grok-4.5-high")
+                        lambda base, head: ((cursor, "model=grok-4.7-high")
                                             if cursor else (None, "стаб-отказ")))
 
 
@@ -70,7 +70,7 @@ def test_m1_m3_model_allow_list(monkeypatch):
     monkeypatch.setenv("CURSOR_REVIEW_MODEL", "gpt-5.3-codex-high-fast")
     assert g.resolve_cursor_model()[0] == "gpt-5.3-codex-high-fast"   # M4
     monkeypatch.delenv("CURSOR_REVIEW_MODEL")
-    assert g.resolve_cursor_model()[0] == "cursor-grok-4.5-high"      # дефолт — другое семейство
+    assert g.resolve_cursor_model()[0] == "grok-4.7-high"      # дефолт — другое семейство
 
 
 def test_m1_bad_model_blocks_deploy(gate, monkeypatch):
@@ -158,10 +158,10 @@ def test_adapter_happy_path_and_usage_audited(gate, monkeypatch):
         "I checked the repo.Verdict: approve\n\nNo material findings."))
     text, info = g.run_cursor_review("HEAD~1", "HEAD")
     assert text is not None and g.parse_review_output(text).valid
-    assert info == "model=cursor-grok-4.5-high"
+    assert info == "model=grok-4.7-high"
     audit = (gate / "audit.log").read_text()
     assert "cursor-review bin=" in audit and "cursor-agent" in audit     # фактический бинарь (F2)
-    assert "model=cursor-grok-4.5-high in=100 out=20" in audit           # наблюдаемость затрат
+    assert "model=grok-4.7-high in=100 out=20" in audit           # наблюдаемость затрат
 
 
 def test_adapter_p4_auth_error_blocks_and_redacts(gate, monkeypatch):

@@ -88,6 +88,9 @@ _RUNNERS = {
     "claude": (lambda diff: gate.run_claude_review_text(diff, role="blocking",
                                                         allow_candidate=True)[:4],
                "claude-cli", lambda: gate.claude_blocking_model(allow_candidate=True)),
+    "cursor": (lambda diff: gate.run_cursor_review_text(
+        diff, requested_model=gate._CURSOR_MODEL, allow_candidate=True)[:4],
+               "cursor-cli", lambda: gate._CURSOR_MODEL),
 }
 
 

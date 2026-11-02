@@ -1,5 +1,5 @@
-"""Portable resolver v2: обязательная blocking-пара Codex+Claude (дизайн
-docs/2026-08-07-host-relative-reviewer-ladder-design.md, §3/§4, матрица B1..B14)."""
+"""Portable resolver: обязательные пары Codex+Cursor или Codex+Claude
+(дизайн docs/2026-11-02-codex-cursor-portable-pair-design.md, матрица C1..C15)."""
 import io
 import json
 import pathlib
@@ -57,10 +57,176 @@ def _cert(provider, model, role, *, candidate=False):
     return cert
 
 
+def _certified_cursor(**changes):
+    return replace(_cert("cursor", "grok-4.7-high", "blocking", candidate=True),
+                   status="certified", **changes)
+
+
+def _candidate_cursor_registry(tmp_path, monkeypatch):
+    registry = json.loads(g._CERTIFICATION_REGISTRY.read_text())
+    for item in registry["certifications"]:
+        if item["provider"] == "cursor":
+            item["status"] = "candidate"
+            item.pop("report", None)
+    path = tmp_path / "candidate-registry.json"
+    path.write_text(json.dumps(registry))
+    monkeypatch.setattr(g, "_CERTIFICATION_REGISTRY", path)
+
+
+def test_portable_prefers_certified_cursor_without_env_selection(monkeypatch):
+    cursor = _certified_cursor()
+    codex = _cert("codex", g.codex_model(), "blocking")
+    monkeypatch.setattr(g, "load_reviewer_certifications",
+                        lambda: ("portable-review-v2", (codex, cursor)))
+    monkeypatch.setenv("CURSOR_REVIEW_MODEL", "gpt-5.3-codex")
+    plan, err = g.resolve_portable_review_plan("portable")
+    assert not err and plan is not None
+    assert [c.provider for c in plan] == ["codex", "cursor"]
+    assert [c.family for c in plan] == ["openai", "xai"]
+    assert all(c.attestation == "declared" for c in plan)
+
+
+def test_ambiguous_certified_cursor_records_fail_without_fallback(monkeypatch):
+    cursor = _certified_cursor()
+    monkeypatch.setattr(g, "load_reviewer_certifications",
+                        lambda: ("portable-review-v2", (cursor, cursor)))
+    plan, err = g.resolve_portable_review_plan("portable")
+    assert plan is None and "неоднознач" in err
+
+
+def test_invalid_declared_base_pair_is_rejected_before_verified_gemini(monkeypatch):
+    cursor = _certified_cursor(adapter="legacy-cursor")
+    codex = _cert("codex", g.codex_model(), "blocking")
+    gemini = replace(_cert("gemini", "gemini-2.5-pro", "blocking", candidate=True),
+                     status="certified")
+    monkeypatch.setattr(g, "load_reviewer_certifications",
+                        lambda: ("portable-review-v2", (cursor,)))
+    monkeypatch.setattr(
+        g, "reviewer_certification",
+        lambda provider, _model, role, **_kw: {
+            "codex": codex, "cursor": cursor, "gemini": gemini,
+        }.get(provider) if role == "blocking" else None,
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "synthetic")
+    plan, err = g.resolve_portable_review_plan("gemini")
+    assert plan is None and "базов" in err
+
+
+def test_cursor_cert_dispatches_requested_model_to_certified_adapter(monkeypatch):
+    cert = _cert("cursor", "grok-4.7-high", "blocking", candidate=True)
+    seen = []
+
+    def fake(diff, *, requested_model, role, allow_candidate=False):
+        seen.append((diff, requested_model, allow_candidate))
+        return _CLEAN, requested_model, "", {"outputTokens": 3}, "ok"
+
+    monkeypatch.setattr(g, "run_cursor_review_text", fake)
+    run = g.run_certified_reviewer(cert, "HEAD~1", "HEAD")
+    assert run.status == "ok" and run.actual_models == (cert.requested_model,)
+    assert seen and seen[0][1:] == (cert.requested_model, False)
+
+
+def test_wrong_cursor_adapter_never_dispatches(monkeypatch):
+    cert = replace(_cert("cursor", "grok-4.7-high", "blocking", candidate=True),
+                   adapter="legacy-cursor")
+    monkeypatch.setattr(g, "run_cursor_review_text",
+                        lambda *_a, **_kw: pytest.fail("wrong adapter dispatched"))
+    run = g.run_certified_reviewer(cert, "HEAD~1", "HEAD")
+    assert run.status == "unavailable" and "adapter" in run.detail
+
+
+def test_certified_cursor_uses_requested_model_and_sterile_process(monkeypatch):
+    cert = _cert("cursor", "grok-4.7-high", "blocking", candidate=True)
+    monkeypatch.setattr(g, "reviewer_certification",
+                        lambda *_a, **_kw: cert)
+    monkeypatch.setattr(g, "_resolve_certified_cursor_bin", lambda: "/opt/cursor-agent")
+    monkeypatch.setattr(g, "_sterile_mkdtemp", lambda _prefix: "/tmp/gates-cursor-sterile")
+    monkeypatch.setattr(g, "_certified_subprocess_env", lambda: {"SAFE": "1"})
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(cmd=cmd, **kwargs)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "result": _CLEAN, "usage": {"inputTokens": 10, "outputTokens": 3},
+        }), stderr="")
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    removed = []
+    monkeypatch.setattr(g.shutil, "rmtree",
+                        lambda path, ignore_errors: removed.append((path, ignore_errors)))
+    monkeypatch.setenv("CURSOR_REVIEW_MODEL", "gpt-5.3-codex")
+    text, actual, detail, usage, status = g.run_cursor_review_text(
+        "diff", requested_model=cert.requested_model)
+    assert status == "ok" and text.strip() == _CLEAN.strip() \
+        and actual == cert.requested_model and not detail
+    assert usage["outputTokens"] == 3
+    assert captured["cmd"][:7] == [
+        "/opt/cursor-agent", "-p", "--output-format", "json", "--mode", "ask", "--trust",
+    ]
+    assert captured["cmd"][7:9] == ["--model", cert.requested_model]
+    assert captured["cwd"] == "/tmp/gates-cursor-sterile"
+    assert captured["env"] == {"SAFE": "1"}
+    assert removed == [("/tmp/gates-cursor-sterile", True)]
+
+
+def test_certified_cursor_sterile_cwd_failure_never_runs_in_repo(monkeypatch):
+    cert = _cert("cursor", "grok-4.7-high", "blocking", candidate=True)
+    monkeypatch.setattr(g, "reviewer_certification", lambda *_a, **_kw: cert)
+    monkeypatch.setattr(g, "_resolve_certified_cursor_bin", lambda: "/opt/cursor-agent")
+    monkeypatch.setattr(g, "_sterile_mkdtemp", lambda _prefix: None)
+    monkeypatch.setattr(g.subprocess, "run",
+                        lambda *_a, **_kw: pytest.fail("Cursor ran without sterile cwd"))
+    text, _actual, detail, _usage, status = g.run_cursor_review_text(
+        "diff", requested_model=cert.requested_model)
+    assert text is None and status == "unavailable" and "стерильный cwd" in detail
+
+
+def test_certified_cursor_resolver_rejects_repo_symlink_and_path_shim(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    binary = home / ".local" / "bin" / "cursor-agent"
+    binary.parent.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    shim = repo / "cursor-agent"
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+    shim_case_variant = repo.with_name(repo.name.upper()) / "cursor-agent"
+    if not shim_case_variant.exists():
+        pytest.skip("case-variant identity требует case-insensitive FS")
+    binary.symlink_to(shim_case_variant)
+    path_shim = tmp_path / "path-bin" / "cursor-agent"
+    path_shim.parent.mkdir()
+    path_shim.write_text("#!/bin/sh\nexit 0\n")
+    path_shim.chmod(0o755)
+    monkeypatch.setattr(g, "_trusted_home", lambda: home)
+    monkeypatch.setattr(g, "REPO_ROOT", repo)
+    monkeypatch.setenv("PATH", str(path_shim.parent))
+    assert g._resolve_certified_cursor_bin() is None
+
+
+def test_cursor_corpus_runner_uses_production_adapter_for_every_case(monkeypatch):
+    corpus = cr.load_corpus()
+    expected = {case["diff"]: case["expect_blocking"] for case in corpus["cases"]}
+    seen = []
+
+    def fake_review(diff, *, requested_model, allow_candidate):
+        seen.append((diff, requested_model, allow_candidate))
+        text = _BLOCK if expected[diff] else _CLEAN
+        return text, requested_model, "", {"outputTokens": 5}, "ok"
+
+    monkeypatch.setattr(g, "run_cursor_review_text", fake_review)
+    rc, report = cr.run_provider("cursor", 2)
+    assert rc == 0 and report["pass"] is True
+    assert len(report["results"]) == len(corpus["cases"]) * 2 == len(seen)
+    assert report["actual_models"] == ["grok-4.7-high"]
+    assert all(model == "grok-4.7-high" and allowed is True
+               for _diff, model, allowed in seen)
+
+
 def test_model_family_is_closed_and_unknown_fails_closed():
     assert g.model_family("claude-opus-5") == "anthropic"
     assert g.model_family("gpt-5.6-sol-high") == "openai"
-    assert g.model_family("cursor-grok-4.5-high") == "xai"
+    assert g.model_family("grok-4.7-high") == "xai"
     assert g.model_family("gemini-2.5-pro") == "google"
     assert g.model_family("auto") == "unknown"
     assert g.model_family("new-provider-model") == "unknown"
@@ -74,10 +240,8 @@ def test_shipped_registry_is_strict_and_gemini_stays_candidate():
     candidate = g.reviewer_certification(
         "gemini", "gemini-2.5-pro", "blocking", allow_candidate=True)
     assert candidate is not None and candidate.status == "candidate"
-    assert g.reviewer_certification(
-        "cursor", "cursor-grok-4.5-high", "blocking") is None
-    assert _cert(
-        "cursor", "cursor-grok-4.5-high", "blocking", candidate=True).family == "xai"
+    cursor = _cert("cursor", "grok-4.7-high", "blocking")
+    assert cursor.status == "certified" and cursor.family == "xai"
     assert _cert("claude", CLAUDE_REQUESTED, "blocking").roles == ("blocking",)
 
 
@@ -108,21 +272,22 @@ def test_multi_actual_model_certification_is_rejected_by_loader(tmp_path, monkey
     assert g.load_reviewer_certifications() == (None, ())
 
 
-def test_b14_portable_needs_neither_gemini_key_nor_cursor(monkeypatch):
-    """B14/§3: пара самодостаточна — ни ключ Gemini, ни Cursor CLI не требуются и не
-    упоминаются в отказах. Ровно та боль, из-за которой политика и переписывалась."""
+def test_b14_portable_needs_neither_gemini_key_nor_cursor_binary(monkeypatch):
+    """C1/C2: план строится по реестру, без Gemini key и без запуска Cursor binary."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
     plan, err = g.resolve_portable_review_plan("portable")
     assert plan is not None and not err
-    assert [c.provider for c in plan] == ["codex", "claude"]
-    assert [c.family for c in plan] == ["openai", "anthropic"]
+    assert [c.provider for c in plan] == ["codex", "cursor"]
+    assert [c.family for c in plan] == ["openai", "xai"]
 
 
-def test_portable_does_not_treat_unattested_cursor_as_certified(monkeypatch):
-    """P12: Cursor не аттестует фактическую модель → в blocking-панель не входит никогда."""
+def test_portable_does_not_treat_candidate_cursor_as_certified(tmp_path, monkeypatch):
+    """C4: candidate с установленным бинарём не заменяет Codex+Claude."""
+    _candidate_cursor_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: "/opt/cursor-agent")
+    assert g._cursor_blocking_certifications() == []
     plan, err = g.resolve_portable_review_plan("portable")
     assert plan is not None and "cursor" not in [c.provider for c in plan]
 
@@ -137,7 +302,7 @@ def test_b5_gemini_profile_adds_to_pair_never_replaces_it(monkeypatch):
     assert plan2 is not None and not err2            # но пара при этом работает
 
 
-def test_portable_profiles_and_panel_guards(monkeypatch):
+def test_portable_profiles_and_panel_guards(tmp_path, monkeypatch):
     codex = _cert("codex", g.codex_model(), "blocking")
     claude = _cert("claude", CLAUDE_REQUESTED, "blocking")
     gemini = replace(_cert("gemini", "gemini-2.5-pro", "blocking", candidate=True),
@@ -147,6 +312,7 @@ def test_portable_profiles_and_panel_guards(monkeypatch):
         ("claude", CLAUDE_REQUESTED, "blocking"): claude,
         ("gemini", "gemini-2.5-pro", "blocking"): gemini,
     }
+    _candidate_cursor_registry(tmp_path, monkeypatch)
     monkeypatch.setattr(
         g, "reviewer_certification",
         lambda provider, model, role, **_kwargs: certs.get((provider, model, role)),
@@ -498,7 +664,7 @@ def test_claude_resolver_supports_nvm_install(tmp_path, monkeypatch):
 def test_old_blocking_only_cache_cannot_satisfy_portable_panel(
         tmp_path, monkeypatch):
     monkeypatch.setattr(g, "LEDGER_DIR", tmp_path)
-    blocking = _cert("cursor", "cursor-grok-4.5-high", "blocking", candidate=True)
+    blocking = _cert("cursor", "grok-4.7-high", "blocking", candidate=True)
     supplemental = _cert("claude", CLAUDE_REQUESTED, "blocking")
     old_panel = [g._cert_cache_record(blocking, "blocking")]
     portable_panel = old_panel + [g._cert_cache_record(supplemental, "supplemental")]
@@ -566,17 +732,6 @@ def test_ambiguous_cert_never_dispatches(monkeypatch):
     run = g.run_certified_reviewer(cert, "HEAD~1", "HEAD")
     assert run.status == "invalid"
     assert "ровно одну" in run.detail
-
-
-def test_cursor_cert_never_dispatches_from_certified_path(monkeypatch):
-    cert = _cert("cursor", "cursor-grok-4.5-high", "blocking", candidate=True)
-    monkeypatch.setattr(
-        g, "run_cursor_review",
-        lambda *_args: pytest.fail("unattested Cursor reached certified adapter"),
-    )
-    run = g.run_certified_reviewer(cert, "HEAD~1", "HEAD")
-    assert run.status == "unavailable"
-    assert "не аттестует actual model" in run.detail
 
 
 @pytest.fixture()
@@ -675,7 +830,7 @@ def test_default_portable_enters_real_dispatch_and_both_adapters(
     monkeypatch.delenv("REVIEW_PROVIDER", raising=False)
     monkeypatch.setattr(g, "resolve_portable_review_plan", _REAL_RESOLVE_PORTABLE)
     monkeypatch.setattr(g, "run_certified_reviewer", _REAL_RUN_CERTIFIED)
-    monkeypatch.setattr(g, "_resolve_claude_bin", lambda: "/bin/sh")
+    monkeypatch.setattr(g, "_resolve_certified_cursor_bin", lambda: "/opt/cursor-agent")
     seen = []
 
     def fake_companion(args, **_kw):
@@ -684,20 +839,19 @@ def test_default_portable_enters_real_dispatch_and_both_adapters(
             "status": 0, "rawOutput": _CLEAN}))
 
     def fake_run(cmd, **_kwargs):
-        if cmd and cmd[0] == "/bin/sh":
-            seen.append("claude")
+        if cmd and cmd[0] == "/opt/cursor-agent":
+            seen.append("cursor")
             return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({
-                "is_error": False, "result": _CLEAN,
-                "modelUsage": {CLAUDE_MODEL: {"inputTokens": 1, "outputTokens": 200}}}))
+                "result": _CLEAN, "usage": {"inputTokens": 1, "outputTokens": 200}}))
         return _fake_git(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(g, "_exec_companion", fake_companion)
     monkeypatch.setattr(g.subprocess, "run", fake_run)
     assert g.check_reviewed_cli() == 0
-    assert sorted(seen) == ["claude", "codex"], "оба члена пары обязаны отработать"
+    assert sorted(seen) == ["codex", "cursor"], "оба члена пары обязаны отработать"
     audit_text = g.AUDIT_LOG.read_text()
     assert "role=blocking provider=codex" in audit_text
-    assert "role=blocking provider=claude" in audit_text
+    assert "role=blocking provider=cursor" in audit_text
 
 
 def test_b7_missing_claude_artifact_blocks_without_downgrade(portable_gate, monkeypatch):

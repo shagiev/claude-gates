@@ -60,12 +60,14 @@ codex plugin add gates@lenar-gates
 (с локального клона: `codex plugin marketplace add <путь-к-клону>`.) На Codex CLI 0.146.0
 проверен полный install/activation smoke: доставленный плагином PreToolUse hook перехватывает
 реальный `apply_patch`, возвращает блокирующий `exit 2`, а причина доходит до модели.
-Portable runtime уже имеет прямой Gemini HTTPS adapter (`GOOGLE_API_KEY`/`GEMINI_API_KEY`) и
-обязательный отдельный Claude supplemental adapter. Gemini и Cursor пока имеют статус `candidate`:
-первый ждёт живого corpus-прогона, второй не аттестует actual model в JSON CLI. Поэтому resolver
-честно блокируется, а не объявляет непроверенную модель независимой. Cursor остаётся опциональным
-legacy-adapter, а не зависимостью установки; portable resolver не включит его даже простой
-сменой registry status без нового attesting adapter.
+Portable runtime имеет прямой Gemini HTTPS adapter (`GOOGLE_API_KEY`/`GEMINI_API_KEY`) и
+детерминированно выбирает одну обязательную пару: Codex+Cursor при единственной certified
+Cursor-записи, иначе Codex+Claude. Cursor проходит тот же certification corpus, что и остальные
+blocking-ревьюеры, и вызывается с requested model из реестра через изолированный trusted-binary
+adapter. Cursor и Codex имеют `declared`-аттестацию: CLI возвращает requested slug, а не
+фактическую модель провайдера. Две такие записи допускаются только для точной пары
+`codex-companion/openai` + `cursor-cli/xai` по явному решению владельца; любая другая панель без
+`verified` блокируется. Candidate/ambiguous Cursor не даёт слота и не выбирается по порядку JSON.
 Если `REVIEW_PROVIDER` не задан, universal default — `portable`; legacy
 `REVIEW_PROVIDER=codex|cursor|both` доступен только как явный режим совместимости.
 Для существующего онбординга это намеренная fail-closed миграция: пока Gemini остаётся

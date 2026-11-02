@@ -2419,7 +2419,7 @@ def _empirical_gate(baseline: str, head: str) -> int:
 _LEGACY_PROVIDERS = ("codex", "cursor", "both")
 _PORTABLE_PROFILES = ("portable", "strong", "gemini")
 _PROVIDERS = _LEGACY_PROVIDERS + _PORTABLE_PROFILES
-_CURSOR_MODEL = "cursor-grok-4.5-high"     # другое СЕМЕЙСТВО, чем codex (gpt-5.6-sol) → разнообразие
+_CURSOR_MODEL = "grok-4.7-high"            # другое СЕМЕЙСТВО, чем codex (gpt-5.6-sol) → разнообразие
 _CURSOR_TIMEOUT_S = 600
 _CURSOR_DIFF_LIMIT = 300_000
 _GEMINI_MODEL = "gemini-2.5-pro"
@@ -2444,7 +2444,7 @@ _MIN_CERT_REPETITIONS = 2
 # Разрешены ТОЛЬКО не-Anthropic модели: Claude пишет код в этом контуре, Claude-ревьюер молча
 # превращает независимый гейт в самопроверку. `auto` запрещён — скрытая маршрутизация.
 _CURSOR_MODEL_ALLOW = frozenset({
-    "cursor-grok-4.5-high", "cursor-grok-4.5-high-fast", "cursor-grok-4.5-low",
+    "cursor-grok-4.5-high", "cursor-grok-4.5-high-fast", "cursor-grok-4.5-low", "grok-4.7-high",
     "gpt-5.3-codex", "gpt-5.3-codex-high", "gpt-5.3-codex-high-fast", "gpt-5.3-codex-xhigh",
     "gpt-5.2", "gpt-5.4-high", "gpt-5.4-high-fast", "gpt-5.5-high", "gpt-5.5-high-fast",
     "gpt-5.6-sol-high", "gpt-5.6-sol-high-fast", "gpt-5.6-sol-xhigh",
@@ -2990,6 +2990,75 @@ def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
     return (normalized, f"model={model}")
 
 
+def _resolve_certified_cursor_bin() -> "str | None":
+    """Cursor для blocking-панели: только фиксированные пути, без PATH и repo-local shim."""
+    home = _trusted_home()
+    candidates = (home / ".local" / "bin" / "cursor-agent",
+                  Path("/opt/homebrew/bin/cursor-agent"), Path("/usr/local/bin/cursor-agent"))
+    for candidate in candidates:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if _inside_repo(candidate) or _inside_repo(resolved):
+            return None
+        return str(resolved)
+    return None
+
+
+def run_cursor_review_text(diff_text: str, *, requested_model: str, role: str = "blocking",
+                           allow_candidate: bool = False
+                           ) -> "tuple[str | None, str, str, dict, str]":
+    """Certified Cursor adapter; requested slug остаётся declared, не verified."""
+    cert = reviewer_certification("cursor", requested_model, role,
+                                  allow_candidate=allow_candidate)
+    if cert is None or cert.adapter != "cursor-cli":
+        return (None, requested_model, "нет certified Cursor CLI model для роли blocking",
+                {}, "unavailable")
+    if len(diff_text) > _CURSOR_DIFF_LIMIT:
+        return (None, requested_model,
+                f"дифф {len(diff_text)} символов > лимита {_CURSOR_DIFF_LIMIT}",
+                {}, "invalid")
+    binary = _resolve_certified_cursor_bin()
+    if binary is None:
+        return (None, requested_model,
+                "cursor-agent не найден в доверенных каталогах или путь ведёт в репозиторий",
+                {}, "unavailable")
+    cmd = [binary, "-p", "--output-format", "json", "--mode", "ask", "--trust",
+           "--model", requested_model, _build_cursor_prompt(diff_text)]
+    sterile_cwd = _sterile_mkdtemp("gates-cursor-cwd-")
+    if sterile_cwd is None:
+        return (None, requested_model, "не создать стерильный cwd вне репозитория",
+                {}, "unavailable")
+    try:
+        r = subprocess.run(cmd, cwd=sterile_cwd, env=_certified_subprocess_env(),
+                           capture_output=True, text=True, timeout=_CURSOR_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return (None, requested_model, f"таймаут {_CURSOR_TIMEOUT_S}s", {}, "unavailable")
+    except OSError as e:
+        return (None, requested_model, redact_secrets(f"{type(e).__name__}: {e}"),
+                {}, "unavailable")
+    finally:
+        shutil.rmtree(sterile_cwd, ignore_errors=True)
+    if r.returncode != 0:
+        return (None, requested_model,
+                redact_secrets((r.stderr or r.stdout or "").strip())[:300], {}, "unavailable")
+    try:
+        env = json.loads((r.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return (None, requested_model, "вывод cursor-agent не JSON", {}, "invalid")
+    usage = env.get("usage") or {}
+    audit(f"cursor-review bin={binary} model={requested_model} in={usage.get('inputTokens')} "
+          f"out={usage.get('outputTokens')}")
+    normalized = normalize_reviewer_text(env.get("result") or "")
+    if normalized is None:
+        return (None, requested_model,
+                "ответ не в контракте (нет ровно одного 'Verdict:')", usage, "invalid")
+    return (normalized, requested_model, "", usage, "ok")
+
+
 def _gemini_api_key() -> "str | None":
     # Официальный приоритет Google SDK: GOOGLE_API_KEY над GEMINI_API_KEY. Значение никогда
     # не возвращается в diagnostics/audit и не помещается в URL/argv.
@@ -3030,24 +3099,37 @@ def _cert_cache_record(cert: ReviewerCertification, role: str) -> dict:
     }
 
 
+def _cursor_blocking_certifications() -> list[ReviewerCertification]:
+    _policy, certs = load_reviewer_certifications()
+    return [c for c in certs
+            if c.provider == "cursor" and c.status == "certified" and "blocking" in c.roles]
+
+
+def _base_pair_shape(pair) -> frozenset:
+    return frozenset((c.provider, c.adapter, c.family) for c in pair)
+
+
 def resolve_portable_review_plan(profile: str
                                  ) -> "tuple[tuple[ReviewerCertification, ...] | None, str]":
-    """Blocking certs + final Claude supplemental cert. No repo config/provider auto-routing."""
+    """Две независимые blocking-записи; certified Cursor предпочтителен при наличии."""
     if profile not in {"portable", "strong", "gemini"}:
         return (None, f"неизвестный portable profile {profile!r}")
     if profile == "strong":
         return (None, "[codex-gate] ✗ профиль `strong` ещё не реализован: нужен второй "
                       "аттестующий actual model independent adapter (direct xAI/local)")
-    # §3: обязательная ПАРА строится безусловно, ДО чтения любого окружения. Обе возможные
-    # авторские семьи представлены, поэтому каждый кусок диффа судит как минимум один
-    # независимый ревьюер — при любом и недоказуемом авторстве. Определения хоста нет нигде:
-    # хост сессии не доказывает авторство диапазона коммитов (возражение ревью ред. 1).
+    cursor_records = _cursor_blocking_certifications()
+    if len(cursor_records) > 1:
+        return (None, "[codex-gate] ✗ certified Cursor blocking-записи неоднозначны: "
+                      "ожидалась максимум одна, fallback по порядку реестра запрещён")
     codex = reviewer_certification("codex", codex_model(), "blocking")
-    claude = reviewer_certification("claude", claude_blocking_model(), "blocking")
-    if codex is None or claude is None:
-        missing = ", ".join(n for n, c in (("codex", codex), ("claude", claude)) if c is None)
-        # Запись могла быть ПОНИЖЕНА из-за разошедшейся связки отчёта — без этой подсказки
-        # оператор видит «нет certified записи» и вслепую перезапускает сертификацию.
+    if cursor_records:
+        second = cursor_records[0]
+        second_name = "cursor"
+    else:
+        second = reviewer_certification("claude", claude_blocking_model(), "blocking")
+        second_name = "claude"
+    if codex is None or second is None:
+        missing = ", ".join(n for n, c in ((("codex", codex), (second_name, second))) if c is None)
         claude_any = claude_blocking_model(allow_candidate=True)
         demoted = [n for n, m in (("codex", codex_model()), ("claude", claude_any))
                    if reviewer_certification(n, m, "blocking") is None
@@ -3061,10 +3143,24 @@ def resolve_portable_review_plan(profile: str
                       "было бы саморевью на коде того же семейства. Прогони certification "
                       f"suite (`certify_reviewers.py --provider <name>`) и закоммить отчёт.{hint}"
                       f"{_claude_registry_ambiguity()}")
-    panel = [codex, claude]
-    # §4: REVIEW_PROVIDER больше НЕ выбирает панель — только ДОБАВЛЯЕТ сертифицированного
-    # ревьюера. Раньше агент, запускающий деплой, отключал обязательность пары той же
-    # переменной, которую сам и выставляет (возражение ревью ред. 2).
+    panel = [codex, second]
+    cursor_shape = frozenset({
+        ("codex", "codex-companion", "openai"),
+        ("cursor", "cursor-cli", "xai"),
+    })
+    claude_shape = frozenset({
+        ("codex", "codex-companion", "openai"),
+        ("claude", "claude-cli", "anthropic"),
+    })
+    shape = _base_pair_shape(panel)
+    if shape not in (cursor_shape, claude_shape):
+        return (None, "[codex-gate] ✗ неверная базовая blocking-пара: требуются точные "
+                      "provider/adapter/family Codex+Cursor или Codex+Claude")
+    if not any(cert.attestation == "verified" for cert in panel) and shape != cursor_shape:
+        return (None, "[codex-gate] ✗ в базовой blocking-панели нет ни одной `verified` записи: "
+                      "две `declared` разрешены только для Codex companion + Cursor CLI")
+    # Gemini добавляется только после полной независимой проверки базовой пары: его verified
+    # статус не легализует чужой adapter или две declared-записи вне разрешённой пары.
     if profile == "gemini":
         gemini_model = (os.environ.get("GEMINI_REVIEW_MODEL") or _GEMINI_MODEL).strip()
         gemini = reviewer_certification("gemini", gemini_model, "blocking")
@@ -3077,11 +3173,6 @@ def resolve_portable_review_plan(profile: str
     families = [cert.family for cert in panel]
     if len(set(families)) != len(families) or "unknown" in families:
         return (None, "[codex-gate] ✗ blocking-панель содержит повтор семейства или unknown")
-    # Граница остатка M8 была описана словами, но не проверялась: правкой реестра ОБА слота
-    # могли стать `declared`, и панель осталась бы без единой аттестованной модели.
-    if not any(cert.attestation == "verified" for cert in panel):
-        return (None, "[codex-gate] ✗ в blocking-панели нет ни одной `verified` записи: "
-                      "`declared` допускается только рядом с аттестованным членом (остаток M8)")
     return (tuple(panel), "")
 
 
@@ -4136,19 +4227,18 @@ def run_certified_reviewer(cert: ReviewerCertification, base: str, head: str) ->
         return ReviewerRun("blocking", cert.provider, cert.requested_model, (), cert.family,
                            cert.certification_id, "invalid",
                            detail="certification должна иметь ровно одну однозначную role")
-    if cert.provider == "gemini":
+    if (cert.provider, cert.adapter) == ("gemini", "gemini-api"):
         return run_gemini_review(base, head)
-    if cert.provider == "claude":
+    if (cert.provider, cert.adapter) == ("claude", "claude-cli"):
         # модель — из ЭТОЙ записи: по умолчанию адаптер берёт blocking-модель реестра, и
         # supplemental-запись другой модели искалась бы под чужим именем (всегда unavailable)
         return _run_text_reviewer(cert, role, base, head, functools.partial(
             run_claude_review_text, requested_model=cert.requested_model))
-    if cert.provider == "codex":
+    if (cert.provider, cert.adapter) == ("codex", "codex-companion"):
         return _run_text_reviewer(cert, role, base, head, run_codex_review_text)
-    if cert.provider == "cursor":
-        return ReviewerRun(role, cert.provider, cert.requested_model, (), cert.family,
-                           cert.certification_id, "unavailable",
-                           detail="Cursor CLI не аттестует actual model; только legacy adapter")
+    if (cert.provider, cert.adapter) == ("cursor", "cursor-cli"):
+        return _run_text_reviewer(cert, role, base, head, functools.partial(
+            run_cursor_review_text, requested_model=cert.requested_model))
     return ReviewerRun(role, cert.provider, cert.requested_model, (), cert.family,
                        cert.certification_id, "unavailable",
                        detail=f"adapter {cert.adapter!r} не реализован")
@@ -4331,8 +4421,8 @@ def check_reviewed_cli() -> int:
         # §4: легаси-значения означали «панель МЕНЬШЕ обязательной пары», а такой панели больше
         # нет. Тихо понижать нельзя — это и был env-обход обязательности (money-case M3).
         print(f"[codex-gate] ✗ REVIEW_PROVIDER={raw_provider!r} больше не поддерживается на "
-              "деплой-пути: панель Codex+Claude обязательна, и переменной окружения её понизить "
-              "нельзя (это был обход независимости). Допустимы только профили, ДОБАВЛЯЮЩИЕ "
+              "деплой-пути: обязательная независимая пара не выбирается и не понижается "
+              "переменной окружения (это был обход независимости). Допустимы только профили, ДОБАВЛЯЮЩИЕ "
               f"ревьюера: {'|'.join(_PORTABLE_PROFILES)}. Аварийный выход — CODEX_REVIEW_SKIP=1 "
               "(громкий и аудируемый).", file=sys.stderr)
         return 2

@@ -12,6 +12,18 @@ coexistence требуют одинаковый delivery digest. Поставл�
 Server API, машиночитаемый transcript и crash-safe API-owned recovery без raw rewrite общего
 `installed.json`. Дизайн: `docs/2026-11-01-kimi-host-support-design.md`.
 
+## 0.10.8 — 2026-11-02
+
+Portable deploy-review работает без Anthropic API: при единственной certified Cursor-записи
+обязательная панель — Codex+Cursor (OpenAI+xAI), иначе прежняя Codex+Claude. Cursor получил
+production/certification adapter с моделью `grok-4.7-high` из реестра, trusted binary/cwd/env и
+`_diff_text`.
+По явному решению владельца две `declared`-аттестации разрешены только для точной пары
+`codex-companion` + `cursor-cli`; другие панели без `verified` по-прежнему блокируются.
+Несколько certified Cursor-записей, неверный provider/adapter/family и outage адаптера —
+fail-closed, без fallback после частичного раунда. Дизайн и BSAC:
+`docs/2026-11-02-codex-cursor-portable-pair-design.md`.
+
 ## 0.10.7 — 2026-10-19
 
 Большие дизайны снова ревьюятся. 0.10.6 отказывала дизайнам больше 100 КБ, а замер показал, что

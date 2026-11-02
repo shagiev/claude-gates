@@ -62,17 +62,23 @@
     {
       "provider": "cursor",
       "adapter": "cursor-cli",
-      "requested_model": "cursor-grok-4.5-high",
+      "requested_model": "grok-4.7-high",
       "actual_models": [
-        "cursor-grok-4.5-high"
+        "grok-4.7-high"
       ],
       "family": "xai",
       "roles": [
         "blocking"
       ],
-      "certification_id": "cursor-grok-4.5-high-candidate-20260730",
-      "status": "candidate",
-      "attestation": "declared"
+      "certification_id": "grok-4.7-high-candidate-20261102",
+      "status": "certified",
+      "attestation": "declared",
+      "report": {
+        "path": "reports/grok-4.7-high-candidate-20261102.json",
+        "sha256": "6765b935f8f5e2b28e50c03ff293be41a992caa12af6157c325475d7d3e8c050",
+        "corpus_sha256": "db8df53c685ef38fcc15693a77257fb6830a7aacf5412ae65419f7d825ea2a37",
+        "repetitions": 2
+      }
     },
     {
       "provider": "claude",

@@ -219,9 +219,10 @@ def _gates_test_isolation(monkeypatch, tmp_path):
         monkeypatch.delenv(_secret_var, raising=False)
     monkeypatch.delenv("GEMINI_REVIEW_MODEL", raising=False)
     # Та же защита от случайного live-spend, что CODEX_COMPANION_CMD ниже: тест, забывший
-    # подменить Claude adapter, обязан получить deterministic unavailable, а не запустить CLI.
+    # подменить любой reviewer adapter, получает deterministic unavailable, а не живой CLI.
     monkeypatch.setattr(g, "_resolve_claude_bin", lambda: None)
     monkeypatch.setattr(g, "_resolve_cursor_bin", lambda: None)
+    monkeypatch.setattr(g, "_resolve_certified_cursor_bin", lambda: None)
     # В проде git закреплён абсолютным путём и санированным окружением (F19/F22). Тесты же
     # подменяют subprocess.run и опознают вызов по имени `git`, поэтому здесь _trusted_git
     # делегирует привычной форме — иначе пришлось бы переписывать все фейки, не проверяя
@@ -231,8 +232,8 @@ def _gates_test_isolation(monkeypatch, tmp_path):
         capture_output=True, text=True))
     monkeypatch.setattr(g, "_trusted_git_bytes", lambda *args, cwd=None: g.subprocess.run(
         ["git", *args], cwd=str(cwd) if cwd else g.REPO_ROOT, capture_output=True))
-    # Легаси-значения (codex|cursor|both) сняты с деплой-пути: панель Codex+Claude обязательна
-    # и переменной окружения не понижается (§4 дизайна 2026-08-07). Дефолт тестов — portable.
+    # Легаси-значения (codex|cursor|both) сняты с деплой-пути: обязательная независимая пара
+    # переменной окружения не выбирается и не понижается. Дефолт тестов — portable.
     monkeypatch.setenv("REVIEW_PROVIDER", "portable")
     # см. F11: resolved-by-user принимается только из интерактивного терминала;
     # тестам протокола он эмулируется, запрет проверяется точечным тестом.
@@ -279,7 +280,7 @@ def _gates_test_isolation(monkeypatch, tmp_path):
 
 @pytest.fixture()
 def clean_pair(monkeypatch):
-    """Обязательная blocking-пара (Codex+Claude) отрабатывает чисто.
+    """Выбранная обязательная blocking-пара отрабатывает чисто.
 
     Нужна тестам деплой-пути, которые проверяют НЕ ревью, а его последствия (вердикт, ledger,
     reviewed-sha). Раньше им хватало одного shell-стаба companion; теперь панель обязательна,

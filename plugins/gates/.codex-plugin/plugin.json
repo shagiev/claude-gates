@@ -1,6 +1,6 @@
 {
   "name": "gates",
-  "version": "0.11.0+codex.20261101",
+  "version": "0.11.0+codex.20261103",
   "description": "Cross-host review gates preview for Claude Code and Codex.",
   "author": {
     "name": "Ленар"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Gates",
     "shortDescription": "Cross-host independent review gates preview.",
-    "longDescription": "Installable for Claude Code and Codex. Deploy review runs a mandatory blocking pair (Codex + Claude) certified against the shipped corpus; no third-party API key is required. Gemini and Cursor are optional additions, never replacements.",
+    "longDescription": "Installable for Claude Code and Codex. Deploy review runs a mandatory blocking pair (Codex + Cursor or Codex + Claude) certified against the shipped corpus; no third-party API key is required. Gemini is an optional addition, never a replacement.",
     "developerName": "Ленар",
     "category": "Developer Tools",
     "capabilities": [
