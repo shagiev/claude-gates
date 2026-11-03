@@ -696,7 +696,7 @@ def test_chain_instructions_mention_every_pass_and_runner(repo):
         assert lg._PASS_RUNNER[p] in msg, p
     assert lg._RUNNER_RULE in msg
     # команды печатаются в исполнимой форме (через шим), иначе copy-paste даёт command not found
-    assert "bash .githooks/gates-run ladder_gate.py begin" in msg
+    assert "/bin/sh .githooks/gates-run ladder_gate.py begin" in msg
 
 
 def test_chain_instructions_do_not_invent_shim_path(repo):
@@ -718,7 +718,7 @@ def test_begin_prints_runner_banner_in_runnable_form(repo, capsys):
     captured = capsys.readouterr()
     assert "begin simplify" in captured.err
     assert lg._PASS_RUNNER["simplify"] in captured.err
-    assert "bash .githooks/gates-run ladder_gate.py mark simplify" in captured.err
+    assert "/bin/sh .githooks/gates-run ladder_gate.py mark simplify" in captured.err
     assert captured.out == ""          # на пустом stdout держится машиночитаемость CLI
 
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.0 — 2026-11-02
+
+Добавлен Kimi Code как третий host общего AI SDLC. Native+global одинаковые G1 hooks дедуплицируются
+Kimi; gate-owned dispatcher и resolver вычисляют home через OS account, не используют worktree или
+caller-controlled HOME/PATH/PYTHON*, проверяют digest, registry/manifest/siblings/bytecode и при
+coexistence требуют одинаковый delivery digest. Поставляются Skills и команды
+`/gates:design-review`, `/gates:simplify`, `/gates:security-review`, `/gates:code-review`,
+`/gates:gates-init`; независимое ревью остаётся вне Kimi. Одноразовый nonce-handoff связывает Bash
+`write-marker`/ladder с `session_id` hook. Artifact-bound live acceptance использует официальный
+Server API, машиночитаемый transcript и crash-safe API-owned recovery без raw rewrite общего
+`installed.json`. Дизайн: `docs/2026-11-01-kimi-host-support-design.md`.
+
 ## 0.10.7 — 2026-10-19
 
 Большие дизайны снова ревьюятся. 0.10.6 отказывала дизайнам больше 100 КБ, а замер показал, что

@@ -30,14 +30,15 @@ try:
     from codex_review_gate import (is_code_path, _trusted_git, TrustedGitError,
                                    _trusted_git_bin, _trusted_home, _GIT_ENV_ALLOW,
                                    _GIT_SAFE_ENV, _GIT_NEUTRALIZE, _TRUSTED_PATH_DIRS,
-                                   _bootstrap_git, _has_git_marker, redact_secrets, _timed)
+                                   _bootstrap_git, _has_git_marker, redact_secrets, _timed,
+                                   _env_session)
 except ImportError:                                    # запуск как голый скрипт
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from codex_review_gate import (is_code_path, _trusted_git,  # type: ignore[no-redef]
                                    TrustedGitError, _trusted_git_bin, _trusted_home,
                                    _GIT_ENV_ALLOW, _GIT_SAFE_ENV, _GIT_NEUTRALIZE,
                                    _TRUSTED_PATH_DIRS, _bootstrap_git,
-                                   _has_git_marker, redact_secrets, _timed)
+                                   _has_git_marker, redact_secrets, _timed, _env_session)
 
 DEPLOY_REQUIRED_PASSES = ("simplify", "code-review", "security")
 # Легаси-набор: записи БЕЗ поля `ladder_schema` физически писал старый код, когда
@@ -57,15 +58,16 @@ GATE_CONFIG_NAME = ".codex-gate.yaml"
 # Остаётся текстом: подсказка ничего не энфорсит, машиночитаемое описание прохода
 # {class, command, source} проектируется в тикете B1.
 _PASS_RUNNER = {
-    "simplify": "/simplify либо субагенты очистки",
+    "simplify": "Claude: /simplify; Kimi: /gates:simplify; либо субагенты очистки",
     # Перечисляем ВЫЗЫВАЕМЫЕ АГЕНТОМ движки, а не только слэш-команду: платформа блокирует
     # агенту имя команды, но не движок, который она оборачивает. Прежний текст «/code-review»
     # толкал агента останавливаться и ждать человека там, где ждать не нужно (2026-07-26).
-    "code-review": "/code-review, либо тот же движок напрямую (workflow-ревью), либо "
-                   "независимый ревьюер: codex_review_gate.py companion-review / cursor",
-    "security": "/security-review либо security-фокус по конституции AGENTS.md",
+    "code-review": "Claude: /code-review; Kimi: /gates:code-review, либо тот же движок "
+                   "напрямую: codex_review_gate.py companion-review / cursor",
+    "security": "Claude: /security-review; Kimi: /gates:security-review, либо security-фокус "
+                "по конституции AGENTS.md",
 }
-_RUN = "bash .githooks/gates-run ladder_gate.py"   # как гейт реально вызывается (см. README)
+_RUN = "/bin/sh .githooks/gates-run ladder_gate.py"   # как гейт реально вызывается (см. README)
 _RUN_UNKNOWN = "<ваш шим gates-run> ladder_gate.py"
 
 
@@ -129,11 +131,6 @@ class GateRefusal(TrustedGitError):
 
 class LadderError(Exception):
     """Нарушение протокола begin/mark (неизвестный проход, mark без begin, разрыв цепочки)."""
-
-
-def _env_session() -> str:
-    # Тот же конвенционный chokepoint, что _env_session в codex_review_gate.py.
-    return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID", "")
 
 
 def _marker_path(root: Path, pass_name: str) -> Path:

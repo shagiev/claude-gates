@@ -41,6 +41,22 @@
   бинарь/команду вместо сертифицированного ревьюера (env-override пути к движку, выбор панели
   переменной окружения, repo-local подмена скрипта), равносилен саморевью.
 
+## Kimi host (0.11.0)
+
+- **Native+global trust root.** Native manifest и `~/.kimi-code/config.toml` обязаны содержать
+  идентичную gate-owned команду (Kimi дедуплицирует её). Путь не зависит от `${HOME}`/
+  `${KIMI_PLUGIN_ROOT}`: `/usr/bin/python3` вычисляет home через `getpwuid`, проверяет digest
+  `native_hook.py` и исполняет тот же buffer. Dispatcher сначала проверяет opt-in; malformed
+  payload = 2, disabled/absent/broken installation = 2 только внутри onboarding.
+- **Bootstrap вне worktree.** `~/.local/lib/claude-gates/kimi_install.py` pinned в `gates-run`;
+  digest и exec идут над одним buffer. Resolver проверяет каждый path component, manifest targets,
+  все sibling scripts и не использует stale Claude cache без registry-записи.
+- **Acceptance — API-owned и artifact-bound.** Восстановление после сбоя идёт только через Kimi
+  API remove/install/enable/disable; raw read-modify-write `installed.json` запрещён. Успешная
+  приёмка оставляет candidate активным. Managed digest/version сверяются с reviewed artifact до
+  и после smoke. Reviewer evidence требует exact canonical argv текущего turn и один
+  `Verdict: approve` без findings; audit-строка сама по себе evidence не является.
+
 ## Medium/low (совещательно)
 
 Нет теста на новую ветку/except; сообщение об ошибке без контекста; пере-блок безобидного

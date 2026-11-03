@@ -148,14 +148,14 @@ def test_real_plugin_cli_is_unreachable_from_tests():
         assert r.returncode == 97 and "тест-страж" in r.stderr
 
 
-def test_stub_bin_contains_nothing_but_the_two_inert_stubs():
+def test_stub_bin_contains_nothing_but_the_inert_plugin_cli_stubs():
     """Каталог стоит первым в PATH ВСЕЙ сессии и вклеивается детям: что угодно, положенное сюда,
     затенит системный бинарь для всего прогона. Например `git` — conftest подменяет
     `_trusted_git` на форму, резолвимую через PATH, тогда как боевой `_trusted_git_bin`
     специально абсолютный."""
     d = ROOT / "tests" / "stub_bin"
-    assert {f.name for f in d.iterdir()} == {"claude", "codex", "plugin-cli-stub"}
-    for link in ("claude", "codex"):
+    assert {f.name for f in d.iterdir()} == {"claude", "codex", "kimi", "plugin-cli-stub"}
+    for link in ("claude", "codex", "kimi"):
         assert os.readlink(d / link) == "plugin-cli-stub"
     body = (d / "plugin-cli-stub").read_text()
     assert "exec" not in body and body.rstrip().endswith("exit 97")
@@ -664,7 +664,7 @@ def test_the_shipped_gate_never_writes_bytecode():
     """Структурный корень: пока гейт пишет `__pycache__` в каталог установки, слепое пятно
     возвращается при первом же запуске хука."""
     shim = (ROOT / "plugins/gates/templates/githooks/gates-run").read_text()
-    assert "python3 -B" in shim and "exec python3 -B" in shim
+    assert "-I -B" in shim and 'exec "$PY" -I -B' in shim
     hooks = (ROOT / "plugins/gates/hooks/hooks.json").read_text()
     assert "python3 \\\n" not in hooks and "python3 -B" in hooks
 
@@ -686,6 +686,15 @@ def test_smoke_proves_the_gate_actually_blocks(install):
     """Сердцевина. «Точка входа не упала» ничего не доказывает: no-op с нулевым кодом такую
     проверку проходит. Гейт обязан ЗАБЛОКИРОВАТЬ код-правку без ревью и ПРОПУСТИТЬ её после
     честной цепочки — и всё это через настоящий шим, которым ходят хуки."""
+    assert dv.smoke_gate_blocks(install) is None
+
+
+def test_smoke_launcher_ignores_path_bash(install, tmp_path, monkeypatch):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "bash").write_text("#!/bin/sh\nexit 0\n")
+    (fake / "bash").chmod(0o755)
+    monkeypatch.setitem(dv.E, "PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
     assert dv.smoke_gate_blocks(install) is None
 
 

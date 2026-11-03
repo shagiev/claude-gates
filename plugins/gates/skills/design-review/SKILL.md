@@ -9,7 +9,7 @@ description: Обязательное независимое дизайн-рев
 `docs/methodology/2026-07-21-codex-review-gates-phase1-design.md` в репо плагина gates).
 
 Все команды гейта ниже запускаются через раннер целевого репо:
-`bash .githooks/gates-run codex_review_gate.py <команда> ...`
+`/bin/sh .githooks/gates-run codex_review_gate.py <команда> ...`
 (если `.githooks/gates-run` нет — проект не онбординат, сначала `/gates-init`).
 
 ## Обычный режим
@@ -30,7 +30,7 @@ description: Обязательное независимое дизайн-рев
    `/codex:adversarial-review` (`disable-model-invocation`) — запусти тот же движок напрямую,
    слэш-команда является тонкой обёрткой ровно над этим вызовом:
    ```bash
-   bash .githooks/gates-run codex_review_gate.py companion-review \
+   /bin/sh .githooks/gates-run codex_review_gate.py companion-review \
      --design-file <путь-к-дизайну.md> \
      --base <sha-до-дизайна> --scope branch "<фокус-текст>"
    ```
@@ -77,7 +77,7 @@ description: Обязательное независимое дизайн-рев
    ```bash
    F=docs/2026-..-design.md
    H=$(shasum -a 256 "$F" | cut -d' ' -f1)   # хэш ОТРЕВЬЮЕННОГО содержимого
-   bash .githooks/gates-run codex_review_gate.py write-marker design "codex approved: <кратко>" "$H" --file "$F"
+   /bin/sh .githooks/gates-run codex_review_gate.py write-marker design "codex approved: <кратко>" "$H" --file "$F"
    ```
    Гейт сверит `$H` с текущим файлом; при несовпадении — маркер помечается дрейфом (exit 2).
    Гейт также требует (exit 2, маркер не ставится): секцию альтернатив и секцию
@@ -114,7 +114,7 @@ description: Обязательное независимое дизайн-рев
 ## Тривиальный режим
 
 ```bash
-bash .githooks/gates-run codex_review_gate.py write-marker trivial "<причина>"
+/bin/sh .githooks/gates-run codex_review_gate.py write-marker trivial "<причина>"
 ```
 — без Codex, осознанно (пишется в аудит).
 
@@ -149,7 +149,7 @@ review:
 по исчерпании ОТКАЗЫВАЕТСЯ стартовать следующий, пока не выполнено:
 
 ```bash
-bash .githooks/gates-run codex_review_gate.py residuals-accept <artifact> \
+/bin/sh .githooks/gates-run codex_review_gate.py residuals-accept <artifact> \
   --operator-confirmed "почему принимаем эту цену"
 ```
 
@@ -189,3 +189,14 @@ bash .githooks/gates-run codex_review_gate.py residuals-accept <artifact> \
 Маркер привязан к сессии и сбрасывается на SessionStart — проходить раз в сессию до первой
 правки кода. Bash-мутации кода (sed -i/git apply/redirect в код-путь) тоже гейтятся.
 Код-пути определяет `.codex-gate.yaml`; его отсутствие/битость = строгий режим (всё код).
+
+## Kimi Code
+
+Команды плагина называются `/gates:design-review`, `/gates:simplify`,
+`/gates:security-review`, `/gates:code-review`, `/gates:gates-init`. Для `write-marker`
+и ladder-записей на Kimi обязателен одноразовый nonce-handoff: добавь перед командой
+`GATES_SESSION_NONCE=<32-hex-literal>` (nonce подставляется литералом, не `$NONCE` и не
+`$(python3 …)` — hook должен видеть те же 32 hex, что получит CLI).
+PreToolUse создаст привязку к `session_id` из payload, CLI потребит её один раз. Не используй
+общий файл текущей сессии и не оставляй маркер в `nosession`. Независимый ревьюер — Codex,
+самопроверка Kimi не засчитывается.

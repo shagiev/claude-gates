@@ -3,7 +3,7 @@
 # Pre-deploy гейт (чистое дерево + тесты) живёт В САМОМ скрипте, а не здесь: цель `deploy` —
 # удобная обёртка, а не точка контроля. Когда гейт стоял в Makefile, документированный прямой
 # вызов `python3 scripts/deploy_gates.py` мутировал флот вообще без проверок.
-.PHONY: test check deploy gates-restore deploy-status recertify
+.PHONY: test check deploy gates-restore deploy-status recertify accept-kimi
 
 test:
 	python3 -m pytest tests/ -q
@@ -29,3 +29,6 @@ deploy-status:               ## что сейчас на флоте
 # (`make recertify MODEL=…` скрипт отвергает, а не молча игнорирует.)
 recertify:                   ## перекалибровать Claude-ревьюера на модель, куда указывает алиас
 	python3 -B scripts/recertify.py
+
+accept-kimi:                 ## одноразовая live-приёмка reviewed artifact через Kimi Server API
+	python3 -B scripts/kimi_acceptance.py

@@ -9,6 +9,8 @@ code_paths:
   exact:
     - "plugins/gates/.claude-plugin/plugin.json"
     - "plugins/gates/.codex-plugin/plugin.json"
+    - "plugins/gates/.kimi-plugin/plugin.json"
+    - "plugins/gates/kimi.plugin.json"
     - "plugins/gates/reviewer_certifications.json"
     - ".claude-plugin/marketplace.json"
     - ".agents/plugins/marketplace.json"

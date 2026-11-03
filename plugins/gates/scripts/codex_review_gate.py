@@ -324,11 +324,14 @@ HARD_CODE_PATH_EXACT = {
     ".codex/config.toml",
     ".claude/settings.json",
     ".claude/settings.local.json",
+    "kimi.plugin.json",
 }
 HARD_CODE_PATH_PREFIXES = (
     ".githooks/",
     ".codex-plugin/",
     ".claude-plugin/",
+    ".kimi-plugin/",
+    "plugins/gates/commands/",
     ".agents/plugins/",
     ".claude/.design-approved",
     ".claude/.review-disabled-",
@@ -339,6 +342,7 @@ HARD_CODE_PATH_PREFIXES = (
 HARD_CODE_PATH_COMPONENTS = (
     "/.codex-plugin/",
     "/.claude-plugin/",
+    "/.kimi-plugin/",
     "/.agents/plugins/",
     "/reviewer_corpus/",
 )
@@ -447,8 +451,8 @@ def _onboarded(root: Path) -> bool:
 
 
 def _read_gate_config(root: Path) -> "dict | None":
-    """Парсит .codex-gate.yaml. None = нет файла / битый YAML / нет PyYAML / не dict —
-    вызывающий трактует как строгий режим (безопасные дефолты, решение 1)."""
+    """Парсит .codex-gate.yaml. Без PyYAML принимается JSON-совместимый YAML; остальные
+    нечитаемые формы → None и строгий режим (безопасные дефолты, решение 1)."""
     p = root / GATE_CONFIG_NAME
     if p.is_symlink():
         # символишен конфиг указывает на untracked-цель вне контроля диффа (Codex code-R1) —
@@ -458,16 +462,23 @@ def _read_gate_config(root: Path) -> "dict | None":
         return None
     if not p.exists():
         return None
-    if yaml is None:
-        print(f"[codex-gate] PyYAML не установлен — {GATE_CONFIG_NAME} нечитаем, строгий режим "
-              "(все пути = код). Почини: pip install pyyaml", file=sys.stderr)
-        return None
     try:
-        data = yaml.safe_load(p.read_text())
-    except (yaml.YAMLError, OSError, UnicodeError):
-        # UnicodeError: не-UTF-8 файл не должен ронять импорт (хук упал бы exit 1 вместо
-        # строгого гейта) — это «битый конфиг» → строгий режим (Codex code-R1 medium)
+        text = p.read_text()
+    except (OSError, UnicodeError):
         return None
+    if yaml is None:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            print(f"[codex-gate] PyYAML не установлен — {GATE_CONFIG_NAME} нечитаем, строгий "
+                  "режим (все пути = код). Почини: pip install pyyaml или используй JSON-"
+                  "совместимый YAML", file=sys.stderr)
+            return None
+    else:
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
     return data if isinstance(data, dict) else None
 
 
@@ -1945,7 +1956,7 @@ def convergence_decision(led: dict) -> "tuple[str, str]":
                     f"[codex-gate] ⚖️ ЭСКАЛАЦИЯ: спор по {k} «{f.get('title', '')[:60]}» "
                     f"(disputes={d}, severity={f.get('severity')}). Нужно решение человека — "
                     f"набери в терминале:\n"
-                    f"  bash .githooks/gates-run codex_review_gate.py adjudicate {k} "
+                    f"  /bin/sh .githooks/gates-run codex_review_gate.py adjudicate {k} "
                     f"resolved-by-user --reason-file <путь>\n"
                     f"  (или ... resolved-by-user \"$(pbpaste)\" — текст из буфера)\n"
                     f"  Альтернативы: fix | аварийный SKIP.")
@@ -4530,7 +4541,8 @@ def is_code_path(path: str) -> bool:
             or hard_p == "hooks/hooks.json"
             or hard_p.endswith("/hooks/hooks.json")
             or hard_p == "reviewer_certifications.json"
-            or hard_p.endswith("/reviewer_certifications.json")):
+            or hard_p.endswith("/reviewer_certifications.json")
+            or hard_p.endswith("/kimi.plugin.json")):
         return True
     if CODE_PATH_PREFIXES is None:
         return True   # строгий режим (нет/битый конфиг): ВСЁ код, экземпций нет (решение 1)
@@ -4545,10 +4557,87 @@ def is_code_path(path: str) -> bool:
     return False
 
 
+_HANDOFF_TTL_S = 60
+_HANDOFF_NONCE_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _handoff_path(nonce: str) -> "Path | None":
+    state = _gate_state_dir()
+    return (state / "session-handoff" / f"{nonce}.json") if state else None
+
+
+def _handoff_nonce_from_command(command: str) -> "str | None":
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if not words or not words[0].startswith("GATES_SESSION_NONCE="):
+        return None
+    nonce = words[0].split("=", 1)[1]
+    if (len(words) < 4 or words[1] != "/bin/sh" or REPO_ROOT is None
+            or words[3] not in ("codex_review_gate.py", "ladder_gate.py", "prepush_gate.py")):
+        raise ValueError("GATES_SESSION_NONCE разрешён только для canonical gates-run")
+    runner = Path(words[2])
+    actual = runner if runner.is_absolute() else REPO_ROOT / runner
+    if actual.resolve() != (REPO_ROOT / ".githooks/gates-run").resolve():
+        raise ValueError("GATES_SESSION_NONCE разрешён только для canonical gates-run")
+    if not _HANDOFF_NONCE_RE.fullmatch(nonce):
+        raise ValueError("GATES_SESSION_NONCE должен быть 32 hex-символами")
+    return nonce
+
+
+def _publish_session_handoff(nonce: str, session: str) -> bool:
+    path = _handoff_path(nonce)
+    if path is None or not session:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        json.dump({"session_id": session, "created_at": time.time()}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    return True
+
+
+def _consume_session_handoff(nonce: str) -> str:
+    if not _HANDOFF_NONCE_RE.fullmatch(nonce):
+        return ""
+    path = _handoff_path(nonce)
+    if path is None:
+        return ""
+    claim = path.with_name(f"{path.stem}.claim-{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        os.replace(path, claim)                 # consume-first, ровно один победитель
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+    try:
+        try:
+            rec = json.loads(claim.read_text())
+        except (OSError, ValueError, UnicodeError):
+            return ""
+        if not isinstance(rec, dict) or not isinstance(rec.get("session_id"), str):
+            return ""
+        created = rec.get("created_at")
+        if isinstance(created, bool) or not isinstance(created, (int, float)):
+            return ""
+        if time.time() - created > _HANDOFF_TTL_S or created > time.time() + 1:
+            return ""
+        return rec["session_id"] if rec["session_id"] else ""
+    finally:
+        claim.unlink(missing_ok=True)
+
+
 def _env_session() -> str:
+    nonce = os.environ.get("GATES_SESSION_NONCE")
+    if nonce is not None:
+        return _consume_session_handoff(nonce)
     # Claude Code экспонирует id сессии как CLAUDE_CODE_SESSION_ID; CLAUDE_SESSION_ID —
-    # легаси/тестовый фолбэк. Раньше write_marker читал только legacy → маркер НИКОГДА не
-    # совпадал с session_id хука (пусто) → G1 блокировал все правки без разблокировки.
+    # легаси/тестовый фолбэк.
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID", "")
 
 
@@ -4842,7 +4931,7 @@ def write_design_file_marker_cli(detail: str, design_file: str, reviewed_hash: s
                   "(правка после ревью — новое ревью). Codex недоступен — "
                   "`--no-receipt \"<причина>\"` (аудируется).", file=sys.stderr)
             return 2
-    return add_design_file_binding(detail, norm, reviewed_hash)
+    return add_design_file_binding(detail, norm, reviewed_hash, session=session)
 
 
 def _read_design(path: Path) -> "tuple[str, str] | None":
@@ -4883,12 +4972,14 @@ def write_marker(kind: str, detail: str, design_hash: str | None = None) -> None
         audit(f"trivial-marker session={session} reason={redact_secrets(detail)!r}")
 
 
-def add_design_file_binding(detail: str, design_file: str, reviewed_hash: str) -> int:
+def add_design_file_binding(detail: str, design_file: str, reviewed_hash: str,
+                            session: "str | None" = None) -> int:
     """File-режим design-маркера (тикет #3): мержит биндинг {file, hash: reviewed_hash} в набор
     `designs` маркера сессии. reviewed_hash — из результата ревью (не «что сейчас в файле»).
     Возвращает 0 при sha256(файл)==reviewed_hash, иначе 2 (записанный несовпадающий биндинг
     делает has_marker drifted — маркер невалиден целиком, R2-F1)."""
-    session = _env_session()
+    if session is None:
+        session = _env_session()
     with _marker_lock(session):                           # code-R1 F2: load+merge+write атомарно
         rec = _load_marker(session)
         designs = []
@@ -4974,9 +5065,13 @@ def clear_marker_cli(raw: str) -> int:
         data = json.loads(raw) if raw.strip() else None
     except json.JSONDecodeError:
         data = None
+    if isinstance(data, dict):
+        _refresh_hook_repo_context(data)
     session = data.get("session_id") if isinstance(data, dict) else None
     if isinstance(session, str) and session:
         clear_marker(session)
+        if _hooks_active():
+            audit(f"SESSION-START session={session}")
     return 0
 
 
@@ -5294,9 +5389,16 @@ def gate_bash_cli(hook_json: str) -> int:
     # G1 Bash — документированный best-effort/fail-open путь: schema drift не должен падать
     # traceback'ом и превращать hook-runtime error в неясный блок.
     command = ti.get("command", "") if isinstance(ti, dict) else ""
+    session = _hook_session(data)
+    try:
+        nonce = _handoff_nonce_from_command(command)
+        if nonce is not None and not _publish_session_handoff(nonce, session):
+            return _deny("[codex-gate] GATES_SESSION_NONCE уже существует или сессия неизвестна — "
+                         "повторная публикация не меняет первую session-привязку")
+    except (ValueError, OSError, TrustedGitError) as exc:
+        return _deny(f"[codex-gate] session handoff отклонён: {exc}")
     if not (command and bash_touches_code(command)):
         return 0
-    session = _hook_session(data)
     if not session:
         print("[codex-gate] сессия неизвестна — bash-гейт пропускает (fail-open)", file=sys.stderr)
         return 0   # fail-open
@@ -5407,7 +5509,7 @@ def review_round_check(artifact: str) -> "tuple[int, int, str]":
             # Артефакт содержит имя ветки, а git принимает `$()`/бэктики в именах ссылок:
             # неэкранированная подстановка в КОПИРУЕМУЮ команду исполнилась бы под аккаунтом
             # оператора (security-проход 11.08.2026).
-            f"  bash .githooks/gates-run codex_review_gate.py residuals-accept "
+            f"  /bin/sh .githooks/gates-run codex_review_gate.py residuals-accept "
             f"{shlex.quote(artifact)} "
             "--operator-confirmed \"причина\"\n"
             "  ⚠️ Для ДИЗАЙН-ревью неразрешённые critical/high под бюджет НЕ подпадают: их\n"
@@ -5986,7 +6088,7 @@ def main(argv: list[str]) -> int:
                                "решением человека, не ревьюером.")
                 audit(f"ARBITER-PROPOSAL F={fid} verdict={verdict} model={actual} class={tier}")
                 print(f"[codex-gate] арбитр предложил «{verdict}» по {fid}. Разбор записан; "
-                      f"принять:\n  bash .githooks/gates-run codex_review_gate.py adjudicate "
+                      f"принять:\n  /bin/sh .githooks/gates-run codex_review_gate.py adjudicate "
                       f"{fid} resolved-by-arbiter --operator-confirmed \"принимаю\"")
             save_findings_ledger(led)
         return 0

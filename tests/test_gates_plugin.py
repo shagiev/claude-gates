@@ -102,6 +102,14 @@ def test_read_gate_config_states(tmp_path):
     assert cfg == {"code_paths": {"prefixes": ["src/"]}}              # валидный
 
 
+def test_json_yaml_config_works_without_pyyaml_in_isolated_python(tmp_path, monkeypatch):
+    monkeypatch.setattr(g, "yaml", None)
+    (tmp_path / ".codex-gate.yaml").write_text('{"code_paths":{"prefixes":["app/"]}}')
+    assert g._read_gate_config(tmp_path) == {"code_paths": {"prefixes": ["app/"]}}
+    (tmp_path / ".codex-gate.yaml").write_text("code_paths:\n  prefixes: [app/]\n")
+    assert g._read_gate_config(tmp_path) is None
+
+
 # --- opt-in признак онбординга (worktree OR HEAD, Codex R1-фикс спеки) ---
 
 def _git(repo, *args):

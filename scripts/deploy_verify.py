@@ -322,10 +322,10 @@ def _run_gate(install_root: pathlib.Path, repo: pathlib.Path, script, *args, env
     Свой лаунчер доказывал бы путь, которым не ходит ни один хук, — и промах резолва (тот
     самый, что четыре раза делал ревьюера слепым) остался бы невидим.
 
-    Шим резолвит установку САМ, через `$HOME`, поэтому ему подставляется синтетический дом,
-    указывающий ровно на проверяемый каталог: иначе smoke молча доказывал бы работоспособность
-    ДРУГОЙ установки — той, что случайно активна у пользователя. Логика резолва при этом
-    исполняется настоящая, его собственная."""
+    Шим резолвит установку САМ через OS account home. В smoke-копии resolver точка home
+    подменяется на синтетическую (НЕ env-override в поставке): иначе smoke доказывал бы
+    работоспособность ДРУГОЙ установки — той, что случайно активна у пользователя. Все проверки
+    путей, ownership, digest и запуска остаются настоящими."""
     shim = install_root / "templates" / "githooks" / "gates-run"
     e = {**E, **(env or {})}
     if not shim.is_file():
@@ -333,14 +333,33 @@ def _run_gate(install_root: pathlib.Path, repo: pathlib.Path, script, *args, env
         # хотя шим — часть закреплённого дерева и единственное, чем хуки запускают гейт.
         raise FileNotFoundError(f"в поставке нет шима {shim} — хукам гейт запускать нечем")
     home = repo.parent / "home"
+    installed = home / ".claude/plugins/cache/lenar-gates/gates/smoke"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(install_root, installed, dirs_exist_ok=True)
     meta = home / ".claude" / "plugins" / "installed_plugins.json"
     meta.parent.mkdir(parents=True, exist_ok=True)
     meta.write_text(json.dumps({"plugins": {"gates@lenar-gates": [
-        {"scope": "user", "installPath": str(install_root), "version": "smoke"}]}}))
+        {"scope": "user", "installPath": str(installed), "version": "smoke"}]}}))
     dst = repo / ".githooks" / "gates-run"
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(shim, dst)
-    return subprocess.run(["bash", str(dst), script, *args], cwd=repo,
+    resolver_src = install_root / "templates" / "githooks" / "kimi_install.py"
+    if resolver_src.is_file():
+        marker = 'GATE_HOME=$("$PY" -I -B -c \'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)\')'
+        body = dst.read_text()
+        if marker in body:
+            resolver_body = resolver_src.read_text().replace(
+                "return Path(pwd.getpwuid(os.getuid()).pw_dir)", f"return Path({str(home)!r})")
+            digest = hashlib.sha256(resolver_body.encode()).hexdigest()
+            body, count = re.subn(r"BOOT_SHA256=[0-9a-f]{64}", f"BOOT_SHA256={digest}",
+                                  body.replace(marker, f'GATE_HOME="{home}"'))
+            if count != 1:
+                raise RuntimeError("smoke не нашёл digest-pin в gates-run")
+            dst.write_text(body)
+            resolver = home / ".local/lib/claude-gates/kimi_install.py"
+            resolver.parent.mkdir(parents=True, exist_ok=True)
+            resolver.write_text(resolver_body)
+    return subprocess.run(["/bin/sh", str(dst), script, *args], cwd=repo,
                           capture_output=True, text=True, env={**e, "HOME": str(home)})
 
 

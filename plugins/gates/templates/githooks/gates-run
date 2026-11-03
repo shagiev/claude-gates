@@ -1,50 +1,57 @@
-#!/usr/bin/env bash
-# gates-run: запускает скрипт плагина gates@lenar-gates актуальной установленной версии.
-# Использование: gates-run <script.py> [args...]
-# Резолв версии (спека, решение 3): installed_plugins.json — авторитетно (то, что реально
-# активно у Claude Code); глоб кэша — ТОЛЬКО фолбэк при нечитаемых метаданных. Читаемые
-# метаданные БЕЗ записи плагина = «удалён» → fail-closed (протухший кэш не подхватывается).
+#!/bin/sh
+# gates-run: trusted Claude/Kimi resolver + isolated interpreter. Не использует PATH/HOME caller.
 set -u
 SCRIPT="${1:?usage: gates-run <script.py> [args...]}"
 shift
-P=$(python3 -B - <<'EOF'
-import json, os, sys
-meta = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
-try:
-    d = json.load(open(meta))
-except Exception:
-    print("FALLBACK"); sys.exit(0)   # метаданные нечитаемы -> глоб-фолбэк
-entries = (d.get("plugins") or {}).get("gates@lenar-gates") or []
-for e in entries:                     # несколько scope'ов -> первый с реально существующим путём
-    ip = e.get("installPath") or ""
-    if not os.path.isabs(ip):         # пустой/относительный путь (дрейф схемы) НЕ должен
-        continue                      # резолвиться в repo-local scripts/ от cwd хука
-    p = os.path.join(ip, "scripts")
-    if os.path.isfile(os.path.join(p, "ladder_gate.py")):
-        print(p); sys.exit(0)
-print("")                             # метаданные читаемы, записи/пути нет -> НЕ установлен
-EOF
-)
-if [ "$P" = "FALLBACK" ]; then
-  P=$(ls -d "$HOME"/.claude/plugins/cache/lenar-gates/gates/*/scripts 2>/dev/null | sort -V | tail -1)
+PY=""
+for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] \
+      && [ -z "$(/usr/bin/find "$candidate" -perm -022 -print -quit)" ] \
+      && [ -z "$(/usr/bin/find "$candidate" ! -user root -print -quit)" ]; then
+    PY="$candidate"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "[gates] нет trusted system Python — операция ПРЕРВАНА (fail-closed)." >&2
+  exit 1
+fi
+GATE_HOME=$("$PY" -I -B -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+BOOT_DIR="$GATE_HOME/.local/lib/claude-gates"
+BOOT="$BOOT_DIR/kimi_install.py"
+BOOT_SHA256=a669a28804370f4134ea2cef0ea598c8e323c549076643ffecb5ebc8675973ae
+GATES_UID=$(/usr/bin/id -u)
+for directory in "$GATE_HOME" "$GATE_HOME/.local" "$GATE_HOME/.local/lib" "$BOOT_DIR"; do
+  if [ ! -d "$directory" ] || [ -L "$directory" ] \
+      || [ -n "$(/usr/bin/find "$directory" -maxdepth 0 -perm -022 -print -quit)" ] \
+      || [ -n "$(/usr/bin/find "$directory" -maxdepth 0 ! -user "$GATES_UID" -print -quit)" ]; then
+    echo "[gates] gate-owned bootstrap path отсутствует или небезопасен — запусти /gates-init." >&2
+    exit 1
+  fi
+done
+if [ ! -f "$BOOT" ] || [ -L "$BOOT" ] \
+    || [ -n "$(/usr/bin/find "$BOOT" -perm -022 -print -quit)" ] \
+    || [ -n "$(/usr/bin/find "$BOOT" ! -user "$GATES_UID" -print -quit)" ]; then
+  echo "[gates] $BOOT отсутствует или небезопасен — запусти /gates-init." >&2
+  exit 1
+fi
+P=$("$PY" -I -B -c 'import hashlib,sys
+path, expected = sys.argv[1:3]
+data = open(path, "rb").read()
+if hashlib.sha256(data).hexdigest() != expected:
+    raise SystemExit("bootstrap digest mismatch — run /gates-init")
+sys.argv = [path] + sys.argv[3:]
+exec(compile(data, path, "exec"), {"__name__": "__main__", "__file__": path})' \
+  "$BOOT" "$BOOT_SHA256" select "$SCRIPT")
+RC=$?
+if [ "$RC" -ne 0 ]; then
+  echo "[gates] установка отклонена trusted resolver — операция ПРЕРВАНА (fail-closed)." >&2
+  exit 1
 fi
 if [ -z "$P" ]; then
-  echo "[gates] плагин gates@lenar-gates не установлен — операция ПРЕРВАНА (fail-closed)." >&2
-  echo "[gates] Установи: /plugin marketplace add <путь-или-repo lenar-gates> ; /plugin install gates@lenar-gates" >&2
+  echo "[gates] активная установка gates не найдена ни Claude, ни Kimi — операция ПРЕРВАНА." >&2
+  echo "[gates] Claude: /plugin install gates@lenar-gates; Kimi: /plugins install <path>/plugins/gates" >&2
   echo "[gates] Обход коммита (аудируется): LADDER_SKIP=1 [LADDER_SKIP_REASON=\"...\"] git commit ..." >&2
   exit 1
 fi
-if [ ! -f "$P/$SCRIPT" ]; then
-  # Разные причины требуют разных действий: плагин МОЖЕТ быть установлен, но версия — старее
-  # скрипта, которого просит шим (реальный инцидент 2026-07-26: шим pre-push из рабочей копии
-  # заблокировал ВСЕ пуши, а сообщение говорило «не установлен» и предлагало обход коммита).
-  echo "[gates] плагин установлен ($P), но скрипт $SCRIPT в этой версии отсутствует —" >&2
-  echo "[gates] операция ПРЕРВАНА (fail-closed). Это рассинхрон версий: шим новее плагина." >&2
-  echo "[gates] Обнови плагин (pull маркетплейса → /plugin uninstall → /plugin install) либо" >&2
-  echo "[gates] удали хук, который просит $SCRIPT, если он попал сюда раньше времени." >&2
-  exit 1
-fi
-# -B: байткод в каталог установки НЕ пишется. Подделанный `.pyc` грузится вместо
-# исходника (CPython сверяет лишь mtime+size из заголовка), то есть исполняется код,
-# которого нет в закреплённом дереве, при полностью сошедшемся дереве.
-exec python3 -B "$P/$SCRIPT" "$@"
+exec "$PY" -I -B "$P" "$@"

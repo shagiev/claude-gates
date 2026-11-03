@@ -1,0 +1,34 @@
+{
+  "name": "gates",
+  "version": "0.11.0",
+  "description": "AI SDLC gates: independent design/code review, simplify, security, ladder and deploy review for Claude Code, Codex and Kimi Code.",
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "interface": {
+    "displayName": "Gates",
+    "shortDescription": "Independent review gates for Claude Code, Codex and Kimi Code.",
+    "longDescription": "Design before code with alternatives and BSAC, independent design/code review, simplify and security passes, commit ladder and commit-bound deploy review.",
+    "developerName": "Ленар",
+    "category": "Developer Tools"
+  },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "^(?:(?:Multi)?Edit.*|Write.*|NotebookEdit.*|apply_patch.*|mcp__.*__.*(?:Edit|edit|Write|write|Patch|patch|Replace|replace|Truncate|truncate).*|mcp__.*__.*(?:Create|create|Update|update|Save|save|Delete|delete|Remove|remove|Move|move|Rename|rename|Append|append|Copy|copy).*(?:File|file|Path|path|Folder|folder|Directory|directory).*|mcp__.*__.*(?:File|file|Path|path|Folder|folder|Directory|directory).*(?:Create|create|Update|update|Save|save|Delete|delete|Remove|remove|Move|move|Rename|rename|Append|append|Copy|copy).*)$",
+      "command": "/usr/bin/python3 -I -B -c 'import hashlib,json,os,pwd,sys,subprocess\nfrom pathlib import Path\ntry:\n payload=json.load(sys.stdin)\n cwd=payload.get(\"cwd\")\n if not isinstance(cwd,str) or not os.path.isabs(cwd): sys.exit(2)\n env={\"PATH\":\"/usr/bin:/bin\",\"HOME\":pwd.getpwuid(os.getuid()).pw_dir,\"GIT_CONFIG_GLOBAL\":\"/dev/null\",\"GIT_CONFIG_NOSYSTEM\":\"1\",\"GIT_NO_REPLACE_OBJECTS\":\"1\",\"GIT_TERMINAL_PROMPT\":\"0\"}\n root=subprocess.run([\"/usr/bin/git\",\"-C\",cwd,\"rev-parse\",\"--show-toplevel\"],env=env,capture_output=True,text=True)\n if root.returncode:\n  if any(os.path.lexists(p/\".git\") for p in (Path(cwd),*Path(cwd).parents)): sys.exit(2)\n  sys.exit(0)\n repo=Path(root.stdout.strip())\n if not os.path.lexists(repo/\".codex-gate.yaml\"):\n  committed=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"ls-tree\",\"HEAD\",\"--\",\".codex-gate.yaml\"],env=env,capture_output=True,text=True)\n  if committed.returncode==0 and not committed.stdout.strip(): sys.exit(0)\n  refs=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"show-ref\",\"--head\"],env=env,capture_output=True,text=True)\n  if refs.returncode in (0,1) and not refs.stdout.strip() and not refs.stderr.strip(): sys.exit(0)\n  if committed.returncode: sys.exit(2)\n p=pwd.getpwuid(os.getuid()).pw_dir+\"/.local/lib/claude-gates/native_hook.py\"\n d=open(p,\"rb\").read()\n if hashlib.sha256(d).hexdigest()!=\"696b0b8c98e6f16d1f2c461babf5e0f84c3759e4cf54a246c7039890c65fda13\": sys.exit(2)\nexcept Exception:\n sys.exit(2)\nsys.argv=[p]+sys.argv[1:]\nexec(compile(d,p,\"exec\"),{\"__name__\":\"__main__\",\"__file__\":p})' codex_review_gate.py gate-edit",
+      "timeout": 10
+    },
+    {
+      "event": "PreToolUse",
+      "matcher": "Bash",
+      "command": "/usr/bin/python3 -I -B -c 'import hashlib,json,os,pwd,sys,subprocess\nfrom pathlib import Path\ntry:\n payload=json.load(sys.stdin)\n cwd=payload.get(\"cwd\")\n if not isinstance(cwd,str) or not os.path.isabs(cwd): sys.exit(2)\n env={\"PATH\":\"/usr/bin:/bin\",\"HOME\":pwd.getpwuid(os.getuid()).pw_dir,\"GIT_CONFIG_GLOBAL\":\"/dev/null\",\"GIT_CONFIG_NOSYSTEM\":\"1\",\"GIT_NO_REPLACE_OBJECTS\":\"1\",\"GIT_TERMINAL_PROMPT\":\"0\"}\n root=subprocess.run([\"/usr/bin/git\",\"-C\",cwd,\"rev-parse\",\"--show-toplevel\"],env=env,capture_output=True,text=True)\n if root.returncode:\n  if any(os.path.lexists(p/\".git\") for p in (Path(cwd),*Path(cwd).parents)): sys.exit(2)\n  sys.exit(0)\n repo=Path(root.stdout.strip())\n if not os.path.lexists(repo/\".codex-gate.yaml\"):\n  committed=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"ls-tree\",\"HEAD\",\"--\",\".codex-gate.yaml\"],env=env,capture_output=True,text=True)\n  if committed.returncode==0 and not committed.stdout.strip(): sys.exit(0)\n  refs=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"show-ref\",\"--head\"],env=env,capture_output=True,text=True)\n  if refs.returncode in (0,1) and not refs.stdout.strip() and not refs.stderr.strip(): sys.exit(0)\n  if committed.returncode: sys.exit(2)\n p=pwd.getpwuid(os.getuid()).pw_dir+\"/.local/lib/claude-gates/native_hook.py\"\n d=open(p,\"rb\").read()\n if hashlib.sha256(d).hexdigest()!=\"696b0b8c98e6f16d1f2c461babf5e0f84c3759e4cf54a246c7039890c65fda13\": sys.exit(2)\nexcept Exception:\n sys.exit(2)\nsys.argv=[p]+sys.argv[1:]\nexec(compile(d,p,\"exec\"),{\"__name__\":\"__main__\",\"__file__\":p})' codex_review_gate.py gate-bash",
+      "timeout": 10
+    },
+    {
+      "event": "SessionStart",
+      "matcher": "",
+      "command": "/usr/bin/python3 -I -B -c 'import hashlib,json,os,pwd,sys,subprocess\nfrom pathlib import Path\ntry:\n payload=json.load(sys.stdin)\n cwd=payload.get(\"cwd\")\n if not isinstance(cwd,str) or not os.path.isabs(cwd): sys.exit(2)\n env={\"PATH\":\"/usr/bin:/bin\",\"HOME\":pwd.getpwuid(os.getuid()).pw_dir,\"GIT_CONFIG_GLOBAL\":\"/dev/null\",\"GIT_CONFIG_NOSYSTEM\":\"1\",\"GIT_NO_REPLACE_OBJECTS\":\"1\",\"GIT_TERMINAL_PROMPT\":\"0\"}\n root=subprocess.run([\"/usr/bin/git\",\"-C\",cwd,\"rev-parse\",\"--show-toplevel\"],env=env,capture_output=True,text=True)\n if root.returncode:\n  if any(os.path.lexists(p/\".git\") for p in (Path(cwd),*Path(cwd).parents)): sys.exit(2)\n  sys.exit(0)\n repo=Path(root.stdout.strip())\n if not os.path.lexists(repo/\".codex-gate.yaml\"):\n  committed=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"ls-tree\",\"HEAD\",\"--\",\".codex-gate.yaml\"],env=env,capture_output=True,text=True)\n  if committed.returncode==0 and not committed.stdout.strip(): sys.exit(0)\n  refs=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"show-ref\",\"--head\"],env=env,capture_output=True,text=True)\n  if refs.returncode in (0,1) and not refs.stdout.strip() and not refs.stderr.strip(): sys.exit(0)\n  if committed.returncode: sys.exit(2)\n p=pwd.getpwuid(os.getuid()).pw_dir+\"/.local/lib/claude-gates/native_hook.py\"\n d=open(p,\"rb\").read()\n if hashlib.sha256(d).hexdigest()!=\"696b0b8c98e6f16d1f2c461babf5e0f84c3759e4cf54a246c7039890c65fda13\": sys.exit(2)\nexcept Exception:\n sys.exit(2)\nsys.argv=[p]+sys.argv[1:]\nexec(compile(d,p,\"exec\"),{\"__name__\":\"__main__\",\"__file__\":p})' codex_review_gate.py clear-marker",
+      "timeout": 10
+    }
+  ]
+}

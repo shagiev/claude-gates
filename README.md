@@ -1,6 +1,6 @@
-# claude-gates — переносимые ревью-гейты Claude↔Codex
+# claude-gates — переносимые ревью-гейты Claude↔Codex↔Kimi
 
-Плагин `gates` для Claude Code и Codex: боевая система независимого ревью, портированная из
+Плагин `gates` для Claude Code, Codex и Kimi Code: боевая система независимого ревью, портированная из
 внутреннего боевого проекта (полный цикл 22.07.2026: ~35 реальных багов найдено независимым
 Codex-ревью, протокол сходимости довёл деплой до самостоятельного схождения). Слои:
 
@@ -82,11 +82,29 @@ Mandatory Claude adapter ищет native/legacy/npm CLI в `~/.local/bin`,
 Нормативный план adapters/certification:
 `docs/2026-07-30-cross-host-reviewer-architecture.md`.
 
+## Установка в Kimi Code
+
+```
+/plugins install <путь-к-клону>/plugins/gates
+/reload
+```
+
+Плагин поставляет `/gates:design-review`, `/gates:simplify`, `/gates:security-review`,
+`/gates:code-review` и `/gates:gates-init`. Независимый ревьюер по-прежнему Codex (при его
+недоступности для итеративного ревью можно использовать `cursor-agent`, но не саморевью Kimi).
+Для `write-marker` используется одноразовый `GATES_SESSION_NONCE` — инструкция есть в команде
+дизайн-ревью. Git-шим поддерживает OS-default `~/.kimi-code`; relocated `KIMI_CODE_HOME`
+не принимается. При одновременной активной установке Claude и Kimi их delivery digest обязан
+совпадать, иначе shim fail-closed. Установку и live-приёмку делай из чистого материализованного
+дерева, а не из каталога с `__pycache__`.
+
 ## Онбординг проекта
 
 В корне целевого git-репо: **`/gates-init`** — сгенерирует `.codex-gate.yaml` (код-пути,
 эпоха; опционально `empirical`/`deploy`-секции), поставит git-хуки-шимы (переживают
-обновления плагина; fail-closed при удалённом плагине), создаст `AGENTS.md` из скелета,
+обновления плагина; fail-closed при удалённом плагине) и gate-owned bootstrap resolver в
+`~/.local/lib/claude-gates/` вне worktree и одинаковые native+global Kimi hooks (Kimi их
+дедуплицирует, а global trust root не зависит от managed manifest), создаст `AGENTS.md` из скелета,
 покажет Makefile-snippet деплой-гейта (deploy-lock, `check-decision`, baseline), сделает
 онбординг-коммит.
 
@@ -97,7 +115,7 @@ Mandatory Claude adapter ищет native/legacy/npm CLI в `~/.local/bin`,
 
 ```
 /design-review (маркер --file c reviewed-hash) → правки кода
-→ bash .githooks/gates-run ladder_gate.py begin simplify → проход simplify → … mark simplify
+→ /bin/sh .githooks/gates-run ladder_gate.py begin simplify → проход simplify → … mark simplify
 → … begin code-review → /code-review (набирает ОПЕРАТОР) → … mark code-review
 → … begin security → проход security → … mark security
 → git commit                        # pre-commit проверяет цепочку
@@ -131,6 +149,7 @@ fail-safe/niche/стиль; **архитектурное** — исключит�
 - `docs/2026-07-23-inframon-interface-design.md` — интерфейс к внешнему guard'у (обе стороны границы).
 - `docs/methodology/` — исходные спеки системы: Phase 1 (Codex-гейты + стоп-политика),
   Phase 1.5 (лесенка), Phase 1.6 (протокол сходимости + carry-over).
-- Каждая фича прошла цикл: спека → Codex adversarial-review до approve → TDD → лесенка →
-  Codex-ревью кода до approve. Тесты: `python3 -m pytest tests/ -q` (278).
+- `docs/2026-11-01-kimi-host-support-design.md` — Kimi host, session handoff и trusted resolver.
+- Каждая фича проходит цикл: спека → независимое design-review → TDD → лесенка →
+  независимое code-review. Тесты: `python3 -m pytest tests/ -q`.
 - История изменений: `CHANGELOG.md`.

@@ -71,13 +71,46 @@ ls .githooks/ .git/hooks/ 2>/dev/null | grep -v sample
   (в `.git/hooks/` не-sample, или свои файлы в `.githooks/`) → **СТОП, спроси пользователя**:
   перезаписать / встроить цепочкой (наш шим вызывается из его хука) / отменить.
   Существующие хуки могут держать безопасность или деплой-автоматику — молча ломать нельзя.
-- Конфликтов нет:
+- Конфликтов нет. Bootstrap resolver ставится ВНЕ репозитория и не исполняется из worktree:
 ```bash
-mkdir -p .githooks
-cp "$T/githooks/gates-run" "$T/githooks/pre-commit" "$T/githooks/post-commit" \
-   "$T/githooks/pre-push" .githooks/
+mkdir -p "$HOME/.local/lib/claude-gates" .githooks
+cp "$T/githooks/kimi_install.py" "$HOME/.local/lib/claude-gates/kimi_install.py.tmp.$$"
+chmod 700 "$HOME/.local/lib/claude-gates"
+chmod 600 "$HOME/.local/lib/claude-gates/kimi_install.py.tmp.$$"
+mv -f "$HOME/.local/lib/claude-gates/kimi_install.py.tmp.$$" \
+  "$HOME/.local/lib/claude-gates/kimi_install.py"
+cp "$T/../scripts/native_hook.py" "$HOME/.local/lib/claude-gates/native_hook.py.tmp.$$"
+chmod 600 "$HOME/.local/lib/claude-gates/native_hook.py.tmp.$$"
+mv -f "$HOME/.local/lib/claude-gates/native_hook.py.tmp.$$" \
+  "$HOME/.local/lib/claude-gates/native_hook.py"
+cp "$T/githooks/gates-run" "$T/githooks/pre-commit" \
+   "$T/githooks/post-commit" "$T/githooks/pre-push" .githooks/
 chmod +x .githooks/gates-run .githooks/pre-commit .githooks/post-commit .githooks/pre-push
 git config core.hooksPath .githooks
+```
+
+В `~/.kimi-code/config.toml` ЗАМЕНИ все собственные записи `claude-gates/launch.sh` и
+`claude-gates/native_hook.py` на следующие три (другие hooks не трогай; при их отсутствии — добавь).
+Это предотвращает дублирование и digest-deadlock при обновлении. Их `command` СОВПАДАЕТ с plugin
+manifest, поэтому Kimi дедуплицирует native+global, а удаление/повреждение managed manifest не
+отключает G1:
+```toml
+[[hooks]]
+event = "PreToolUse"
+matcher = "^(?:(?:Multi)?Edit.*|Write.*|NotebookEdit.*|apply_patch.*|mcp__.*__.*(?:Edit|edit|Write|write|Patch|patch|Replace|replace|Truncate|truncate).*|mcp__.*__.*(?:Create|create|Update|update|Save|save|Delete|delete|Remove|remove|Move|move|Rename|rename|Append|append|Copy|copy).*(?:File|file|Path|path|Folder|folder|Directory|directory).*|mcp__.*__.*(?:File|file|Path|path|Folder|folder|Directory|directory).*(?:Create|create|Update|update|Save|save|Delete|delete|Remove|remove|Move|move|Rename|rename|Append|append|Copy|copy).*)$"
+command = "/usr/bin/python3 -I -B -c 'import hashlib,json,os,pwd,sys,subprocess\nfrom pathlib import Path\ntry:\n payload=json.load(sys.stdin)\n cwd=payload.get(\"cwd\")\n if not isinstance(cwd,str) or not os.path.isabs(cwd): sys.exit(2)\n env={\"PATH\":\"/usr/bin:/bin\",\"HOME\":pwd.getpwuid(os.getuid()).pw_dir,\"GIT_CONFIG_GLOBAL\":\"/dev/null\",\"GIT_CONFIG_NOSYSTEM\":\"1\",\"GIT_NO_REPLACE_OBJECTS\":\"1\",\"GIT_TERMINAL_PROMPT\":\"0\"}\n root=subprocess.run([\"/usr/bin/git\",\"-C\",cwd,\"rev-parse\",\"--show-toplevel\"],env=env,capture_output=True,text=True)\n if root.returncode:\n  if any(os.path.lexists(p/\".git\") for p in (Path(cwd),*Path(cwd).parents)): sys.exit(2)\n  sys.exit(0)\n repo=Path(root.stdout.strip())\n if not os.path.lexists(repo/\".codex-gate.yaml\"):\n  committed=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"ls-tree\",\"HEAD\",\"--\",\".codex-gate.yaml\"],env=env,capture_output=True,text=True)\n  if committed.returncode==0 and not committed.stdout.strip(): sys.exit(0)\n  refs=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"show-ref\",\"--head\"],env=env,capture_output=True,text=True)\n  if refs.returncode in (0,1) and not refs.stdout.strip() and not refs.stderr.strip(): sys.exit(0)\n  if committed.returncode: sys.exit(2)\n p=pwd.getpwuid(os.getuid()).pw_dir+\"/.local/lib/claude-gates/native_hook.py\"\n d=open(p,\"rb\").read()\n if hashlib.sha256(d).hexdigest()!=\"696b0b8c98e6f16d1f2c461babf5e0f84c3759e4cf54a246c7039890c65fda13\": sys.exit(2)\nexcept Exception:\n sys.exit(2)\nsys.argv=[p]+sys.argv[1:]\nexec(compile(d,p,\"exec\"),{\"__name__\":\"__main__\",\"__file__\":p})' codex_review_gate.py gate-edit"
+timeout = 10
+
+[[hooks]]
+event = "PreToolUse"
+matcher = "Bash"
+command = "/usr/bin/python3 -I -B -c 'import hashlib,json,os,pwd,sys,subprocess\nfrom pathlib import Path\ntry:\n payload=json.load(sys.stdin)\n cwd=payload.get(\"cwd\")\n if not isinstance(cwd,str) or not os.path.isabs(cwd): sys.exit(2)\n env={\"PATH\":\"/usr/bin:/bin\",\"HOME\":pwd.getpwuid(os.getuid()).pw_dir,\"GIT_CONFIG_GLOBAL\":\"/dev/null\",\"GIT_CONFIG_NOSYSTEM\":\"1\",\"GIT_NO_REPLACE_OBJECTS\":\"1\",\"GIT_TERMINAL_PROMPT\":\"0\"}\n root=subprocess.run([\"/usr/bin/git\",\"-C\",cwd,\"rev-parse\",\"--show-toplevel\"],env=env,capture_output=True,text=True)\n if root.returncode:\n  if any(os.path.lexists(p/\".git\") for p in (Path(cwd),*Path(cwd).parents)): sys.exit(2)\n  sys.exit(0)\n repo=Path(root.stdout.strip())\n if not os.path.lexists(repo/\".codex-gate.yaml\"):\n  committed=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"ls-tree\",\"HEAD\",\"--\",\".codex-gate.yaml\"],env=env,capture_output=True,text=True)\n  if committed.returncode==0 and not committed.stdout.strip(): sys.exit(0)\n  refs=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"show-ref\",\"--head\"],env=env,capture_output=True,text=True)\n  if refs.returncode in (0,1) and not refs.stdout.strip() and not refs.stderr.strip(): sys.exit(0)\n  if committed.returncode: sys.exit(2)\n p=pwd.getpwuid(os.getuid()).pw_dir+\"/.local/lib/claude-gates/native_hook.py\"\n d=open(p,\"rb\").read()\n if hashlib.sha256(d).hexdigest()!=\"696b0b8c98e6f16d1f2c461babf5e0f84c3759e4cf54a246c7039890c65fda13\": sys.exit(2)\nexcept Exception:\n sys.exit(2)\nsys.argv=[p]+sys.argv[1:]\nexec(compile(d,p,\"exec\"),{\"__name__\":\"__main__\",\"__file__\":p})' codex_review_gate.py gate-bash"
+timeout = 10
+
+[[hooks]]
+event = "SessionStart"
+command = "/usr/bin/python3 -I -B -c 'import hashlib,json,os,pwd,sys,subprocess\nfrom pathlib import Path\ntry:\n payload=json.load(sys.stdin)\n cwd=payload.get(\"cwd\")\n if not isinstance(cwd,str) or not os.path.isabs(cwd): sys.exit(2)\n env={\"PATH\":\"/usr/bin:/bin\",\"HOME\":pwd.getpwuid(os.getuid()).pw_dir,\"GIT_CONFIG_GLOBAL\":\"/dev/null\",\"GIT_CONFIG_NOSYSTEM\":\"1\",\"GIT_NO_REPLACE_OBJECTS\":\"1\",\"GIT_TERMINAL_PROMPT\":\"0\"}\n root=subprocess.run([\"/usr/bin/git\",\"-C\",cwd,\"rev-parse\",\"--show-toplevel\"],env=env,capture_output=True,text=True)\n if root.returncode:\n  if any(os.path.lexists(p/\".git\") for p in (Path(cwd),*Path(cwd).parents)): sys.exit(2)\n  sys.exit(0)\n repo=Path(root.stdout.strip())\n if not os.path.lexists(repo/\".codex-gate.yaml\"):\n  committed=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"ls-tree\",\"HEAD\",\"--\",\".codex-gate.yaml\"],env=env,capture_output=True,text=True)\n  if committed.returncode==0 and not committed.stdout.strip(): sys.exit(0)\n  refs=subprocess.run([\"/usr/bin/git\",\"-C\",str(repo),\"show-ref\",\"--head\"],env=env,capture_output=True,text=True)\n  if refs.returncode in (0,1) and not refs.stdout.strip() and not refs.stderr.strip(): sys.exit(0)\n  if committed.returncode: sys.exit(2)\n p=pwd.getpwuid(os.getuid()).pw_dir+\"/.local/lib/claude-gates/native_hook.py\"\n d=open(p,\"rb\").read()\n if hashlib.sha256(d).hexdigest()!=\"696b0b8c98e6f16d1f2c461babf5e0f84c3759e4cf54a246c7039890c65fda13\": sys.exit(2)\nexcept Exception:\n sys.exit(2)\nsys.argv=[p]+sys.argv[1:]\nexec(compile(d,p,\"exec\"),{\"__name__\":\"__main__\",\"__file__\":p})' codex_review_gate.py clear-marker"
+timeout = 10
 ```
 
 ## 5. `.gitignore` — служебные файлы гейтов
@@ -129,4 +162,6 @@ flock), `check-decision` прямо перед выкаткой, запись `.
 (`/design-review` → правки → `begin/mark simplify` → `/simplify` → … → commit →
 `check-reviewed` на деплое); протокол сходимости (`findings` / `adjudicate`); escape-hatch'и
 (`LADDER_SKIP=1`, `CODEX_REVIEW_SKIP=1` — оба аудируются) и что G1-маркер сбрасывается
-каждую сессию.
+каждую сессию. На Kimi вместо Claude-команд — `/gates:design-review`, `/gates:simplify`,
+`/gates:security-review`, `/gates:code-review`; nonce для `write-marker` обязателен.
+Шим поддерживает только OS-default `~/.kimi-code`, relocated `KIMI_CODE_HOME` не принимается.
