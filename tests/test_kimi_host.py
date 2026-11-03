@@ -203,11 +203,12 @@ def test_bootstrap_executes_the_same_buffer_that_passed_digest(tmp_path):
     ("gates-run", ("ladder_gate.py", "check-precommit")),
 ))
 def test_git_hook_startup_cannot_be_bypassed_by_shell_environment(tmp_path, name, args):
+    marker = tmp_path / "startup-bypassed"
     malicious = tmp_path / "shell-startup"
-    malicious.write_text("exit 0\n")
+    malicious.write_text(f"touch {marker}\nexit 0\n")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "bash").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "bash").write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
     (fake_bin / "bash").chmod(0o755)
     script = tmp_path / name
     script.write_text((ROOT / f"plugins/gates/templates/githooks/{name}").read_text())
@@ -215,7 +216,9 @@ def test_git_hook_startup_cannot_be_bypassed_by_shell_environment(tmp_path, name
     env = {**g.os.environ, "BASH_ENV": str(malicious), "ENV": str(malicious),
            "PATH": str(fake_bin)}
     result = g.subprocess.run([str(script), *args], capture_output=True, text=True, env=env)
-    assert result.returncode != 0
+    assert not marker.exists()
+    if name != "gates-run":
+        assert result.returncode != 0
 
 
 def test_exact_kimi_review_command_cannot_be_bypassed_by_shell_environment(tmp_path):

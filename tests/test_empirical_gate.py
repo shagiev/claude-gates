@@ -92,6 +92,18 @@ def test_config_unreadable_no_pyyaml(repo, monkeypatch):
     assert g._empirical_config(repo, "HEAD")[0] == "unreadable"      # S7b
 
 
+def test_json_config_is_enabled_without_pyyaml(repo, monkeypatch):
+    _commit_config(repo, '{"empirical":{"test_command":"true","timeout_s":30}}', "cfg-json")
+    monkeypatch.setattr(g, "yaml", None)
+    assert g._empirical_config(repo, "HEAD") == ("enabled", "true", 30)
+
+
+def test_nonstandard_json_constants_are_unreadable_without_pyyaml(repo, monkeypatch):
+    _commit_config(repo, '{"empirical":{"test_command":NaN}}', "cfg-nan")
+    monkeypatch.setattr(g, "yaml", None)
+    assert g._empirical_config(repo, "HEAD")[0] == "unreadable"
+
+
 def test_config_unreadable_bad_ref(repo):
     # ls-tree по несуществующему ref падает → unreadable, НЕ absent (R4-F1, git-сбой ≠ «чисто»)
     assert g._empirical_config(repo, "deadbeef" * 5)[0] == "unreadable"   # S14

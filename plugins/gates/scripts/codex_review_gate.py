@@ -450,6 +450,12 @@ def _onboarded(root: Path) -> bool:
     return True                           # unreadable: считаем онбордженным и блокируем
 
 
+def _strict_json_loads(text: str):
+    def reject(value):
+        raise ValueError(f"нестандартная JSON-константа: {value}")
+    return json.loads(text, parse_constant=reject)
+
+
 def _read_gate_config(root: Path) -> "dict | None":
     """Парсит .codex-gate.yaml. Без PyYAML принимается JSON-совместимый YAML; остальные
     нечитаемые формы → None и строгий режим (безопасные дефолты, решение 1)."""
@@ -468,7 +474,7 @@ def _read_gate_config(root: Path) -> "dict | None":
         return None
     if yaml is None:
         try:
-            data = json.loads(text)
+            data = _strict_json_loads(text)
         except ValueError:
             print(f"[codex-gate] PyYAML не установлен — {GATE_CONFIG_NAME} нечитаем, строгий "
                   "режим (все пути = код). Почини: pip install pyyaml или используй JSON-"
@@ -2046,11 +2052,15 @@ def _config_section_at_ref(root: Path, ref: str, section: str) -> "tuple[str, di
     if blob is None or blob.returncode != 0:
         return ("unreadable", None)             # путь есть, но объект не читается
     if yaml is None:
-        return ("unreadable", None)             # нет PyYAML при наличии файла — не подтвердить
-    try:
-        data = yaml.safe_load(blob.stdout)   # слой отдаёт text=True
-    except (yaml.YAMLError, UnicodeError):
-        return ("unreadable", None)
+        try:
+            data = _strict_json_loads(blob.stdout)
+        except ValueError:
+            return ("unreadable", None)
+    else:
+        try:
+            data = yaml.safe_load(blob.stdout)   # слой отдаёт text=True
+        except (yaml.YAMLError, UnicodeError):
+            return ("unreadable", None)
     if not isinstance(data, dict):
         return ("absent", None)                 # валидный YAML, не dict — секции нет
     sec = data.get(section)
