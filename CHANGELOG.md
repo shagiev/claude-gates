@@ -12,6 +12,12 @@ coexistence требуют одинаковый delivery digest. Поставл�
 Server API, машиночитаемый transcript и crash-safe API-owned recovery без raw rewrite общего
 `installed.json`. Дизайн: `docs/2026-11-01-kimi-host-support-design.md`.
 
+## 0.10.10 — 2026-11-03
+
+Таймаут Cursor reviewer увеличен с 1800 до 3600 секунд: полный Kerio diff потребовал
+больше получаса у Grok 4.7 High. Прежний лимит обрывал ревью до verdict. Модель, corpus,
+изоляция и fail-closed обработка не меняются.
+
 ## 0.10.9 — 2026-11-03
 
 Таймаут Cursor reviewer увеличен с 600 до 1800 секунд: замер Grok 4.7 на полном deploy-диффе
