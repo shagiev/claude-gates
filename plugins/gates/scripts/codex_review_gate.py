@@ -231,7 +231,8 @@ _REDACT_RULES = (
 #   6. эхо `empirical.test_command` в сообщении прогона;
 #   7. хвост stdout/stderr тест-команды → _run_empirical();
 #   8. ТЕКСТ ИСКЛЮЧЕНИЯ (TimeoutExpired/OSError/ValueError) — включает весь argv команды;
-#   9. stdout/stderr `cursor-agent` (провайдер cursor) → run_cursor_review();
+#   9. stdout/stderr `cursor-agent` (провайдер cursor) → _discover_cursor_grok_high(),
+#      run_cursor_review() и certified Cursor adapter;
 #  10. тело дизайн-ревью → CLI `companion-review`. ОСОЗНАННОЕ ИСКЛЮЧЕНИЕ: печатается ДОСЛОВНО.
 #      Это не диагностика, а предмет чтения; редакция по шаблонам порезала бы находку,
 #      цитирующую sha256, `token=`-строку или любой длинный идентификатор, и ревью стало бы
@@ -706,7 +707,8 @@ def _sterile_codex_home(requested_model: str) -> "str | None":
         return None
 
 
-def _certified_subprocess_env(codex_home: "str | None" = None) -> dict:
+def _certified_subprocess_env(codex_home: "str | None" = None, *,
+                              cursor_auth: bool = False) -> dict:
     """Минимальное окружение: аллоулист + доверенные PATH и HOME. Ни одна переменная
     вызывающего не может ни подменить бинарь, ни увести запрос на чужой эндпоинт."""
     env = {k: v for k, v in os.environ.items() if k in _CERTIFIED_ENV_ALLOW}
@@ -719,6 +721,8 @@ def _certified_subprocess_env(codex_home: "str | None" = None) -> dict:
         _trusted_home() / ".claude" / "plugins" / "data" / "codex-openai-codex")
     if codex_home:
         env["CODEX_HOME"] = codex_home
+    if cursor_auth and os.environ.get("CURSOR_API_KEY"):
+        env["CURSOR_API_KEY"] = os.environ["CURSOR_API_KEY"]
     return env
 
 
@@ -2415,11 +2419,15 @@ def _empirical_gate(baseline: str, head: str) -> int:
 # REVIEW_PROVIDER отсутствует → portable. Legacy codex|cursor|both доступен только явно.
 # Неизвестное/пустое значение → БЛОК (тихий фолбэк скрыл бы опечатку и создал ложное
 # впечатление «ревьюил тот, кого просили»). Адаптер cursor — В КОДЕ, а не в шаблоне:
-# allow-list модели, --trust, --mode ask и таймаут обязаны быть неотключаемыми.
+# семейство/режим модели, --trust, --mode ask и таймаут обязаны быть неотключаемыми.
 _LEGACY_PROVIDERS = ("codex", "cursor", "both")
 _PORTABLE_PROFILES = ("portable", "strong", "gemini")
 _PROVIDERS = _LEGACY_PROVIDERS + _PORTABLE_PROFILES
-_CURSOR_MODEL = "grok-4.7-high"            # другое СЕМЕЙСТВО, чем codex (gpt-5.6-sol) → разнообразие
+_CURSOR_MODEL = "grok-4.7-high"            # вход corpus certification; НЕ fallback legacy resolver'а
+_CURSOR_MODELS_TIMEOUT_S = 30
+_CURSOR_MODELS_OUTPUT_LIMIT = 256 * 1024
+_CURSOR_GROK_HIGH_RE = re.compile(
+    r"^(?:cursor-)?grok-([0-9]{1,9})\.([0-9]{1,9})(?:\.([0-9]{1,9}))?-high$")
 _CURSOR_TIMEOUT_S = 7200
 _CURSOR_DIFF_LIMIT = 300_000
 _GEMINI_MODEL = "gemini-2.5-pro"
@@ -2709,15 +2717,75 @@ def resolve_providers() -> "tuple[tuple[str, ...] | None, str]":
     return ((("codex", "cursor") if v == "both" else (v,)), "")
 
 
-def resolve_cursor_model() -> "tuple[str | None, str]":
-    """(модель, ошибка). Оверрайд только через CURSOR_REVIEW_MODEL и только из allow-list."""
-    m = (os.environ.get("CURSOR_REVIEW_MODEL") or _CURSOR_MODEL).strip()
-    low = m.lower()
-    if "claude" in low or low == "auto" or m not in _CURSOR_MODEL_ALLOW:
-        return (None, f"[codex-gate] \u2717 модель ревьюера {m!r} недопустима: ревьюер обязан быть "
-                      "НЕ-Anthropic (Claude пишет код — Claude-ревьюер это самопроверка), "
-                      "`auto` запрещён (скрытая маршрутизация).")
-    return (m, "")
+def _discover_cursor_grok_high(binary: str) -> "tuple[list[str] | None, str]":
+    sterile_cwd = _sterile_mkdtemp("gates-cursor-models-")
+    if sterile_cwd is None:
+        return (None, "не создать стерильный cwd для cursor-agent models")
+    try:
+        with tempfile.TemporaryFile(dir=sterile_cwd) as stdout, \
+                tempfile.TemporaryFile(dir=sterile_cwd) as stderr:
+            try:
+                r = subprocess.run([binary, "models"], cwd=sterile_cwd,
+                                   env=_certified_subprocess_env(cursor_auth=True),
+                                   stdout=stdout, stderr=stderr,
+                                   timeout=_CURSOR_MODELS_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                return (None, f"таймаут cursor-agent models ({_CURSOR_MODELS_TIMEOUT_S}s)")
+            stdout.flush()
+            stderr.flush()
+            if any(os.fstat(stream.fileno()).st_size > _CURSOR_MODELS_OUTPUT_LIMIT
+                   for stream in (stdout, stderr)):
+                return (None, "вывод cursor-agent models превышает лимит — список не засчитан")
+            stdout.seek(0)
+            stderr.seek(0)
+            try:
+                stdout_text = stdout.read().decode("utf-8")
+                stderr_text = stderr.read().decode("utf-8")
+            except UnicodeError:
+                return (None, "вывод cursor-agent models не UTF-8")
+            if r.returncode != 0:
+                return (None, redact_secrets(
+                    (stderr_text or stdout_text
+                     or "cursor-agent models завершился с ошибкой").strip())[:300])
+            models = []
+            for line in stdout_text.splitlines():
+                slug = line.split(" - ", 1)[0].strip()
+                slug = re.sub(r"\s+\((?:current|default)(?:,\s*(?:current|default))?\)$",
+                              "", slug, flags=re.IGNORECASE)
+                if _CURSOR_GROK_HIGH_RE.fullmatch(slug):
+                    models.append(slug)
+            return (models, "")
+    except (OSError, UnicodeError) as e:
+        return (None, redact_secrets(f"cursor-agent models: {type(e).__name__}: {e}")[:300])
+    finally:
+        shutil.rmtree(sterile_cwd, ignore_errors=True)
+
+
+def resolve_cursor_model(binary: "str | None" = None) -> "tuple[str | None, str]":
+    """Самая новая доступная Grok high; override обязан быть в фактическом списке CLI."""
+    binary = binary or _resolve_cursor_bin()
+    if binary is None:
+        return (None, "cursor-agent не найден (установлен ли Cursor CLI?)")
+    discovered, err = _discover_cursor_grok_high(binary)
+    if discovered is None:
+        return (None, err)
+    requested = (os.environ.get("CURSOR_REVIEW_MODEL") or "").strip()
+    if requested and (not _CURSOR_GROK_HIGH_RE.fullmatch(requested)
+                      or requested not in discovered):
+        return (None, f"[codex-gate] ✗ модель ревьюера {requested!r} недопустима: нужен точный "
+                      "Grok high из `cursor-agent models`; auto, GPT/Claude и неизвестные ID "
+                      "запрещены")
+    if requested:
+        return (requested, "")
+    candidates = {}
+    for slug in discovered:
+        match = _CURSOR_GROK_HIGH_RE.fullmatch(slug)
+        version = (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+        if version not in candidates or slug.startswith("cursor-"):
+            candidates[version] = slug
+    if not candidates:
+        return (None, "cursor-agent не предлагает Grok high; fallback на auto/GPT запрещён")
+    return (candidates[max(candidates)], "")
 
 
 # Явный отказ ревьюера в narration ДО вердикта (ревью R4). Полностью запретить префикс нельзя —
@@ -2951,7 +3019,10 @@ def _resolve_cursor_bin() -> "str | None":
 
 def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
     """(текст в нашем контракте | None, диагностика). None = отказ → fail-closed у вызывающего."""
-    model, err = resolve_cursor_model()
+    binary = _resolve_cursor_bin()
+    if binary is None:
+        return (None, "cursor-agent не найден (установлен ли Cursor CLI?)")
+    model, err = resolve_cursor_model(binary)
     if model is None:
         return (None, err)
     try:
@@ -2962,9 +3033,6 @@ def run_cursor_review(base: str, head: str) -> "tuple[str | None, str]":
     if len(diff_text) > _CURSOR_DIFF_LIMIT:
         return (None, f"дифф {len(diff_text)} символов > лимита {_CURSOR_DIFF_LIMIT} — сузь "
                       "диапазон или REVIEW_PROVIDER=codex (усечённое ревью выглядело бы полным)")
-    binary = _resolve_cursor_bin()
-    if binary is None:
-        return (None, "cursor-agent не найден (установлен ли Cursor CLI?)")
     cmd = [binary, "-p", "--output-format", "json", "--mode", "ask", "--trust",
            "--model", model, _build_cursor_prompt(diff_text)]
     try:
@@ -4255,10 +4323,9 @@ def review_with_provider(provider: str, base: str,
         return ((v if v.valid else None), codex_model(),
                 "" if v.valid else (outage_details(out) or "невалидный вывод"))
     text, info = run_cursor_review(base, head)
-    model = info[len("model="):] if info.startswith("model=") else \
-        (os.environ.get("CURSOR_REVIEW_MODEL") or _CURSOR_MODEL)
     if text is None:
-        return (None, model, info)
+        return (None, "unknown", info)
+    model = info[len("model="):] if info.startswith("model=") else "unknown"
     v = parse_review_output(text)
     return ((v if v.valid else None), model,
             "" if v.valid else "вывод не прошёл валидацию контракта")
