@@ -4,10 +4,67 @@ set -u
 SCRIPT="${1:?usage: gates-run <script.py> [args...]}"
 shift
 PY=""
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-  if [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] \
-      && [ -z "$(/usr/bin/find "$candidate" -perm -022 -print -quit)" ] \
-      && [ -z "$(/usr/bin/find "$candidate" ! -user root -print -quit)" ]; then
+TRUST_ROOT=/
+ROOT_PREFIX=${TRUST_ROOT%/}
+KERNEL=$(/usr/bin/uname -s) || KERNEL=""
+_trusted_owner() {
+  PROBE=$(/usr/bin/find "$1" -maxdepth 0 ! -user root -print -quit) || return 1
+  [ -z "$PROBE" ]
+}
+_trusted_acl() {
+  case "$KERNEL" in
+    Darwin)
+      PROBE=$(/usr/bin/find "$1" -maxdepth 0 -acl -print -quit) || return 1
+      [ -z "$PROBE" ] || return 1
+      ;;
+    Linux) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_trusted_metadata() {
+  PROBE=$(/usr/bin/find "$1" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit) || return 1
+  [ -z "$PROBE" ] || return 1
+  _trusted_owner "$1" || return 1
+  _trusted_acl "$1"
+}
+_trusted_directory() {
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  _trusted_metadata "$1"
+}
+_trusted_ancestors() {
+  ANCESTOR=$1
+  while :; do
+    _trusted_directory "$ANCESTOR" || return 1
+    [ "$ANCESTOR" != "$TRUST_ROOT" ] || break
+    ANCESTOR=${ANCESTOR%/*}
+    [ -n "$ANCESTOR" ] || ANCESTOR=$TRUST_ROOT
+  done
+}
+_trusted_regular() {
+  [ -f "$1" ] && [ -x "$1" ] && [ ! -L "$1" ] || return 1
+  _trusted_ancestors "${1%/*}" || return 1
+  _trusted_metadata "$1"
+}
+for candidate in "$ROOT_PREFIX/opt/homebrew/bin/python3" "$ROOT_PREFIX/usr/local/bin/python3" \
+    "$ROOT_PREFIX/usr/bin/python3"; do
+  if [ -L "$candidate" ]; then
+    [ "$candidate" = "$ROOT_PREFIX/usr/bin/python3" ] || continue
+    _trusted_ancestors "${candidate%/*}" || continue
+    _trusted_owner "$candidate" || continue
+    _trusted_acl "$candidate" || continue
+    target=$(/usr/bin/readlink "$candidate") || continue
+    case "$target" in
+      python3.[0-9]*)
+        version=${target#python3.}
+        case "$version" in
+          *[!0-9.]*|.*|*..*|*.) continue ;;
+        esac
+        candidate="$ROOT_PREFIX/usr/bin/$target"
+        ;;
+      *) continue ;;
+    esac
+  fi
+  if _trusted_regular "$candidate"; then
     PY="$candidate"
     break
   fi
@@ -23,14 +80,14 @@ BOOT_SHA256=a669a28804370f4134ea2cef0ea598c8e323c549076643ffecb5ebc8675973ae
 GATES_UID=$(/usr/bin/id -u)
 for directory in "$GATE_HOME" "$GATE_HOME/.local" "$GATE_HOME/.local/lib" "$BOOT_DIR"; do
   if [ ! -d "$directory" ] || [ -L "$directory" ] \
-      || [ -n "$(/usr/bin/find "$directory" -maxdepth 0 -perm -022 -print -quit)" ] \
+      || [ -n "$(/usr/bin/find "$directory" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit)" ] \
       || [ -n "$(/usr/bin/find "$directory" -maxdepth 0 ! -user "$GATES_UID" -print -quit)" ]; then
     echo "[gates] gate-owned bootstrap path отсутствует или небезопасен — запусти /gates-init." >&2
     exit 1
   fi
 done
 if [ ! -f "$BOOT" ] || [ -L "$BOOT" ] \
-    || [ -n "$(/usr/bin/find "$BOOT" -perm -022 -print -quit)" ] \
+    || [ -n "$(/usr/bin/find "$BOOT" \( -perm -020 -o -perm -002 \) -print -quit)" ] \
     || [ -n "$(/usr/bin/find "$BOOT" ! -user "$GATES_UID" -print -quit)" ]; then
   echo "[gates] $BOOT отсутствует или небезопасен — запусти /gates-init." >&2
   exit 1

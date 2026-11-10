@@ -1,6 +1,6 @@
 {
   "name": "gates",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "description": "AI SDLC gates: independent design/code review, simplify, security, ladder and deploy review for Claude Code, Codex and Kimi Code.",
   "skills": "./skills/",
   "commands": "./commands/",

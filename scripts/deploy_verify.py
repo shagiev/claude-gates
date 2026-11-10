@@ -196,8 +196,8 @@ def tree_digest(entries: dict) -> str:
 
 
 #: Единственное, что законно лежит в установке помимо закреплённого дерева. Замерено на живых
-#: установках обоих каналов: `.in_use/<pid>` (Claude), `__pycache__` (побочный продукт запуска
-#: гейта), `.orphaned_at`, метаданные маркетплейса Codex, `.git` клона. Список экземплярный
+#: установках обоих каналов: `.in_use/<pid>` (Claude), `.orphaned_at`, метаданные маркетплейса
+#: Codex, `.git` клона. `__pycache__` НЕ tolerated, а обнаруживается без удаления. Список экземплярный
 #: сознательно: неизвестный новый файл красит деплой в КРАСНЫЙ, и это верная сторона отказа.
 _EXTRA_DIRS = frozenset({".in_use", ".git"})
 _EXTRA_FILES = frozenset({".orphaned_at", ".codex-marketplace-install.json", ".DS_Store"})
@@ -209,27 +209,8 @@ def _extra_ok(rel: str) -> bool:
         or parts[-1] in _EXTRA_FILES
 
 
-def _drop_stale_bytecode(root: pathlib.Path) -> int:
-    """Снять `__pycache__` из установки ПЕРЕД доказательством.
-
-    Байткод был терпимым слепым пятном под неверной посылкой «source-less `.pyc` не
-    импортируется». Правило другое: CPython при штатной инвалидации сверяет только 8 байт
-    заголовка (mtime и размер исходника), содержимое не проверяется вовсе — подделанный `.pyc`
-    с этими байтами, снятыми с нетронутого `.py`, грузится ВМЕСТО исходника. Воспроизведено:
-    произвольный код исполнялся внутри гейта при зелёном дереве и обеих пройденных smoke.
-
-    Снимаем, а не жалуемся: байткод — кэш без полномочий, удаление ничего не теряет и делает
-    «что исполнится» равным «что захэшировано». Генерация закрыта отдельно — гейт и шим ходят
-    через `python3 -B`. Граница честная: проверка утверждает состояние на МОМЕНТ проверки, и
-    локальный процесс с правами на запись может подложить заново — ровно как может и
-    отредактировать сам `.py`."""
-    dropped = 0
-    for dirpath, dirnames, _f in os.walk(root):
-        for d in [d for d in dirnames if d == "__pycache__"]:
-            shutil.rmtree(os.path.join(dirpath, d), ignore_errors=True)
-            dirnames.remove(d)
-            dropped += 1
-    return dropped
+def _raise_walk_error(error: OSError) -> None:
+    raise error
 
 
 def check_tree(root: pathlib.Path, want: dict):
@@ -238,14 +219,17 @@ def check_tree(root: pathlib.Path, want: dict):
 
     Терпимость к лишним файлам была ошибкой: каталог `scripts` первым лежит в `sys.path` того,
     что из него запускается, поэтому подброшенный `scripts/json.py` затеняет stdlib для
-    `ladder_gate.py` — при полностью сошедшихся mode+oid всех 20 файлов и зелёном флоте.
-    `__pycache__` терпится отдельно: source-less `.pyc` в нём не импортируется, а без него
-    каждый запуск гейта красил бы деплой."""
+    `ladder_gate.py`. `__pycache__` любого типа — отдельный fail-closed результат: verifier
+    только сообщает путь и НЕ удаляет/не открывает cache. Это сохраняет данные даже при bind
+    mount и не оставляет подавленных ошибок удаления."""
     problems = []
-    _drop_stale_bytecode(root)
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise_walk_error):
         for d in list(dirnames):
             rel_d = os.path.relpath(os.path.join(dirpath, d), root)
+            if d == "__pycache__":
+                problems.append(f"bytecode cache {rel_d} — проверь и удали его вручную")
+                dirnames.remove(d)
+                continue
             if os.path.islink(os.path.join(dirpath, d)) and rel_d not in want:
                 # `os.walk` симлинк-каталоги НЕ обходит, а цикл ожиданий читает файлы СКВОЗЬ
                 # них: подменённый `scripts/` → симлинк на чужой каталог с верными копиями плюс
@@ -255,7 +239,9 @@ def check_tree(root: pathlib.Path, want: dict):
                        and not os.path.islink(os.path.join(dirpath, d))]
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), root)
-            if rel not in want and not _extra_ok(rel):
+            if name == "__pycache__":
+                problems.append(f"bytecode cache {rel} — проверь и удали его вручную")
+            elif rel not in want and not _extra_ok(rel):
                 problems.append(f"лишний файл {rel} — установка не равна закреплённому дереву")
     for rel in sorted(want):
         f = root / rel
@@ -345,14 +331,13 @@ def _run_gate(install_root: pathlib.Path, repo: pathlib.Path, script, *args, env
     shutil.copy2(shim, dst)
     resolver_src = install_root / "templates" / "githooks" / "kimi_install.py"
     if resolver_src.is_file():
-        marker = 'GATE_HOME=$("$PY" -I -B -c \'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)\')'
         body = dst.read_text()
-        if marker in body:
+        body, home_count = re.subn(r"GATE_HOME=.*", f'GATE_HOME="{home}"', body, count=1)
+        if home_count == 1:
             resolver_body = resolver_src.read_text().replace(
                 "return Path(pwd.getpwuid(os.getuid()).pw_dir)", f"return Path({str(home)!r})")
             digest = hashlib.sha256(resolver_body.encode()).hexdigest()
-            body, count = re.subn(r"BOOT_SHA256=[0-9a-f]{64}", f"BOOT_SHA256={digest}",
-                                  body.replace(marker, f'GATE_HOME="{home}"'))
+            body, count = re.subn(r"BOOT_SHA256=[0-9a-f]{64}", f"BOOT_SHA256={digest}", body)
             if count != 1:
                 raise RuntimeError("smoke не нашёл digest-pin в gates-run")
             dst.write_text(body)

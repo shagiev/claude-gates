@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.11.3 — 2026-11-08
+
+Исправлен fail-closed отказ `gates-run` на штатном Linux `/usr/bin/python3 → python3.14`, из-за
+которого deploy 0.11.2 не проходил удалённые smoke и автоматически откатывался. Resolver теперь
+допускает только root-owned same-dir numeric symlink targets, включая patch versions. Для всех
+кандидатов проверяется полная ancestor chain до `/`, успешный rc ownership/mode probes и отсутствие
+Darwin ACL; Linux effective ACL-mask по-прежнему покрывается mode-проверкой. Ошибка любого probe и
+неподдерживаемая ОС останавливают запуск. По решению владельца сохранена граница
+R-ARTIFACT-PROVENANCE/ML-E5: OS и окружение оператора trusted, second stage и shell-scrub не
+добавляются; сертифицированные allowlists не меняются. На symlink-only Linux сломанный 0.11.2 не
+является рабочей rollback target: сначала восстанавливается проверенная pre-0.11 версия, deploy не
+обходит эту проверку. Добавлены исполняемые RED/security-сценарии
+для каждого candidate, реальный macOS ACL-негатив и offline Docker полного shim. Дизайн (10 раундов
+Codex, approve): `docs/2026-11-05-versioned-system-python-design.md`.
+
+First-party test/deploy/recertify/acceptance entrypoints и их children больше не создают
+`__pycache__`: все Makefile Python recipes используют `$(PYTHON) -B`, а
+`PYTHONDONTWRITEBYTECODE=1` принудителен даже при пустом env/command-line значении. Deploy
+verification больше не удаляет bytecode: прежний `rmtree(ignore_errors=True)` на реальном Linux
+bind mount удалил sentinel вне installation и вернул отсутствие проблем. Теперь cache любого типа
+даёт fail-closed диагностику без unlink/rmtree/rename; real bind acceptance подтверждает сохранность
+данных. По решению владельца постоянный cleaner/quarantine/permission не добавляются. Дизайн (14
+раундов, approve): `docs/2026-11-08-pycache-clean-command-design.md`.
+
 ## 0.11.2 — 2026-11-04
 
 Legacy Cursor fallback больше не закреплён на устаревшей модели: при каждом резолве список

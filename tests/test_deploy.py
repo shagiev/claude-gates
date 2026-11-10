@@ -23,7 +23,7 @@ import deploy_verify as dv         # noqa: E402
 @pytest.fixture()
 def install(tmp_path):
     """Полная копия плагина — «установленная версия» на фейковом хосте (нужны и scripts, и
-    templates/githooks/gates-run: smoke ходит через шим)."""
+    templates/githooks/gates-run: smoke ходит через две стадии одного файла)."""
     d = tmp_path / "install"
     shutil.copytree(ROOT / "plugins" / "gates", d,
                     ignore=shutil.ignore_patterns("__pycache__"))
@@ -178,12 +178,15 @@ def test_codex_production_address_is_refused():
             "toplevel": os.path.expanduser("~/.codex/.tmp/marketplaces/lenar-gates")}}))
 
 
-def test_bytecode_removal_cannot_target_a_real_install():
-    """`check_tree` безусловно `rmtree`'ит `__pycache__` под своим аргументом, а он приходит ни
-    из `installed()`, ни из спека — единственный разрушительный примитив мимо остальных слоёв."""
-    with pytest.raises(AssertionError, match="НАСТОЯЩУЮ установку"):
-        dv.check_tree(Path(os.path.expanduser(
-            "~/.claude/plugins/cache/lenar-gates/gates/0.10.0")), {})
+def test_bytecode_check_is_read_only(tmp_path):
+    root = tmp_path / "install"
+    cache = root / "scripts" / "__pycache__"
+    cache.mkdir(parents=True)
+    sentinel = cache / "sentinel.pyc"
+    sentinel.write_text("keep")
+    problems = dv.check_tree(root, {})
+    assert any("__pycache__" in problem for problem in problems)
+    assert sentinel.read_text() == "keep"
 
 
 def test_restore_aimed_at_the_real_home_is_refused(monkeypatch):
@@ -612,20 +615,17 @@ def test_extra_file_under_scripts_is_a_problem(install):
 
 def test_installer_metadata_is_tolerated(install):
     """Замерено на живых установках обоих каналов: без этого каждый запуск гейта красил бы
-    деплой."""
+    деплой. Bytecode metadata к этим исключениям НЕ относится."""
     tree = _full_tree(install)
     (install / ".in_use").mkdir(exist_ok=True)
     (install / ".in_use" / "12345").write_text("")
-    (install / "scripts" / "__pycache__").mkdir(exist_ok=True)
-    (install / "scripts" / "__pycache__" / "x.cpython-313.pyc").write_text("")
     (install / ".orphaned_at").write_text("2026")
     assert dv.check_tree(install, tree) == []
 
 
-def test_poisoned_bytecode_is_removed_before_the_proof(install):
-    """Подделанный `.pyc` грузится ВМЕСТО исходника: CPython при штатной инвалидации сверяет
-    только 8 байт заголовка (mtime и размер), содержимое — нет. Воспроизведено: произвольный
-    код исполнялся внутри гейта при зелёном дереве и обеих пройденных smoke."""
+def test_poisoned_bytecode_is_refused_without_removal(install):
+    """Подделанный `.pyc` грузится ВМЕСТО исходника, поэтому verifier обязан отказать, а не
+    молча удалять потенциально внешние данные и продолжать deploy."""
     import py_compile
     import struct
     tree = _full_tree(install)
@@ -644,8 +644,50 @@ def test_poisoned_bytecode_is_removed_before_the_proof(install):
     pyc.write_bytes(bytes(raw))
 
     assert src.read_bytes() == before, "атака не трогает исходник — в этом и суть"
-    assert dv.check_tree(install, tree) == []
-    assert not pyc.exists(), "байткод остался: исполнится он, а захэширован был исходник"
+    assert any("__pycache__" in problem for problem in dv.check_tree(install, tree))
+    assert pyc.exists(), "verifier не должен мутировать installation"
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "file"])
+def test_bytecode_cache_of_any_type_is_detected_without_mutation(install, monkeypatch, kind):
+    tree = _full_tree(install)
+    cache = install / "scripts" / "__pycache__"
+    outside = install.parent / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep")
+    if kind == "directory":
+        cache.mkdir()
+        (cache / "x.pyc").write_text("keep")
+    elif kind == "symlink":
+        os.symlink(outside, cache)
+    else:
+        cache.write_text("keep")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("check_tree не должен вызывать rmtree")
+
+    monkeypatch.setattr(dv.shutil, "rmtree", forbidden)
+    assert any("__pycache__" in problem for problem in dv.check_tree(install, tree))
+    assert sentinel.read_text() == "keep"
+    if kind == "directory":
+        assert (cache / "x.pyc").read_text() == "keep"
+    elif kind == "file":
+        assert cache.read_text() == "keep"
+    else:
+        assert cache.is_symlink()
+
+
+def test_bytecode_detector_does_not_swallow_walk_errors(install, monkeypatch):
+    tree = _full_tree(install)
+
+    def broken_walk(root, **kwargs):
+        yield str(root), ["scripts"], []
+        kwargs["onerror"](PermissionError("read denied"))
+
+    monkeypatch.setattr(dv.os, "walk", broken_walk)
+    with pytest.raises(PermissionError, match="read denied"):
+        dv.check_tree(install, tree)
 
 
 def test_symlinked_directory_hiding_extra_files_is_caught(install):
@@ -1139,7 +1181,7 @@ def test_transport_failure_is_never_read_as_absent(fake_host):
     real = dg.on_host
 
     def only_agent_fails(host, argv, stdin=None):
-        if argv[:2] == ["python3", "-"]:
+        if argv[:3] == ["python3", "-B", "-"]:
             return subprocess.CompletedProcess(argv, 255, "", "ssh: connection timed out")
         return real(host, argv, stdin)
 

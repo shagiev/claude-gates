@@ -310,10 +310,16 @@ coexistence не исполняет устаревший gate; одинаков�
   Kimi hooks вызывают `/usr/bin/env -i … /bin/sh` и plugin launcher; launcher принимает только
   allowlisted script basename и выбирает Python из фиксированных системных кандидатов
   (`/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3`) с regular-file,
-  ownership и no-group/world-write проверками. Запуск — `-I -B`: игнорируются `PYTHON*`,
-  cwd и user site. `gates-run` использует тот же резолвер Python, а не PATH; shell-вызовы
-  `ls/sort/tail` убираются в Python. Для служебных skip/session переменных передаётся явный
-  allowlist, остальное environment очищается ДО любого Python-кода.
+  ownership и no-group/world-write проверками. После исправления Linux-раскладки 05.11.2026
+  каждый candidate дополнительно требует полную ancestor chain от parent до `/`: non-symlink
+  directories, root-owned, non-group/world-writable, успешные probes и отсутствие Darwin ACL
+  (Linux effective ACL-mask покрывается mode-проверкой). `/usr/bin/python3` может быть root-owned
+  symlink ровно на slashless numeric `python3.<digits/dots>`; target проходит общий regular
+  validator и исполняется вместо symlink. `/bin/sh`, `find`, `uname`, `readlink` и окружение
+  оператора — pretrusted по R-ARTIFACT-PROVENANCE и ML-E5: их hostile подмена/startup controls вне
+  гарантий resolver и не требуют second stage. Запуск — `-I -B`:
+  игнорируются `PYTHON*`, cwd и user site. `gates-run` использует тот же резолвер Python, а не PATH;
+  shell-вызовы `ls/sort/tail` убираются в Python.
   Git hook shims и `gates-run` используют только POSIX `/bin/sh`, включая абсолютный `/bin/sh`
   при вложенном вызове: bare `bash` из PATH и startup-файлы `BASH_ENV`/`ENV` не участвуют.
   Изолированный системный Python не видит user-site PyYAML. Поэтому dependency-free конфиг

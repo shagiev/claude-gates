@@ -131,8 +131,8 @@ def _no_real_install_mutation(monkeypatch, tmp_path):
     """Мутация установки БЕЗ subprocess — маршрут, который не видит ни один из трёх слоёв.
 
     `_installed_claude` читает реестр ЧИСТЫМ ЧТЕНИЕМ и честно возвращает боевой адрес
-    (`registry=~/.claude/plugins/installed_plugins.json`); `cmd_restore` затем в него пишет, а
-    `cmd_verify` идёт `rmtree`'ом по `__pycache__` живой установки. Ни `Popen`, ни PATH, ни
+    (`registry=~/.claude/plugins/installed_plugins.json`); `cmd_restore` затем в него пишет.
+    Ни `Popen`, ни PATH, ни
     `on_host` тут не участвуют. Проверка «адрес не боевой» в самом `cmd_restore` была бы
     неверна: на хосте писать в боевой реестр — это и есть его работа. Поэтому chokepoint
     ставится со стороны тестов, как уже сделано для `on_host` и резолверов бинарей."""
@@ -165,15 +165,6 @@ def _no_real_install_mutation(monkeypatch, tmp_path):
             return real_restore(spec)
 
         monkeypatch.setattr(dv, "cmd_restore", guarded_restore)
-        real_drop = dv._drop_stale_bytecode
-
-        def guarded_drop(root):
-            # `check_tree` безусловно `rmtree`'ит `__pycache__` под своим аргументом, а он
-            # приходит НИ из `installed()`, НИ из спека — то есть мимо остальных слоёв.
-            _not_production(root, "_drop_stale_bytecode(root)")
-            return real_drop(root)
-
-        monkeypatch.setattr(dv, "_drop_stale_bytecode", guarded_drop)
 
     dg = sys.modules.get("deploy_gates")
     if dg is not None:

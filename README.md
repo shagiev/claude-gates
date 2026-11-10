@@ -100,6 +100,12 @@ Mandatory Claude adapter ищет native/legacy/npm CLI в `~/.local/bin`,
 совпадать, иначе shim fail-closed. Установку и live-приёмку делай из чистого материализованного
 дерева, а не из каталога с `__pycache__`.
 
+First-party Makefile recipes используют `$(PYTHON) -B` и принудительный
+`PYTHONDONTWRITEBYTECODE=1` (включая command-line override); прямые deploy/recertify/acceptance
+entrypoints выставляют тот же запрет до local imports. Стандартно: `make test PYTHON=python3.13`,
+`make deploy PYTHON=python3.13`. Deploy verification не удаляет bytecode автоматически: cache даёт
+fail-closed диагностику с путём для ручной проверки и очистки.
+
 ## Онбординг проекта
 
 В корне целевого git-репо: **`/gates-init`** — сгенерирует `.codex-gate.yaml` (код-пути,

@@ -359,7 +359,7 @@ def test_make_target_takes_no_parameters():
     code = [ln for ln in (ROOT / "Makefile").read_text().splitlines()
             if ln.strip() and not ln.lstrip().startswith("#")]
     target = next(i for i, ln in enumerate(code) if ln.startswith("recertify:"))
-    assert code[target + 1] == "\tpython3 -B scripts/recertify.py"
+    assert code[target + 1] == "\t$(PYTHON) -B scripts/recertify.py"
     assert not any("MODEL" in ln for ln in code)
 
 

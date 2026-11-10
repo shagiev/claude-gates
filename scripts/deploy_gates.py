@@ -20,6 +20,9 @@ import shlex
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "plugins" / "gates" / "scripts"))
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -110,7 +113,7 @@ def agent(host: str, subcmd: str, arg: str) -> dict:
     факты, и их склейка объявила бы недостижимую машину первой установкой."""
     if _AGENT_SRC is None:
         fail("агент не загружен из коммита — вызов до `load_agent`")
-    r = on_host(host, ["python3", "-", subcmd, arg], stdin=_AGENT_SRC)
+    r = on_host(host, ["python3", "-B", "-", subcmd, arg], stdin=_AGENT_SRC)
     try:
         return json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -154,7 +157,7 @@ def read_inventory() -> "list[dict]":
 
 
 def pre_deploy_gate():
-    """Гейт принадлежит МУТИРУЮЩЕМУ скрипту, а не Makefile: `python3 scripts/deploy_gates.py` —
+    """Гейт принадлежит МУТИРУЮЩЕМУ скрипту, а не Makefile: `python3 -B scripts/deploy_gates.py` —
     документированный прямой вызов, и через него флот мутировался бы без проверки дерева и
     тестов вовсе."""
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -163,7 +166,7 @@ def pre_deploy_gate():
     if not g.working_tree_clean():
         fail("дерево грязное — выкатывать нечего воспроизводимого. `git status` тут не годится "
              "как предикат (clean-фильтры, skip-worktree), поэтому сверяются сырые байты")
-    if subprocess.run([sys.executable, "-m", "pytest", "tests/", "-q"], cwd=ROOT).returncode != 0:
+    if subprocess.run([sys.executable, "-B", "-m", "pytest", "tests/", "-q"], cwd=ROOT).returncode != 0:
         fail("тесты красные — выкатка остановлена")
 
 

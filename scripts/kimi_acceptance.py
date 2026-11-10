@@ -17,6 +17,9 @@ import tomllib
 import urllib.request
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 
 class RestoreConflict(Exception):
     pass

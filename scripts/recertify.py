@@ -24,6 +24,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "plugins" / "gates" / "scripts"))
 import certify_reviewers as cr                                                   # noqa: E402
