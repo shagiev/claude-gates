@@ -780,6 +780,13 @@ def test_r38_release_state_schema_drift_is_fatal(tmp_path, monkeypatch):
         gr.publish_release(artifact, gh=run)
 
 
+def test_r33_review_evidence_and_baseline_are_isolated_from_production():
+    real_state = dg.g._REAL_GATE_STATE_DIR()
+    assert real_state is not None
+    assert not dg.g.PANEL_EVIDENCE.is_relative_to(real_state)
+    assert not dg.g.GATE_BASELINE.is_relative_to(real_state)
+
+
 def test_r39_panel_evidence_is_required_before_artifact_build(monkeypatch):
     monkeypatch.setattr(dg.g, "_panel_evidence_ok", lambda sha: (False, "missing panel"))
     monkeypatch.setattr(dg.ka, "build_artifact", lambda root:

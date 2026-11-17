@@ -209,6 +209,8 @@ def _gates_test_isolation(monkeypatch, tmp_path):
     # Гигиена (инцидент проекта-источника: тест заархивировал боевую findings-серию): даже тест
     # с забытым точечным моком не должен трогать файлы репо-носителя.
     monkeypatch.setattr(g, "AUDIT_LOG", tmp_path / "audit_auto.log")
+    monkeypatch.setattr(g, "PANEL_EVIDENCE", tmp_path / "panel-evidence-auto.json")
+    monkeypatch.setattr(g, "GATE_BASELINE", tmp_path / "review-baseline-auto")
     monkeypatch.setattr(g, "LAST_REVIEWED", tmp_path / ".last-reviewed-sha-auto")
     monkeypatch.setattr(g, "LAST_DEPLOYED", tmp_path / ".last-deployed-sha-auto")
     monkeypatch.setattr(g, "DESIGN_MARKER", tmp_path / ".design-approved-auto")
