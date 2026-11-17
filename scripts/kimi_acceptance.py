@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -295,9 +296,10 @@ def require_plugin_api(spec: dict) -> None:
     paths = spec.get("paths") if isinstance(spec, dict) else None
     required = {
         "/api/v1/plugins": {"get", "post"},
-        "/api/v1/plugins/{plugin_id}:{action}": {"post"},
-        "/api/v1/sessions": {"post"},
+        "/api/v1/plugins/{tail}": {"post"},
+        "/api/v1/sessions": {"get", "post"},
         "/api/v1/sessions/{session_id}": {"get"},
+        "/api/v1/sessions/{session_id}:reload": {"post"},
         "/api/v1/sessions/{session_id}/prompts": {"get", "post"},
         "/api/v1/sessions/{session_id}/messages": {"get"},
         "/api/v1/sessions/{session_id}/transcript/user-messages": {"get"},
@@ -339,6 +341,11 @@ def _api(base: str, token: str, method: str, path: str, body=None):
                                           "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as response:
         payload = json.load(response)
+    if path == "/openapi.json" and isinstance(payload, dict) \
+            and isinstance(payload.get("paths"), dict):
+        return payload
+    if not isinstance(payload, dict):
+        raise ApiSchemaError(f"Server API {method} {path}: response не object")
     if payload.get("code") != 0:
         raise RuntimeError(f"Server API {method} {path}: {payload}")
     return payload.get("data")
@@ -612,35 +619,55 @@ finally:
 def _start_server(root: Path, port=58690):
     lifeline, writer = os.pipe()
     proc = subprocess.Popen(["/usr/bin/python3", "-I", "-B", "-c", _SUPERVISOR, str(lifeline),
-                             _kimi_bin(), "web", "--no-open", "--port", str(port)], cwd=root,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             _kimi_bin(), "web", "--no-open", "--log-level", "info",
+                             "--port", str(port)], cwd=root,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             pass_fds=(lifeline,))
     os.close(lifeline)
     proc._gates_lifeline = writer
     token = None
     base = None
-    deadline = time.time() + 30
-    while (token is None or base is None) and time.time() < deadline:
-        line = proc.stdout.readline()
-        if not line and proc.poll() is not None:
-            raise RuntimeError("kimi web завершился до выдачи bearer token")
-        match = re.search(r"token[=:\s]+([A-Za-z0-9._-]+)", line, re.IGNORECASE)
-        if match:
-            token = match.group(1)
-        address = re.search(r"http://127\.0\.0\.1:(\d+)", line)
-        if address:
-            base = f"http://127.0.0.1:{address.group(1)}"
-    if not token or base is None:
+    buffered = b""
+    deadline = time.monotonic() + 30
+    try:
+        while (token is None or base is None) and time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [],
+                                        max(0.0, deadline - time.monotonic()))
+            if not ready:
+                if proc.poll() is not None:
+                    raise RuntimeError("kimi web завершился до выдачи bearer token")
+                continue
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk and proc.poll() is not None:
+                raise RuntimeError("kimi web завершился до выдачи bearer token")
+            buffered += chunk
+            *lines, buffered = buffered.split(b"\n")
+            for raw in lines:
+                line = raw.decode("utf-8", "replace")
+                match = re.search(r"token[=:\s]+([A-Za-z0-9._-]+)", line, re.IGNORECASE)
+                if match:
+                    token = match.group(1)
+                address = re.search(r"http://127\.0\.0\.1:(\d+)", line)
+                if address:
+                    base = f"http://127.0.0.1:{address.group(1)}"
+        if not token or base is None:
+            raise RuntimeError("kimi web не выдал адрес и bearer token за 30 секунд")
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(base + "/api/v1/healthz", timeout=1):
+                    return proc, base, token
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("kimi web healthz не стал доступен за 30 секунд")
+    except Exception:
         proc.terminate()
-        raise RuntimeError("kimi web не выдал адрес и bearer token за 30 секунд")
-    while time.time() < deadline:
         try:
-            with urllib.request.urlopen(base + "/api/v1/healthz", timeout=1):
-                return proc, base, token
-        except OSError:
-            time.sleep(0.1)
-    proc.terminate()
-    raise RuntimeError("kimi web healthz не стал доступен за 30 секунд")
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        os.close(writer)
+        raise
 
 
 def _scratch_repo(base: Path) -> Path:
@@ -727,7 +754,9 @@ def live() -> None:
             save_journal(journal, journal_path)
             _api(base, token, "POST", "/api/v1/plugins", {"source": str(plugin)})
             plugins = _api(base, token, "GET", "/api/v1/plugins")
-            gates = next((p for p in plugins if p.get("id") == "gates"), None)
+            if not isinstance(plugins, dict) or not isinstance(plugins.get("plugins"), list):
+                raise ApiSchemaError("Kimi plugins response не содержит plugins list")
+            gates = next((p for p in plugins["plugins"] if p.get("id") == "gates"), None)
             if not gates or not gates.get("enabled") or gates.get("state") != "ok":
                 raise RuntimeError(f"Kimi plugin не активен: {gates}")
             if gates.get("commandCount") != 5 or gates.get("hookCount") != 3:

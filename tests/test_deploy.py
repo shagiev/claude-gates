@@ -42,13 +42,24 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(dg, "read_inventory", lambda: [
         {"id": "canary", "channels": ["claude"]}, {"id": "vps", "channels": ["claude"]}])
     monkeypatch.setattr(dg, "pinned_identity", lambda: {
-        "version": {"claude": "9.9.9", "codex": "9.9.9+codex"}, "sha": "s" * 40,
-        "tree": {"scripts/x.py": "100644 abc"}, "digest": "dig"})
+        "version": {"claude": "9.9.9", "codex": "9.9.9+codex", "kimi": "9.9.9"},
+        "sha": "s" * 40, "tree": {"scripts/x.py": "100644 abc"}, "digest": "dig"})
+    monkeypatch.setattr(dg, "check_review_evidence", lambda sha: None)
+    monkeypatch.setattr(dg, "build_and_publish", lambda pin: {
+        **dg.gr.release_identity("9.9.9"), "sha": pin["sha"], "tree": pin["tree"],
+        "zip_sha256": "0" * 64})
+    monkeypatch.setattr(dg.gr, "mark_release_latest", lambda artifact: None)
+    monkeypatch.setattr(dg.gr, "mark_release_draft", lambda artifact: None)
+    monkeypatch.setattr(dg, "session_inventory", lambda hosts: {
+        "enumeration": "known", "sessions": [
+            {"host": h["id"], "channel": "kimi", "id": f"session-{h['id']}"} for h in hosts]})
+    monkeypatch.setattr(dg, "activation", lambda *args: {"complete": True, "status": "complete"})
     monkeypatch.setattr(dg, "snapshot", lambda h, c: {
-        "host": h, "channels": {"claude": {"state": "installed", "version": "9.9.8",
-                                           "sha": "o" * 40, "path": "/p"}}})
+        "host": h, "ts": "2026-01-01T00:00:00+00:00",
+        "channels": {"claude": {"state": "installed", "version": "9.9.8",
+                                "sha": "o" * 40, "path": "/p"}}})
     monkeypatch.setattr(dg, "check_rollback_target", lambda *a: None)
-    monkeypatch.setattr(dg, "update", lambda h, c: None)
+    monkeypatch.setattr(dg, "update", lambda h, c, *args: None)
     monkeypatch.setattr(dg, "verify", lambda *a: {"ok": True, "problems": [],
                                                   "channels": {}})
     monkeypatch.setattr(dg, "rollback", lambda h, s: [])
@@ -331,16 +342,18 @@ def test_tripwire_does_not_break_generator_argv():
 def test_agent_source_comes_from_the_commit(monkeypatch):
     """`make gates-restore` увозил на хост НЕЗАКОММИЧЕННЫЙ рабочий код и исполнял его там:
     путь `--restore` не зовёт pre-deploy гейт, а агент читался с диска."""
-    seen = {}
+    seen = []
     def fake_git(*a, **k):
-        seen["args"] = a
+        seen.append(a)
         return subprocess.CompletedProcess(a, 0, "# из коммита\n", "")
 
     monkeypatch.setattr(dg.g, "_trusted_git", fake_git)
     monkeypatch.setattr(dg, "_AGENT_SRC", None)
     dg.load_agent("c" * 40)
-    assert seen["args"] == ("show", f"{'c' * 40}:scripts/deploy_verify.py")
-    assert dg._AGENT_SRC == "# из коммита\n"
+    assert seen == [("show", f"{'c' * 40}:scripts/deploy_verify.py"),
+                    ("show", f"{'c' * 40}:scripts/kimi_acceptance.py")]
+    assert dg._AGENT_SRC.endswith("# из коммита\n")
+    assert "ModuleType('kimi_acceptance')" in dg._AGENT_SRC
 
 
 def test_agent_missing_from_the_commit_is_fatal(monkeypatch):
@@ -359,6 +372,7 @@ def test_agent_refuses_to_run_before_it_is_loaded(monkeypatch):
 def test_version_mismatch_across_manifests_blocks(monkeypatch, tmp_path):
     monkeypatch.setattr(dg, "ROOT", tmp_path)
     for rel, ver in (("plugins/gates/.claude-plugin/plugin.json", "1.0.0"),
+                     ("plugins/gates/.kimi-plugin/plugin.json", "1.0.0"),
                      ("plugins/gates/.codex-plugin/plugin.json", "0.9.9+codex")):
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -451,7 +465,8 @@ def test_codex_path_with_a_space_is_parsed(monkeypatch, tmp_path):
     monkeypatch.setattr(dv.subprocess, "run", lambda argv, **k:
                         subprocess.CompletedProcess(argv, 0, "lenar-gates\n" + rows, ""))
     monkeypatch.setattr(dv, "git", lambda cwd, *a: subprocess.CompletedProcess(
-        a, 0, str(path) if a[0] == "rev-parse" and "--show-toplevel" in a else "a" * 40, ""))
+        a, 0, str(path) if a[0] == "rev-parse" and "--show-toplevel" in a else
+        "git@github.com:shagiev/claude-gates.git" if a[:2] == ("remote", "get-url") else "a" * 40, ""))
     got = dv.installed("codex")
     assert got["state"] == "installed" and got["path"] == str(path)
 
@@ -935,7 +950,7 @@ def test_installed_channel_without_sha_blocks_rollback_confirmation(monkeypatch)
 # ── порядок выкатки ────────────────────────────────────────────────────────────────────────
 def test_canary_failure_leaves_other_hosts_untouched(harness):
     touched = []
-    harness.setattr(dg, "update", lambda h, c: touched.append(h) or None)
+    harness.setattr(dg, "update", lambda h, c, *args: touched.append(h) or None)
     harness.setattr(dg, "verify", lambda *a: {"ok": False, "channels": {}, "problems": [
         {"code": "smoke", "channel": "claude", "text": "сломано"}]})
     assert dg.main([]) == 2
@@ -1077,11 +1092,14 @@ def fake_host(tmp_path, monkeypatch):
     meta.write_text(json.dumps({"plugins": {"gates@lenar-gates": [
         {"scope": "user", "installPath": str(old), "version": old_ver,
          "gitCommitSha": OLD_SHA}]}}))
+    meta.with_name("known_marketplaces.json").write_text(json.dumps({"lenar-gates": {
+        "source": {"source": "github", "repo": "shagiev/claude-gates"}}}))
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "claude").write_text(_FAKE_CLAUDE)
     os.chmod(bin_dir / "claude", 0o755)
     env = {**os.environ, "HOME": str(home), "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+           "PYTHONPATH": str(ROOT / "scripts"),
            "FAKE_NEW": str(new), "FAKE_NEW_VER": new_ver, "FAKE_NEW_SHA": NEW_SHA}
     for var in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"):
         env.pop(var, None)
@@ -1091,6 +1109,15 @@ def fake_host(tmp_path, monkeypatch):
     monkeypatch.setattr(dg, "STATE", tmp_path / "state")
     monkeypatch.setattr(dg, "LOCK", tmp_path / "state" / "lock")
     monkeypatch.setattr(dg, "pre_deploy_gate", lambda: None)
+    monkeypatch.setattr(dg, "check_review_evidence", lambda sha: None)
+    monkeypatch.setattr(dg, "build_and_publish", lambda pin: {
+        **dg.gr.release_identity(new_ver), "sha": NEW_SHA, "tree": tree,
+        "zip_sha256": "0" * 64})
+    monkeypatch.setattr(dg.gr, "mark_release_latest", lambda artifact: None)
+    monkeypatch.setattr(dg.gr, "mark_release_draft", lambda artifact: None)
+    monkeypatch.setattr(dg, "session_inventory", lambda hosts: {
+        "enumeration": "known", "sessions": [{"host": "h", "channel": "kimi", "id": "session-h"}]})
+    monkeypatch.setattr(dg, "activation", lambda *args: {"complete": True, "status": "complete"})
     monkeypatch.delenv("GATES_HOSTS", raising=False)
     monkeypatch.setattr(dg, "read_inventory", lambda: [{"id": "h", "channels": ["claude"]}])
     # В проде агент едет из коммита; здесь проверяется рабочая копия, поэтому загрузка
@@ -1100,7 +1127,7 @@ def fake_host(tmp_path, monkeypatch):
         dg, "_AGENT_SRC", (ROOT / "scripts" / "deploy_verify.py").read_text()))
     tree = dg.expected_tree(NEW_SHA)
     monkeypatch.setattr(dg, "pinned_identity", lambda: {
-        "version": {"claude": new_ver}, "sha": NEW_SHA, "tree": tree,
+        "version": {"claude": new_ver, "kimi": new_ver}, "sha": NEW_SHA, "tree": tree,
         "digest": dv.tree_digest(tree)})
     return {"home": home, "old": old, "new": new, "meta": meta, "state": tmp_path / "state",
             "old_ver": old_ver, "new_ver": new_ver, "monkeypatch": monkeypatch, "env": env}

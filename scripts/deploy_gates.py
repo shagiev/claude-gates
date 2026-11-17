@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -27,6 +28,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "plugins" / "gates" / "scripts"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import codex_review_gate as g                                                    # noqa: E402
+import github_release as gr                                                      # noqa: E402
+import kimi_acceptance as ka                                                     # noqa: E402
 import prepush_gate                                                              # noqa: E402
 from deploy_verify import CHANNELS, tree_digest                                  # noqa: E402
 
@@ -55,6 +58,16 @@ class DeployAbort(Exception):
     когда так падал второй хост, уже обновлённая канарейка оставалась на новой версии, второй
     хост на старой, а `stable` от прошлого деплоя продолжал сертифицировать флот зелёным —
     ровно тот version skew, ради устранения которого всё делается."""
+
+    def __init__(self, message, *, artifact=False):
+        super().__init__(message)
+        self.artifact = artifact
+
+
+_ARTIFACT_PROBLEM_CODES = frozenset({
+    "version", "sha", "tree", "post-smoke-tree", "kimi-registration", "zip-sha256",
+    "source-tree", "source-archive", "smoke_compute_tree", "smoke_gate_blocks",
+})
 
 
 def fail(msg: str) -> "NoReturn":                      # noqa: F821
@@ -100,9 +113,16 @@ def load_agent(sha: str):
     весь этот файл."""
     global _AGENT_SRC
     r = g._trusted_git("show", f"{sha}:scripts/deploy_verify.py", cwd=ROOT)
-    if r is None or r.returncode != 0 or not r.stdout.strip():
-        fail(f"агент не прочитан из коммита {sha[:12]} — на хост нечего везти")
-    _AGENT_SRC = r.stdout
+    helper = g._trusted_git("show", f"{sha}:scripts/kimi_acceptance.py", cwd=ROOT)
+    if (r is None or r.returncode != 0 or not r.stdout.strip()
+            or helper is None or helper.returncode != 0 or not helper.stdout.strip()):
+        fail(f"агент и Kimi API helper не прочитаны из коммита {sha[:12]} — на хост нечего везти")
+    prelude = ("import sys as _deploy_sys\nimport types as _deploy_types\n"
+               "_deploy_ka = _deploy_types.ModuleType('kimi_acceptance')\n"
+               "_deploy_ka.__file__ = 'kimi_acceptance.py'\n"
+               f"exec(compile({helper.stdout!r}, 'kimi_acceptance.py', 'exec'), _deploy_ka.__dict__)\n"
+               "_deploy_sys.modules['kimi_acceptance'] = _deploy_ka\n")
+    _AGENT_SRC = prelude + r.stdout
 
 
 def agent(host: str, subcmd: str, arg: str) -> dict:
@@ -195,15 +215,41 @@ def pinned_identity() -> dict:
         fail(f"HEAD ({head[:12]}) != origin/main ({sha[:12]}) — хосты ставят плагин ИЗ GITHUB, "
              "незамерженное выкатить нельзя")
     ver = json.loads((ROOT / "plugins/gates/.claude-plugin/plugin.json").read_text())["version"]
+    kimi_ver = json.loads(
+        (ROOT / "plugins/gates/.kimi-plugin/plugin.json").read_text())["version"]
     codex_ver = json.loads(
         (ROOT / "plugins/gates/.codex-plugin/plugin.json").read_text())["version"]
     mkt = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
     mkt_vers = {mkt["metadata"]["version"], *(p["version"] for p in mkt["plugins"])}
-    if codex_ver.split("+", 1)[0] != ver or mkt_vers != {ver}:
-        fail(f"версии рассогласованы: plugin.json={ver}, codex={codex_ver}, marketplace={mkt_vers}")
+    if kimi_ver != ver or codex_ver.split("+", 1)[0] != ver or mkt_vers != {ver}:
+        fail(f"версии рассогласованы: plugin.json={ver}, kimi={kimi_ver}, "
+             f"codex={codex_ver}, marketplace={mkt_vers}")
+    gr.release_identity(ver)
     tree = expected_tree(sha)
-    return {"version": {"claude": ver, "codex": codex_ver}, "sha": sha, "tree": tree,
-            "digest": tree_digest(tree)}
+    return {"version": {"claude": ver, "codex": codex_ver, "kimi": kimi_ver},
+            "sha": sha, "tree": tree, "digest": tree_digest(tree)}
+
+
+def check_review_evidence(sha: str):
+    panel_ok, panel_why = g._panel_evidence_ok(sha)
+    if not panel_ok:
+        fail(f"independent panel evidence для {sha[:12]} недействительно: {panel_why}")
+    try:
+        _artifact, reviewed_head, _digest = ka.build_artifact(ROOT)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        fail(f"independent-review evidence для {sha[:12]} недействительно: {exc}")
+    if reviewed_head != sha:
+        fail(f"review evidence относится к {reviewed_head[:12]}, а выкатывается {sha[:12]}")
+
+
+def build_and_publish(pin: dict) -> dict:
+    with tempfile.TemporaryDirectory(prefix="gates-github-release-") as tmp:
+        artifact = gr.build_release_artifact(pin["sha"], pin["version"]["kimi"],
+                                             pin["tree"], pathlib.Path(tmp))
+        gr.publish_release(artifact)
+        print(f"[deploy] ✓ release {artifact['tag']} опубликован как prerelease; "
+              f"ZIP SHA-256 {artifact['zip_sha256']}")
+        return artifact
 
 
 def _git_out(*args) -> str:
@@ -233,13 +279,29 @@ def expected_tree(sha: str) -> dict:
     return tree
 
 
-def _spec(channels, versions, sha, tree, checks) -> str:
-    return json.dumps({"channels": {
-        ch: {"version": versions[ch], "sha": sha, "tree": tree, "checks": checks}
-        for ch in channels}}, ensure_ascii=False)
+def _spec(channels, versions, sha, tree, checks, zip_sha256=None) -> str:
+    result = {}
+    for ch in channels:
+        entry = {"version": versions[ch], "sha": sha, "tree": tree, "checks": list(checks)}
+        if ch == "kimi":
+            entry["source"] = gr.release_identity(versions[ch])["url"]
+            entry["enabled"] = True
+            if zip_sha256 is not None:
+                entry["zip_sha256"] = zip_sha256
+            for check in ("source", "enabled"):
+                if check not in entry["checks"]:
+                    entry["checks"].append(check)
+        result[ch] = entry
+    return json.dumps({"channels": result}, ensure_ascii=False)
 
 
 # ── шаги ───────────────────────────────────────────────────────────────────────────────────
+def _write_snapshot(snap: dict):
+    STATE.mkdir(parents=True, exist_ok=True)
+    path = STATE / f"{snap['host']}-{snap['ts'].replace(':', '')}.json"
+    path.write_text(json.dumps(snap, ensure_ascii=False, indent=2))
+
+
 def snapshot(host: str, channels: "list[str]") -> dict:
     """Снапшот ВСЕХ объявленных каналов одним вызовом: деплой мутирует все, и восстановление
     одного оставило бы смешанное состояние."""
@@ -248,9 +310,7 @@ def snapshot(host: str, channels: "list[str]") -> dict:
         raise DeployAbort(f"{host}: снапшот не снят — {got['error']}. Недостижимый хост НЕ "
                           "считается первой установкой: деплой без цели отката запрещён")
     snap = {"host": host, "ts": _now(), "channels": got["channels"]}
-    STATE.mkdir(parents=True, exist_ok=True)
-    (STATE / f"{host}-{snap['ts'].replace(':', '')}.json").write_text(
-        json.dumps(snap, ensure_ascii=False, indent=2))
+    _write_snapshot(snap)
     return snap
 
 
@@ -269,8 +329,42 @@ def check_rollback_target(host: str, snap: dict) -> "str | None":
         return f"{host}: состояние не определено ({'; '.join(undet)}) — откатываться будет некуда"
     if not live:
         return None                                    # первая установка: откатывать не на что
+
+    def failed(rep):
+        if "error" in rep:
+            return f"{host}: цель отката не проверена — {rep['error']}"
+        if not rep.get("ok"):
+            return (f"{host}: цель отката НЕ работает ("
+                    + "; ".join(f"{p['channel']}/{p['code']}: {p['text']}"
+                                for p in rep.get("problems", [])) + ") — деплой не начинается")
+        return None
+
+    for ch, info in live.items():
+        if ch != "kimi":
+            continue
+        try:
+            canonical = gr.release_identity(info.get("version"))["url"]
+        except gr.ReleaseError:
+            canonical = None
+        if info.get("rollback_source", canonical) != canonical or not info.get("tree"):
+            return f"{host}/{ch}: rollback source не canonical — откат запрещён"
+        spec = {"channels": {"kimi": {
+            "version": info["version"], "source": canonical, "tree": info["tree"],
+            "enabled": info.get("enabled"), "migration": info.get("source") != canonical,
+            "checks": ["version", "tree", "source", "enabled", "smoke"]}}}
+        report = agent(host, "verify", json.dumps(spec, ensure_ascii=False))
+        why = failed(report)
+        if why:
+            return why
+        observed = (report.get("channels", {}).get("kimi") or {}).get("zip_sha256")
+        if not isinstance(observed, str) or re.fullmatch(r"[0-9a-f]{64}", observed, re.ASCII) is None:
+            return f"{host}/{ch}: rollback ZIP digest не зафиксирован — откат запрещён"
+        info["zip_sha256"] = observed
+
     by_sha: "dict[str, list[str]]" = {}
     for ch, info in live.items():
+        if ch == "kimi":
+            continue
         if not info.get("sha"):
             return f"{host}/{ch}: у установки нет sha — цель отката недоказуема"
         by_sha.setdefault(info["sha"], []).append(ch)
@@ -279,20 +373,28 @@ def check_rollback_target(host: str, snap: dict) -> "str | None":
                 subprocess.CompletedProcess([], 1)).returncode != 0:
             return (f"{host}/{','.join(chans)}: коммит {sha[:12]} не найден локально — "
                     "ожидаемое дерево цели отката не построить")
-        rep = agent(host, "verify", _spec(
+        why = failed(agent(host, "verify", _spec(
             chans, {ch: live[ch]["version"] for ch in chans}, sha, expected_tree(sha),
-            ["version", "sha", "tree", "smoke"]))
-        if "error" in rep:
-            return f"{host}: цель отката не проверена — {rep['error']}"
-        if not rep["ok"]:
-            return (f"{host}: цель отката НЕ работает ("
-                    + "; ".join(f"{p['channel']}/{p['code']}: {p['text']}"
-                                for p in rep["problems"]) + ") — деплой не начинается")
+            ["version", "sha", "tree", "smoke"])))
+        if why:
+            return why
     return None
 
 
-def update(host: str, channels: "list[str]") -> "str | None":
+def update(host: str, channels: "list[str]", versions=None) -> "str | None":
     for ch in channels:
+        if ch == "kimi":
+            if not versions or not versions.get("kimi"):
+                return f"{host}/{ch}: версия release не передана — локальный source запрещён"
+            out = agent(host, "update", json.dumps({
+                "version": versions["kimi"],
+                "source": gr.release_identity(versions["kimi"])["url"]}))
+            if "error" in out:
+                return f"{host}/{ch}: {out['error']}"
+            if not out.get("ok"):
+                return f"{host}/{ch}: " + "; ".join(
+                    problem["text"] for problem in out.get("problems", []))
+            continue
         spec = CHANNELS[ch]
         for args in spec["update"]:
             r = on_host(host, [spec["cli"], *args])
@@ -303,7 +405,7 @@ def update(host: str, channels: "list[str]") -> "str | None":
     return None
 
 
-def verify(host: str, channels, versions, sha, tree) -> dict:
+def verify(host: str, channels, versions, sha, tree, zip_sha256=None) -> dict:
     """Идентичность выкатки — ДЕРЕВО, а не коммит. Коммит остаётся диагностикой.
 
     Первая же настоящая выкатка это и показала: два коммита подряд трогали только `tests/` и
@@ -316,7 +418,7 @@ def verify(host: str, channels, versions, sha, tree) -> dict:
     каждого), и «CLI отчитался успехом, ничего не сделав» ловится ровно тогда, когда это
     меняет исполняемый код."""
     rep = agent(host, "verify", _spec(channels, versions, sha, tree,
-                                      ["version", "tree", "smoke"]))
+                                      ["version", "tree", "smoke"], zip_sha256))
     if "error" in rep:
         return {"ok": False, "problems": [{"code": "agent", "channel": "-",
                                            "text": rep["error"]}]}
@@ -349,17 +451,34 @@ def rollback(host: str, snap: dict) -> "list[str]":
     # человеческий текст проблем по подстроке «sha», то есть чужая проблема с этим словом
     # молча зачлась бы как успешный откат.
     chans = (snap.get("channels") or {})
-    live = {ch: i for ch, i in chans.items() if (i or {}).get("state") == "installed"}
+    live = {ch: i for ch, i in chans.items()
+            if (i or {}).get("state") == "installed" and ch != "kimi"}
     for ch, i in live.items():
         if not i.get("sha"):
-            # Иначе канал молча выпадал из множества постпроверки, и «откат проверен»
-            # печаталось про канал, который не проверяли вовсе.
             problems.append(f"{host}/{ch}: у снапшота нет sha — откат не подтвердить")
     if problems:
         return problems
-    gone = [ch for ch, i in chans.items() if (i or {}).get("state") == "absent"]
+
+    def confirm(spec):
+        rep = agent(host, "verify", json.dumps(spec, ensure_ascii=False))
+        if "error" in rep:
+            problems.append(f"{host}: откат не подтверждён — {rep['error']}")
+        elif not rep.get("ok"):
+            problems.extend(f"{host}/{p['channel']}/{p['code']}: {p['text']}"
+                            for p in rep.get("problems", []))
+
+    for ch, info in chans.items():
+        if ch != "kimi" or (info or {}).get("state") != "installed":
+            continue
+        confirm({"channels": {"kimi": {
+            "version": info.get("version"), "source": info.get("rollback_source") or info.get("source"),
+            "tree": info.get("tree"), "enabled": info.get("enabled"),
+            "zip_sha256": info.get("zip_sha256"),
+            "checks": ["version", "tree", "source", "enabled", "smoke"]}}})
+
+    gone = [ch for ch, i in chans.items() if (i or {}).get("state") == "absent" and ch != "kimi"]
     specs = [({ch: live[ch]["version"] for ch in group}, sha, expected_tree(sha),
-              ["version", "sha", "tree"], "installed")
+              ["version", "sha", "tree", "smoke"], "installed")
              for sha in {i["sha"] for i in live.values() if i.get("sha")}
              for group in ([ch for ch, i in live.items() if i.get("sha") == sha],)]
     if gone:
@@ -368,13 +487,70 @@ def rollback(host: str, snap: dict) -> "list[str]":
         spec = json.loads(_spec(list(versions), versions, sha, tree, checks))
         for ch in spec["channels"]:
             spec["channels"][ch]["state"] = state
-        rep = agent(host, "verify", json.dumps(spec, ensure_ascii=False))
-        if "error" in rep:
-            problems.append(f"{host}: откат не подтверждён — {rep['error']}")
-        elif not rep["ok"]:
-            problems.extend(f"{host}/{p['channel']}/{p['code']}: {p['text']}"
-                            for p in rep["problems"])
+        confirm(spec)
+    if any(ch == "kimi" and (info or {}).get("state") == "absent"
+           for ch, info in chans.items()):
+        confirm({"channels": {"kimi": {"state": "absent", "checks": []}}})
     return problems
+
+
+def session_inventory(hosts) -> dict:
+    result = {"enumeration": "known", "hosts": {}, "sessions": []}
+    for host in hosts:
+        got = agent(host["id"], "sessions", ",".join(host["channels"]))
+        if "error" in got:
+            got = {"enumeration": "unknown", "sessions": [], "error": got["error"]}
+        result["hosts"][host["id"]] = got
+        sessions = got.get("sessions")
+        if got.get("enumeration") != "known" or not isinstance(sessions, list) or not sessions:
+            result["enumeration"] = "unknown"
+            continue
+        for session in sessions:
+            if not isinstance(session, dict) or not session.get("id"):
+                result["enumeration"] = "unknown"
+                continue
+            result["sessions"].append({"host": host["id"], **session})
+    return result
+
+
+def activation_status(inventory: dict, observations: dict, expected_version=None) -> dict:
+    if inventory.get("enumeration") != "known" or not inventory.get("sessions"):
+        return {"complete": False, "status": "sessions-unknown", "pending": ["enumeration"]}
+    proofs = {}
+    for host, observed in observations.items():
+        for proof in observed.get("sessions", []):
+            if isinstance(proof, dict) and proof.get("id"):
+                proofs[(host, proof["id"])] = proof
+    pending = []
+    for session in inventory["sessions"]:
+        proof = proofs.get((session["host"], session["id"]), {})
+        version_ok = bool(proof.get("version")) and (
+            expected_version is None or proof.get("version") == expected_version)
+        proven = version_ok and proof.get("smoke") == "passed"
+        if not proven:
+            pending.append(session["id"])
+    return {"complete": not pending, "status": "complete" if not pending else "reload-required",
+            "pending": pending}
+
+
+def activation(inventory: dict, hosts, expected_version=None) -> dict:
+    observations = {}
+    for host in hosts:
+        sessions = [session for session in inventory.get("sessions", [])
+                    if session["host"] == host["id"]]
+        got = agent(host["id"], "activate", json.dumps({"sessions": sessions}, ensure_ascii=False))
+        observations[host["id"]] = {} if "error" in got else got
+    return activation_status(inventory, observations, expected_version)
+
+
+def write_pending(status: str, pin: dict, hosts, activation_report=None):
+    STATE.mkdir(parents=True, exist_ok=True)
+    record = {"status": status, "sha": pin["sha"], "version": pin["version"],
+              "hosts": [host["id"] for host in hosts], "ts": _now()}
+    if activation_report is not None:
+        record["activation"] = "complete" if activation_report.get("complete") else "pending"
+        record["activation_detail"] = activation_report
+    (STATE / "pending").write_text(json.dumps(record, ensure_ascii=False, indent=2))
 
 
 def _take_lock(sha: str):
@@ -414,6 +590,7 @@ def main(argv=None) -> int:
     if args.check:
         pre_deploy_gate()
         pin = pinned_identity()
+        check_review_evidence(pin["sha"])
         print(f"[deploy] готово к выкатке: {pin['version']['claude']} ({pin['sha'][:12]}), "
               f"дерево {len(pin['tree'])} файлов")
         return 0
@@ -453,10 +630,16 @@ def main(argv=None) -> int:
 
     pre_deploy_gate()
     pin = pinned_identity()
+    check_review_evidence(pin["sha"])
     ver, sha, tree, digest = pin["version"], pin["sha"], pin["tree"], pin["digest"]
     load_agent(sha)
     _take_lock(sha)
     try:
+        try:
+            artifact = build_and_publish(pin)
+        except gr.ReleaseError as exc:
+            fail(f"release не опубликован/не проверен: {exc}")
+        sessions = session_inventory(hosts)
         print(f"[deploy] версия {ver['claude']}, sha {sha[:12]}, дерево {len(tree)} файлов "
               f"(дайджест {digest})")
         print(f"[deploy] флот: {', '.join(h['id'] for h in hosts)}"
@@ -467,28 +650,31 @@ def main(argv=None) -> int:
         # сертифицировать флот — ровно тот version skew, ради устранения которого всё делается.
         cohort: "list[tuple[dict, dict]]" = []
         try:
-            for i, h in enumerate(hosts):
-                tag = "канарейка" if i == 0 else f"хост {i + 1}/{len(hosts)}"
-                print(f"[deploy] {tag}: {h['id']} ({', '.join(h['channels'])})")
+            prepared = []
+            for h in hosts:
+                print(f"[deploy] preflight: {h['id']} ({', '.join(h['channels'])})")
                 snap = snapshot(h["id"], h["channels"])
                 why = check_rollback_target(h["id"], snap)
                 if why:
                     raise DeployAbort(why)
-                # Сертификация снимается ДО первой мутации: с этого момента запись `stable`
-                # больше не соответствует флоту, чем бы прогон ни кончился.
-                (STATE / "stable").unlink(missing_ok=True)
+                _write_snapshot(snap)
+                prepared.append((h, snap))
+            # Ни один хост не мутируется, пока snapshots и rollback targets не доказаны для
+            # всей выбранной когорты. Сертификация снимается ДО первой мутации.
+            (STATE / "stable").unlink(missing_ok=True)
+            for i, (h, snap) in enumerate(prepared):
+                tag = "канарейка" if i == 0 else f"хост {i + 1}/{len(hosts)}"
+                print(f"[deploy] {tag}: {h['id']} ({', '.join(h['channels'])})")
                 cohort.append((h, snap))
-                why = update(h["id"], h["channels"])
+                why = update(h["id"], h["channels"], ver)
                 if why:
                     raise DeployAbort(why)
-                rep = verify(h["id"], h["channels"], ver, sha, tree)
+                rep = verify(h["id"], h["channels"], ver, sha, tree, artifact["zip_sha256"])
                 if not rep["ok"]:
                     raise DeployAbort("; ".join(f"{h['id']}/{p['channel']}/{p['code']}: "
-                                                f"{p['text']}" for p in rep["problems"]))
-                # Строка успеха печатается ДЛЯ КАЖДОГО хоста, внутри цикла. Выйдя из него на
-                # один уровень, она печаталась один раз после цикла значениями ПОСЛЕДНЕГО
-                # хоста: канарейка отрабатывала и засчитывалась молча — тот самый класс «шаг
-                # зачтён, но не отчитался», ради которого весь этот файл и написан.
+                                                f"{p['text']}" for p in rep["problems"]),
+                                      artifact=any(p.get("code") in _ARTIFACT_PROBLEM_CODES
+                                                   for p in rep["problems"]))
                 drift = [f"{ch}: {(rep['channels'].get(ch) or {}).get('sha') or '?'}"[:20]
                          for ch in h["channels"]
                          if (rep["channels"].get(ch) or {}).get("sha") not in (None, sha)]
@@ -499,8 +685,14 @@ def main(argv=None) -> int:
         except DeployAbort as abort:
             print(f"[deploy] ✗ {abort}", file=sys.stderr)
             if not cohort:
-                print("[deploy] мутаций не было — флот не тронут", file=sys.stderr)
+                print("[deploy] мутаций не было — флот не тронут; release остаётся prerelease",
+                      file=sys.stderr)
                 return 2
+            if abort.artifact:
+                try:
+                    gr.mark_release_draft(artifact)
+                except gr.ReleaseError as exc:
+                    print(f"[deploy] ⛔ release не переведён в draft: {exc}", file=sys.stderr)
             for prev_h, prev_snap in cohort:
                 errs = rollback(prev_h["id"], prev_snap)
                 if errs:
@@ -511,13 +703,23 @@ def main(argv=None) -> int:
                     print(f"[deploy] откат {prev_h['id']}: проверен", file=sys.stderr)
             return 2
         if omitted:
+            write_pending("partial-installed", pin, hosts)
             print(f"[deploy] ⚠️ ЧАСТИЧНО: пропущены {', '.join(omitted)} — `stable` НЕ пишется, "
                   "флот не сертифицирован", file=sys.stderr)
             return 3
+        gr.mark_release_latest(artifact)
+        activation_report = activation(sessions, hosts, ver["kimi"])
+        if not activation_report.get("complete"):
+            write_pending("installed", pin, hosts, activation_report)
+            print("[deploy] ⚠️ установлено, но активные сессии не доказаны. Kimi: /reload или /new; "
+                  "Claude Code/Codex: restart. stable НЕ записан", file=sys.stderr)
+            return 4
         (STATE / "stable").write_text(json.dumps(
-            {"version": ver, "sha": sha, "digest": digest,
-             "hosts": [h["id"] for h in hosts], "ts": _now()}, ensure_ascii=False, indent=2))
-        print(f"[deploy] ✓ флот на {ver['claude']} ({sha[:12]}); stable записан")
+            {"version": ver, "sha": sha, "digest": digest, "release": artifact["url"],
+             "hosts": [h["id"] for h in hosts], "activation": "complete",
+             "ts": _now()}, ensure_ascii=False, indent=2))
+        (STATE / "pending").unlink(missing_ok=True)
+        print(f"[deploy] ✓ флот на {ver['claude']} ({sha[:12]}); release latest; stable записан")
         return 0
     finally:
         LOCK.unlink(missing_ok=True)

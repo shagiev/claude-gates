@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.12.0 — 2026-11-11
+
+`make deploy` теперь публикует versioned GitHub Release ZIP из закреплённого коммита и обновляет
+Kimi только по canonical release URL; Claude Code и Codex остаются на GitHub marketplace с полной
+проверкой delivery tree. Добавлены publisher ZIP/tree digests, идемпотентные prerelease/latest/draft
+переходы, запрет `--clobber` и произвольных sources, Kimi в fleet inventory и crash-safe rollback
+через API с exact tree/enabled/block-pass proof. Все snapshots и rollback targets флота проверяются
+до первой мутации. Post-smoke digest ловит изменения managed tree. `stable` требует доказанной
+активации pre-mutation session inventory; частичный fleet возвращает 3, неподтверждённый reload — 4.
+ZIP получает commit `--mtime`, startup Kimi — non-blocking timeout. Live Kimi 2.4.1 подтвердил
+фактические OpenAPI/plugin/session contracts и same-session reload route. Тесты изолированы от
+настоящих GitHub/Kimi/fleet мутаций; полный regression: 1392 passed. Дизайн:
+`docs/2026-11-10-github-release-deploy-design.md`.
+
+Добавлена явная `make clean-pycache` только для regenerable cache в дереве Gates и его managed/cache
+установках. Автоматический verifier остаётся read-only; это отдельное позднейшее решение владельца,
+а не возврат auto-delete.
+
 ## 0.11.3 — 2026-11-08
 
 Исправлен fail-closed отказ `gates-run` на штатном Linux `/usr/bin/python3 → python3.14`, из-за

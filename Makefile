@@ -7,7 +7,7 @@ PYTHON ?= python3
 override PYTHONDONTWRITEBYTECODE := 1
 export PYTHONDONTWRITEBYTECODE
 
-.PHONY: test check deploy gates-restore deploy-status recertify accept-kimi
+.PHONY: test check clean-pycache deploy gates-restore deploy-status recertify accept-kimi
 
 test:
 	$(PYTHON) -B -m pytest tests/ -q
@@ -18,7 +18,16 @@ check:                       ## то же, что проверит деплой:
 	 || { echo "✗ дерево грязное — выкатывать нечего воспроизводимого"; exit 1; }
 	@$(MAKE) --no-print-directory test
 
-deploy:                      ## выкатить origin/main на весь флот (канарейка → остальные)
+clean-pycache:               ## явно удалить regenerable cache только в деревьях Gates
+	@for root in "$(CURDIR)/plugins/gates" \
+		"$$HOME/.claude/plugins/cache/lenar-gates/gates" \
+		"$$HOME/.kimi-code/plugins/managed/gates"; do \
+		if [ -d "$$root" ]; then \
+			find "$$root" -type d -name __pycache__ -prune -exec rm -rf -- {} +; \
+		fi; \
+	done
+
+deploy:                      ## опубликовать origin/main и обновить весь флот из GitHub
 	$(PYTHON) -B scripts/deploy_gates.py
 
 gates-restore:               ## вернуть хост на прошлую версию: make gates-restore HOST=…

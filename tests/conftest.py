@@ -127,6 +127,20 @@ def _no_remote_mutation(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_release_or_kimi_server(monkeypatch):
+    gr = sys.modules.get("github_release")
+    if gr is not None:
+        def refuse_gh(args):
+            raise AssertionError(f"тест зовёт GitHub CLI без подмены: {args!r}")
+        monkeypatch.setattr(gr, "_gh", refuse_gh)
+    dv = sys.modules.get("deploy_verify")
+    if dv is not None:
+        def refuse_server():
+            raise AssertionError("тест запускает настоящий Kimi Server API без подмены")
+        monkeypatch.setattr(dv, "_kimi_server", refuse_server)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_install_mutation(monkeypatch, tmp_path):
     """Мутация установки БЕЗ subprocess — маршрут, который не видит ни один из трёх слоёв.
 

@@ -274,9 +274,10 @@ def test_live_restore_conflict_preserves_external_change_and_journal(tmp_path, m
         if path == "/openapi.json":
             return {"paths": {
                 "/api/v1/plugins": {"get": {}, "post": {}},
-                "/api/v1/plugins/{plugin_id}:{action}": {"post": {}},
-                "/api/v1/sessions": {"post": {}},
+                "/api/v1/plugins/{tail}": {"post": {}},
+                "/api/v1/sessions": {"get": {}, "post": {}},
                 "/api/v1/sessions/{session_id}": {"get": {}},
+                "/api/v1/sessions/{session_id}:reload": {"post": {}},
                 "/api/v1/sessions/{session_id}/prompts": {"get": {}, "post": {}},
                 "/api/v1/sessions/{session_id}/messages": {"get": {}},
                 "/api/v1/sessions/{session_id}/transcript/user-messages": {"get": {}},
@@ -289,7 +290,7 @@ def test_live_restore_conflict_preserves_external_change_and_journal(tmp_path, m
             registry.write_text(json.dumps({"version": 1, "plugins": [candidate]}))
             return candidate
         if method == "GET" and path == "/api/v1/plugins":
-            return [candidate]
+            return {"plugins": [candidate]}
         raise AssertionError((method, path, body))
 
     def external_change(_base, _token, _repo, _digest):
@@ -347,12 +348,20 @@ def test_global_registration_is_required_and_checked_against_manifest(tmp_path):
         ka._require_global_hooks(home, ROOT / "plugins/gates")
 
 
+def test_openapi_document_is_not_envelope_wrapped(monkeypatch):
+    monkeypatch.setattr(ka.urllib.request, "urlopen", lambda _request, timeout:
+                        ka.io.BytesIO(b'{"openapi":"3.0.3","paths":{}}'))
+    assert ka._api("http://local", "token", "GET", "/openapi.json") == {
+        "openapi": "3.0.3", "paths": {}}
+
+
 def test_openapi_plugin_routes_are_required():
     good = {"paths": {
         "/api/v1/plugins": {"get": {}, "post": {}},
-        "/api/v1/plugins/{plugin_id}:{action}": {"post": {}},
-        "/api/v1/sessions": {"post": {}},
+        "/api/v1/plugins/{tail}": {"post": {}},
+        "/api/v1/sessions": {"get": {}, "post": {}},
         "/api/v1/sessions/{session_id}": {"get": {}},
+        "/api/v1/sessions/{session_id}:reload": {"post": {}},
         "/api/v1/sessions/{session_id}/prompts": {"get": {}, "post": {}},
         "/api/v1/sessions/{session_id}/messages": {"get": {}},
         "/api/v1/sessions/{session_id}/transcript/user-messages": {"get": {}},
@@ -671,5 +680,73 @@ time.sleep(60)
     monkeypatch.setattr(ka, "_kimi_bin", lambda: str(fake))
     proc, base, token = ka._start_server(tmp_path, port)
     assert base == f"http://127.0.0.1:{port}" and token == "fake"
+    log_level = proc.args.index("--log-level")
+    assert proc.args[log_level + 1] == "info"
     proc.terminate()
     proc.wait(timeout=10)
+
+
+def test_server_without_startup_output_honours_timeout(tmp_path, monkeypatch):
+    class SilentProcess:
+        def __init__(self):
+            reader, writer = os.pipe()
+            self.stdout = os.fdopen(reader)
+            self.writer = writer
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.close()
+            os.close(self.writer)
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    process = SilentProcess()
+    monkeypatch.setattr(ka, "_kimi_bin", lambda: "/opt/homebrew/bin/kimi")
+    monkeypatch.setattr(ka.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(ka, "select", SimpleNamespace(select=lambda *args: ([], [], [])), raising=False)
+    monkeypatch.setattr(ka.time, "monotonic", iter((0.0, 31.0)).__next__)
+    monkeypatch.setattr(ka.time, "time", lambda: pytest.fail("блокирующий wall-clock путь"))
+    with pytest.raises(RuntimeError, match="30 секунд"):
+        ka._start_server(tmp_path)
+
+
+def test_server_partial_startup_line_cannot_block_timeout(tmp_path, monkeypatch):
+    class PartialProcess:
+        def __init__(self):
+            reader, writer = os.pipe()
+            self.stdout = os.fdopen(reader, "rb")
+            self.writer = writer
+            self.returncode = None
+            os.write(writer, b"Kimi server: http://127.0.0.1:58690/#token=partial")
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.stdout.close()
+            os.close(self.writer)
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    process = PartialProcess()
+    monkeypatch.setattr(ka, "_kimi_bin", lambda: "/opt/homebrew/bin/kimi")
+    monkeypatch.setattr(ka.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(ka, "select", SimpleNamespace(
+        select=lambda readers, *_args: (readers, [], [])), raising=False)
+    monkeypatch.setattr(ka.time, "monotonic", iter((0.0, 0.0, 0.0, 31.0)).__next__)
+    monkeypatch.setattr(ka.time, "time", lambda: pytest.fail("блокирующий wall-clock путь"))
+    with pytest.raises(RuntimeError, match="30 секунд"):
+        ka._start_server(tmp_path)

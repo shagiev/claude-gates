@@ -18,10 +18,15 @@ import json
 import re
 import os
 import pathlib
+import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
+
+import kimi_acceptance as ka
 
 #: Окружение строится АЛЛОУЛИСТОМ, а не наследуется. Этот модуль доказывает, что стерильный
 #: гейт работает; унаследуй он `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*` хоста — доказательство
@@ -51,7 +56,24 @@ CHANNELS = {
               "update": (["plugin", "marketplace", "upgrade", "lenar-gates"],
                          ["plugin", "add", "gates@lenar-gates"]),
               "remove": ["plugin", "remove", "gates@lenar-gates"]},
+    "kimi": {"cli": "kimi", "via_shim": True, "update": (), "remove": []},
 }
+
+
+class InstallError(RuntimeError):
+    pass
+
+
+class ReleaseDigestError(InstallError):
+    pass
+
+
+class ReleaseArchiveError(InstallError):
+    pass
+
+
+_MAX_ENTRY_BYTES = 16 * 1024 * 1024
+_MAX_EXTRACT_BYTES = 100 * 1024 * 1024
 
 
 def _st(state, **kw):
@@ -83,6 +105,17 @@ def _installed_claude():
                                                      f"в глоб-фолбэк и запустит "
                                                      f"{cached[-1].parent.parent}")
         return _st("absent", registry=reg, why=f"метаданных нет ({exc}) и кэш пуст")
+    marketplace = p.with_name("known_marketplaces.json")
+    try:
+        source = json.loads(marketplace.read_text())["lenar-gates"]["source"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return _st("undetermined", registry=reg,
+                   why=f"marketplace source не прочитан: {type(exc).__name__}: {exc}")
+    if not isinstance(source, dict) or source.get("source") != "github" \
+            or source.get("repo") != "shagiev/claude-gates":
+        return _st("undetermined", registry=reg,
+                   why="marketplace lenar-gates обязан использовать GitHub shagiev/claude-gates, "
+                       f"а не {source!r}; локальная конфигурация не переписывается")
     try:
         entries = (d.get("plugins") or {}).get("gates@lenar-gates") or []
         cands = [(e.get("installPath") or "", e.get("version"), e.get("gitCommitSha"))
@@ -146,14 +179,134 @@ def _installed_codex():
         return _st("undetermined", why=f"манифест codex не прочитан ({man}): {exc}")
     top = git(path, "rev-parse", "--show-toplevel")
     head = git(path, "rev-parse", "HEAD")
+    remote = git(path, "remote", "get-url", "origin")
+    github_sources = {"https://github.com/shagiev/claude-gates",
+                      "https://github.com/shagiev/claude-gates.git",
+                      "git@github.com:shagiev/claude-gates.git",
+                      "ssh://git@github.com/shagiev/claude-gates.git"}
     if top.returncode != 0 or head.returncode != 0:
         return _st("undetermined", why="каталог codex не git-клон — снапшот sha и откат "
                                        "невозможны")
+    if remote.returncode != 0 or remote.stdout.strip() not in github_sources:
+        return _st("undetermined", why="Codex marketplace обязан использовать GitHub "
+                                       "shagiev/claude-gates; local/unknown source не переписывается")
     return _st("installed", version=version, sha=head.stdout.strip(), path=path,
                toplevel=top.stdout.strip())
 
 
+_KIMI_SERVER = None
+_RELEASE_URL = re.compile(
+    r"https://github\.com/shagiev/claude-gates/releases/download/"
+    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)/"
+    r"gates-\1\.\2\.\3\.zip\Z", re.ASCII)
 
+
+def _kimi_home() -> pathlib.Path:
+    return pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir) / ".kimi-code"
+
+
+def _canonical_release_url(version: str) -> str:
+    match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+                         version, re.ASCII)
+    if match is None:
+        raise InstallError(f"недопустимая версия Kimi release: {version!r}")
+    return (f"https://github.com/shagiev/claude-gates/releases/download/v{version}/"
+            f"gates-{version}.zip")
+
+
+def _release_version(source: str) -> str:
+    if not isinstance(source, str):
+        raise InstallError("Kimi source обязан быть canonical release URL")
+    match = _RELEASE_URL.fullmatch(source)
+    if match is None:
+        raise InstallError("Kimi source отклонён: разрешён только canonical GitHub Release ZIP")
+    return ".".join(match.groups())
+
+
+def _kimi_server():
+    global _KIMI_SERVER
+    if _KIMI_SERVER is None:
+        proc, base, token = ka._start_server(pathlib.Path("/"))
+        ka.require_plugin_api(ka._api(base, token, "GET", "/openapi.json"))
+        _KIMI_SERVER = proc, base, token
+    proc, base, token = _KIMI_SERVER
+    if proc.poll() is not None:
+        raise InstallError("Kimi Server API завершился во время deploy")
+    return base, token
+
+
+def _stop_kimi_server():
+    global _KIMI_SERVER
+    if _KIMI_SERVER is not None:
+        proc, _base, _token = _KIMI_SERVER
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        _KIMI_SERVER = None
+
+
+def _kimi_call(method: str, path: str, body=None):
+    base, token = _kimi_server()
+    return ka._api(base, token, method, path, body)
+
+
+def _kimi_records():
+    payload = _kimi_call("GET", "/api/v1/plugins")
+    records = payload.get("plugins") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ka.ApiSchemaError("Kimi plugins response не содержит plugins list")
+    return records
+
+
+def _managed_tree(root: pathlib.Path) -> dict:
+    entries = {}
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs:
+            path = pathlib.Path(base) / name
+            if path.is_symlink():
+                raise OSError(f"symlink в managed installation: {path}")
+        for name in files:
+            path = pathlib.Path(base) / name
+            entries[path.relative_to(root).as_posix()] = " ".join(blob_entry(path))
+    return entries
+
+
+def _installed_kimi():
+    home = _kimi_home()
+    managed = home / "plugins/managed/gates"
+    try:
+        records = [record for record in _kimi_records()
+                   if isinstance(record, dict) and record.get("id") == "gates"]
+        if len(records) > 1:
+            return _st("undetermined", kimi_home=str(home), why="несколько записей Kimi gates")
+        if not records:
+            return _st("absent", kimi_home=str(home), path=str(managed), why="Kimi gates не установлен")
+        record = records[0]
+        if record.get("state") != "ok" or not isinstance(record.get("enabled"), bool):
+            return _st("undetermined", kimi_home=str(home),
+                       why=f"Kimi gates state/enabled не определены: {record!r}")
+        if managed.is_symlink():
+            return _st("undetermined", kimi_home=str(home),
+                       why="gate-owned managed/gates является symlink")
+        if "root" in record:
+            root = pathlib.Path(record["root"])
+            if not root.is_absolute() or root.resolve() != managed.resolve():
+                return _st("undetermined", kimi_home=str(home),
+                           why="Kimi API root не совпадает с resolved gate-owned managed/gates")
+        manifest = managed / ".kimi-plugin/plugin.json"
+        version = json.loads(manifest.read_text())["version"]
+        source = record.get("originalSource")
+        return _st("installed", version=version, path=str(managed), kimi_home=str(home),
+                   enabled=record["enabled"], source=source,
+                   rollback_source=_canonical_release_url(version), tree=_managed_tree(managed),
+                   commandCount=record.get("commandCount"), hookCount=record.get("hookCount"))
+    except (OSError, ValueError, KeyError, AttributeError, TypeError, RuntimeError,
+            ka.ApiSchemaError) as exc:
+        return _st("undetermined", kimi_home=str(home),
+                   why=f"Kimi API/managed state недоступен: {type(exc).__name__}: {exc}")
 
 
 def installed(channel):
@@ -163,7 +316,11 @@ def installed(channel):
     установкой, пропустили бы деплой на машину, откатить которую будет некуда."""
     if channel not in CHANNELS:
         return _st("undetermined", why=f"канал {channel!r} неизвестен")
-    return _installed_claude() if channel == "claude" else _installed_codex()
+    if channel == "claude":
+        return _installed_claude()
+    if channel == "codex":
+        return _installed_codex()
+    return _installed_kimi()
 
 
 # ── идентичность установленного дерева ─────────────────────────────────────────────────────
@@ -454,6 +611,102 @@ def _problem(code, channel, text):
     return {"code": code, "channel": channel, "text": text}
 
 
+def _extract_release(source: str, version: str, destination: pathlib.Path, zip_sha256=None,
+                     observed=None):
+    if _release_version(source) != version:
+        raise InstallError("rollback source version не совпадает со snapshot version")
+    try:
+        with ka.urllib.request.urlopen(source, timeout=60) as response:
+            data = response.read(100 * 1024 * 1024 + 1)
+    except OSError as exc:
+        raise InstallError(f"release не скачан: {type(exc).__name__}: {exc}") from exc
+    if observed is not None:
+        observed["zip_sha256"] = hashlib.sha256(data).hexdigest()
+    if len(data) > 100 * 1024 * 1024:
+        raise ReleaseArchiveError("release ZIP превышает 100 MiB")
+    if zip_sha256 is not None and hashlib.sha256(data).hexdigest() != zip_sha256:
+        raise ReleaseDigestError("release ZIP SHA-256 не совпадает с publisher digest")
+    total = 0
+    try:
+        archive = destination.parent / "release.zip"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(data)
+        with zipfile.ZipFile(archive) as bundle:
+            names = [info.filename for info in bundle.infolist() if not info.is_dir()]
+            if len(names) != len(set(names)):
+                raise ReleaseArchiveError("duplicate entry names в release ZIP")
+            for info in bundle.infolist():
+                name = info.filename
+                parts = pathlib.PurePosixPath(name).parts
+                mode = info.external_attr >> 16
+                if (not name or name.startswith(("/", "plugins/gates/")) or "\\" in name
+                        or ".." in parts or "__pycache__" in parts or name.endswith(".pyc")
+                        or info.flag_bits & 1
+                        or (not info.is_dir() and stat.S_IFMT(mode) not in (0, stat.S_IFREG))):
+                    raise ReleaseArchiveError(f"небезопасный entry в release ZIP: {name!r}")
+                if info.is_dir():
+                    continue
+                if info.file_size > _MAX_ENTRY_BYTES:
+                    raise ReleaseArchiveError(f"ZIP entry превышает per-entry limit: {name!r}")
+                if total + info.file_size > _MAX_EXTRACT_BYTES:
+                    raise ReleaseArchiveError("ZIP total uncompressed size превышает limit")
+                target = destination.joinpath(*parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                written = 0
+                with bundle.open(info) as src, open(target, "wb") as dst:
+                    while chunk := src.read(1024 * 1024):
+                        written += len(chunk)
+                        total += len(chunk)
+                        if written > _MAX_ENTRY_BYTES:
+                            raise ReleaseArchiveError(f"ZIP entry превышает per-entry limit: {name!r}")
+                        if total > _MAX_EXTRACT_BYTES:
+                            raise ReleaseArchiveError("ZIP total uncompressed size превышает limit")
+                        dst.write(chunk)
+                if written != info.file_size:
+                    raise ReleaseArchiveError(f"ZIP entry size drift: {name!r}")
+                target.chmod(0o755 if mode & 0o100 else 0o644)
+    except OSError as exc:
+        raise InstallError(f"release local I/O failed: {type(exc).__name__}: {exc}") from exc
+    except (ValueError, zipfile.BadZipFile) as exc:
+        raise ReleaseArchiveError(
+            f"release ZIP не распакован: {type(exc).__name__}: {exc}") from exc
+    return destination
+
+
+def _remove_kimi_if_present():
+    if any(record.get("id") == "gates" for record in _kimi_records()
+           if isinstance(record, dict)):
+        _kimi_call("POST", "/api/v1/plugins/gates:remove")
+
+
+def _install_kimi_release(source: str, enabled: bool):
+    _remove_kimi_if_present()
+    _kimi_call("POST", "/api/v1/plugins", {"source": source})
+    _kimi_call("POST", "/api/v1/plugins/gates:" + ("enable" if enabled else "disable"))
+
+
+def cmd_update(spec: str):
+    want = json.loads(spec)
+    source = want.get("source")
+    version = want.get("version")
+    if _release_version(source) != version or source != _canonical_release_url(version):
+        raise InstallError("Kimi update source/version не образуют canonical release identity")
+    try:
+        _install_kimi_release(source, enabled=True)
+        return {"ok": True, "problems": []}
+    except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
+        return {"ok": False, "problems": [_problem(
+            "kimi-install", "kimi", f"Kimi API install failed: {type(exc).__name__}: {exc}")]}
+
+
+def _verify_kimi_source(want, observed=None):
+    with tempfile.TemporaryDirectory(prefix="gates-kimi-rollback-") as tmp:
+        root = _extract_release(want["source"], want["version"], pathlib.Path(tmp) / "plugin",
+                                want.get("zip_sha256"), observed)
+        problems = check_tree(root, want["tree"])
+    return problems
+
+
 def cmd_verify(spec):
     """spec: {"channels": {ch: {"version":…, "sha":…|null, "tree": {rel: "mode oid"}|null,
                                 "checks": ["version","sha","tree","smoke"]}}}"""
@@ -481,6 +734,34 @@ def cmd_verify(spec):
         if "sha" in checks and want.get("sha") and info.get("sha") != want["sha"]:
             report["problems"].append(_problem(
                 "sha", ch, f"sha {info.get('sha')} != {want['sha']}"))
+        if ch == "kimi":
+            if "enabled" in checks and info.get("enabled") is not want.get("enabled"):
+                report["problems"].append(_problem(
+                    "enabled", ch, f"enabled {info.get('enabled')} != snapshot {want.get('enabled')}"))
+            if info.get("enabled") is True \
+                    and (info.get("commandCount"), info.get("hookCount")) != (5, 3):
+                report["problems"].append(_problem(
+                    "kimi-registration", ch, "Kimi commands/hooks не зарегистрированы полностью"))
+            if "source" in checks:
+                if info.get("source") != want.get("source") and not want.get("migration"):
+                    report["problems"].append(_problem(
+                        "source", ch, "активная Kimi установка получена не из ожидаемого release URL"))
+                source_code = "source"
+                observed = {}
+                try:
+                    source_problems = _verify_kimi_source(want, observed)
+                    info["zip_sha256"] = observed["zip_sha256"]
+                    source_code = "source-tree"
+                except ReleaseDigestError as exc:
+                    source_code = "zip-sha256"
+                    source_problems = [str(exc)]
+                except ReleaseArchiveError as exc:
+                    source_code = "source-archive"
+                    source_problems = [str(exc)]
+                except (InstallError, OSError, ValueError, RuntimeError) as exc:
+                    source_problems = [f"{type(exc).__name__}: {exc}"]
+                for why in source_problems:
+                    report["problems"].append(_problem(source_code, ch, why))
         root = pathlib.Path(info["path"])
         if "tree" in checks and want.get("tree"):
             for why in check_tree(root, want["tree"]):
@@ -495,6 +776,9 @@ def cmd_verify(spec):
                     why = f"проверка не выполнена: {type(exc).__name__}: {exc}"
                 if why:
                     report["problems"].append(_problem(smoke.__name__, ch, why))
+            if "tree" in checks and want.get("tree"):
+                for why in check_tree(root, want["tree"]):
+                    report["problems"].append(_problem("post-smoke-tree", ch, why))
     report["ok"] = not report["problems"]
     return report
 
@@ -519,21 +803,31 @@ def cmd_restore(spec):
     # «снять канал» выполнила `claude plugin uninstall` НА РАБОЧЕЙ МАШИНЕ и снесла живой
     # плагин. Пока адрес брался из окружения, никакая аккуратность в тестах этого не
     # исключала; теперь неполный спек не может ничего мутировать.
-    target = snap.get("registry") if ch == "claude" else snap.get("toplevel")
+    if ch not in CHANNELS:
+        return {"ok": False, "problems": [_problem("no-target", ch, "неизвестный канал")]}
+    target = (snap.get("registry") if ch == "claude" else
+              snap.get("kimi_home") if ch == "kimi" else snap.get("toplevel"))
     if snap.get("state") == "absent":
         # У ветки «снять канал» адрес не просто ОБЪЯВЛЕН, он УПРАВЛЯЕТ мутацией: раньше здесь
         # проверялась непустота строки, значение которой игнорировалось, а команда била туда,
         # куда смотрит `E["HOME"]`, зафиксированный на импорте. Формулировка «адрес обязан
         # приехать в спеке» для этой ветки была декорацией — именно ей поверил бы следующий.
-        target = snap.get("registry") if ch == "claude" else snap.get("codex_home")
+        target = (snap.get("registry") if ch == "claude" else
+                  snap.get("kimi_home") if ch == "kimi" else snap.get("codex_home"))
     if snap.get("state") in ("absent", "installed") and not target:
         return {"ok": False, "problems": [_problem(
             "no-target", ch, "в снапшоте нет адреса цели — мутация без явного адреса запрещена")]}
     if snap.get("state") == "absent":
         # Канал установлен ЭТИМ деплоем: вернуть состояние — значит снять его, иначе откат
         # отчитался бы успехом, оставив канал, которого до деплоя не было.
-        # Адрес превращается в окружение команды: для claude это дом над реестром
-        # (`<home>/.claude/plugins/installed_plugins.json`), для codex — его собственный корень.
+        if ch == "kimi":
+            try:
+                _remove_kimi_if_present()
+                after = installed(ch)
+                return {"ok": after["state"] == "absent", "problems": [] if after["state"] == "absent"
+                        else [_problem("remove-failed", ch, "Kimi gates не удалён через API")]}
+            except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
+                return {"ok": False, "problems": [_problem("remove-failed", ch, str(exc))]}
         env = dict(E)
         if ch == "claude":
             env["HOME"] = str(pathlib.Path(target).resolve().parents[2])
@@ -549,6 +843,20 @@ def cmd_restore(spec):
                                  f"{after['state']}): {(r.stderr or '').strip()[:160]}")]}
     if snap.get("state") != "installed":
         return {"ok": False, "problems": [_problem("no-target", ch, "снапшота нет")]}
+    if ch == "kimi":
+        try:
+            source = snap.get("rollback_source") or snap.get("source")
+            if _release_version(source) != snap.get("version"):
+                raise InstallError("rollback source/version mismatch")
+            digest = snap.get("zip_sha256")
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest, re.ASCII) is None:
+                raise InstallError("rollback ZIP digest отсутствует в snapshot")
+            with tempfile.TemporaryDirectory(prefix="gates-kimi-restore-") as tmp:
+                _extract_release(source, snap["version"], pathlib.Path(tmp) / "plugin", digest)
+            _install_kimi_release(source, enabled=snap.get("enabled") is True)
+            return {"ok": True, "problems": []}
+        except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
+            return {"ok": False, "problems": [_problem("restore-failed", ch, str(exc))]}
     if ch == "claude":
         p = pathlib.Path(target)
         d = json.loads(p.read_text())
@@ -568,14 +876,66 @@ def cmd_restore(spec):
     return {"ok": True, "problems": []}
 
 
+def cmd_sessions(arg):
+    sessions = []
+    enumeration = "known"
+    for channel in (value for value in arg.split(",") if value):
+        if channel not in CHANNELS:
+            enumeration = "unknown"
+            continue
+        if channel != "kimi":
+            enumeration = "unknown"
+            continue
+        try:
+            payload = _kimi_call("GET", "/api/v1/sessions")
+            records = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(records, list) or payload.get("has_more") is not False:
+                raise ka.ApiSchemaError("Kimi sessions response неполный или без items list")
+            for record in records:
+                if not isinstance(record, dict) or not isinstance(record.get("id"), str) \
+                        or re.fullmatch(r"[A-Za-z0-9._-]+", record["id"], re.ASCII) is None:
+                    raise ka.ApiSchemaError("Kimi session без валидного id")
+                sessions.append({"channel": "kimi", "id": record["id"],
+                                 "kind": record.get("kind", "unknown")})
+        except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
+            return {"enumeration": "unknown", "sessions": [], "error": str(exc)}
+    if not sessions:
+        enumeration = "unknown"
+    return {"enumeration": enumeration, "sessions": sessions}
+
+
+def cmd_activate(arg):
+    inventory = json.loads(arg).get("sessions") or []
+    proofs = []
+    errors = []
+    for session in inventory:
+        if session.get("channel") != "kimi" or not session.get("id"):
+            continue
+        try:
+            _kimi_call("POST", f"/api/v1/sessions/{session['id']}:reload")
+            state = _kimi_call("GET", f"/api/v1/sessions/{session['id']}")
+            if not isinstance(state, dict):
+                raise ka.ApiSchemaError("Kimi session state не object")
+            if state.get("gates_version") and state.get("gates_smoke") == "passed":
+                proofs.append({"id": session["id"], "version": state["gates_version"],
+                               "smoke": "passed"})
+        except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
+            errors.append({"id": session["id"], "error": f"{type(exc).__name__}: {exc}"})
+    return {"sessions": proofs, "errors": errors}
+
+
 def main(argv):
-    cmds = {"installed": cmd_installed, "verify": cmd_verify, "restore": cmd_restore}
+    cmds = {"installed": cmd_installed, "verify": cmd_verify, "restore": cmd_restore,
+            "update": cmd_update, "sessions": cmd_sessions, "activate": cmd_activate}
     if not argv or argv[0] not in cmds:
         print(f"usage: deploy_verify.py {'|'.join(cmds)} <arg>", file=sys.stderr)
         return 2
-    out = cmds[argv[0]](argv[1])
-    print(json.dumps(out, ensure_ascii=False))
-    return 0 if out.get("ok", True) else 1
+    try:
+        out = cmds[argv[0]](argv[1])
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out.get("ok", True) else 1
+    finally:
+        _stop_kimi_server()
 
 
 if __name__ == "__main__":

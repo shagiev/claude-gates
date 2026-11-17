@@ -84,27 +84,36 @@ Mandatory Claude adapter ищет native/legacy/npm CLI в `~/.local/bin`,
 Нормативный план adapters/certification:
 `docs/2026-07-30-cross-host-reviewer-architecture.md`.
 
-## Установка в Kimi Code
+## Установка и deploy в Kimi Code, Claude Code и Codex
+
+Kimi устанавливается только из versioned GitHub Release ZIP, не из локальной папки:
 
 ```
-/plugins install <путь-к-клону>/plugins/gates
+/plugins install https://github.com/shagiev/claude-gates/releases/download/vX.Y.Z/gates-X.Y.Z.zip
 /reload
 ```
+
+Стандартный `make deploy PYTHON=python3.13` после commit/push собирает ZIP из закреплённого
+`origin/main:plugins/gates`, публикует `gates-X.Y.Z.zip` и `.sha256` как prerelease, обновляет Kimi
+по canonical release URL, а Claude Code/Codex — через GitHub marketplace `shagiev/claude-gates`.
+После полного fleet install release становится latest. Локальный marketplace/source не переписывается
+молча: его нужно один раз заменить на GitHub самостоятельно.
+
+Успешный install не означает reload уже работающих сессий. Коды завершения: `0` — версия, tree,
+block/pass smoke и активация всех учтённых сессий доказаны; `2` — ошибка/rollback; `3` — только
+подмножество fleet (`partial-installed`); `4` — установлено, но требуется `/reload` или `/new` в Kimi
+и restart Claude Code/Codex (`installed`, не `stable`). Новая API-сессия и текстовое подтверждение
+оператора не считаются доказательством reload старой интерактивной сессии.
 
 Плагин поставляет `/gates:design-review`, `/gates:simplify`, `/gates:security-review`,
 `/gates:code-review` и `/gates:gates-init`. Независимый ревьюер по-прежнему Codex (при его
 недоступности для итеративного ревью можно использовать `cursor-agent`, но не саморевью Kimi).
-Для `write-marker` используется одноразовый `GATES_SESSION_NONCE` — инструкция есть в команде
-дизайн-ревью. Git-шим поддерживает OS-default `~/.kimi-code`; relocated `KIMI_CODE_HOME`
-не принимается. При одновременной активной установке Claude и Kimi их delivery digest обязан
-совпадать, иначе shim fail-closed. Установку и live-приёмку делай из чистого материализованного
-дерева, а не из каталога с `__pycache__`.
+Git-шим поддерживает OS-default `~/.kimi-code`; relocated `KIMI_CODE_HOME` не принимается.
 
-First-party Makefile recipes используют `$(PYTHON) -B` и принудительный
-`PYTHONDONTWRITEBYTECODE=1` (включая command-line override); прямые deploy/recertify/acceptance
-entrypoints выставляют тот же запрет до local imports. Стандартно: `make test PYTHON=python3.13`,
-`make deploy PYTHON=python3.13`. Deploy verification не удаляет bytecode автоматически: cache даёт
-fail-closed диагностику с путём для ручной проверки и очистки.
+First-party recipes используют `$(PYTHON) -B` и принудительный `PYTHONDONTWRITEBYTECODE=1`.
+Стандартно: `make test PYTHON=python3.13`, `make deploy PYTHON=python3.13`. Verification не удаляет
+bytecode автоматически. Для явной очистки только regenerable cache в дереве плагина и managed/cache
+установках Gates используй `make clean-pycache PYTHON=python3.13`; другие файлы команда не трогает.
 
 ## Онбординг проекта
 

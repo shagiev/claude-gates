@@ -4,6 +4,13 @@
 Tier: 1 — first-party cache prevention и удаление опасного auto-delete; НОВЫХ launch/security
 boundaries и delete actuator'ов НЕТ.
 
+> Дополнение 10.11.2026: владелец позднее явно запросил стандартную команду очистки вместо
+> повторных подтверждений. `make clean-pycache` ограничена `plugins/gates`,
+> `~/.claude/plugins/cache/lenar-gates/gates` и `~/.kimi-code/plugins/managed/gates`, запускается
+> только оператором и удаляет лишь каталоги `__pycache__`. Автоматический resolver/verifier по-прежнему
+> read-only; прежнее решение «cleaner не входит» относится к permanent/auto cleaner, а не к этой
+> явной команде.
+
 ## Исходная задача и факты
 
 Нужно прекратить повторяющиеся ручные удаления `__pycache__` между review/install operations.

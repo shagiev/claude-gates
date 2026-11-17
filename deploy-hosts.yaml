@@ -10,6 +10,6 @@
 # «Claude-only хост», и обязательный ревьюер молча оставался бы слепым (так уже было 4 раза).
 hosts:
   - id: local
-    channels: [claude, codex]
+    channels: [claude, codex, kimi]
   - id: smartape-vps-1
-    channels: [claude, codex]
+    channels: [claude, codex, kimi]
