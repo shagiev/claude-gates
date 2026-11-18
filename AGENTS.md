@@ -57,35 +57,6 @@
   и после smoke. Reviewer evidence требует exact canonical argv текущего turn и один
   `Verdict: approve` без findings; audit-строка сама по себе evidence не является.
 
-## Release deploy (0.12.0)
-
-- Источник Kimi — только вычисленный из строгой версии canonical GitHub Release ZIP. Local/file/
-  fork/userinfo/query/fragment/caller URL запрещены. Publisher ZIP digest и commit-tree digest —
-  независимые доказательства; managed tree нельзя сверять только со скачанным на хосте ZIP.
-  Оба extractor’а ограничивают фактические uncompressed bytes: 16 MiB entry, 100 MiB total и
-  отклоняют duplicate names. Отсутствие API `root` — измеренный live contract Kimi 2.4.1;
-  присутствующий root обязан быть absolute и resolve ровно в gate-owned managed/gates.
-  `source-tree/source-archive/zip-sha256` — artifact rejection и draft; download/local I/O `source` —
-  transport failure, prerelease сохраняется. Post-install verify повторно скачивает canonical ZIP и
-  проверяет publisher digest вдобавок к managed tree; второй fetch самого Kimi см. остаток ниже.
-- Release создаётся prerelease, не latest, без `--clobber`/перемещения tag; latest только после
-  полного fleet install. Публикация проверенного prerelease до host preflight — НЕ мутация флота:
-  failed preflight оставляет его для retry, draft нужен только при artifact/tree/smoke rejection.
-  Publisher public/authenticated download outage — `ReleaseTransportError`, release state не меняется.
-  После digest verification retry из draft/latest нормализуется в prerelease/not-latest до host
-  mutation; не-boolean release state — schema drift и блок.
-  Snapshot и rollback target всех выбранных хостов доказываются до первой host-мутации;
-  rollback проверяет exact tree, enabled и block/pass smoke. Preflight сохраняет ZIP SHA-256 в
-  snapshot; restore перепроверяет его до install и после него. Собственный второй fetch Kimi
-  между этими проверками неустраним без digest-aware installer: подмена в этом окне обнаруживается
-  post-check и rollback не сертифицируется.
-- `installed` не равно `active`: неизвестная/пустая session enumeration или отсутствие same-session
-  proof даёт exit 4 без `stable`; подмножество fleet — exit 3. Текст оператора и новая API-сессия
-  не закрывают pre-mutation interactive sessions. Для Claude/Codex enumeration/proof пока не
-  реализованы, поэтому exit 4 — осознанный fail-closed результат, а не повод объявить их `known`.
-- `make clean-pycache` — явная команда оператора только для cache в известных деревьях Gates;
-  автоматический verifier остаётся read-only.
-
 ## Medium/low (совещательно)
 
 Нет теста на новую ветку/except; сообщение об ошибке без контекста; пере-блок безобидного
