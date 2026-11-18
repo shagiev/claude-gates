@@ -213,29 +213,35 @@ def _download(url: str) -> bytes:
     return data
 
 
-def download_and_verify(artifact: dict, gh=None, draft=False) -> None:
+def download_and_verify(artifact: dict, gh=None, draft=False,
+                        verify_zip=True, verify_checksum=True) -> None:
     if draft:
         with tempfile.TemporaryDirectory(prefix="gates-release-draft-") as tmp:
-            for name in (artifact["asset"], artifact["checksum_asset"]):
+            names = [name for enabled, name in ((verify_zip, artifact["asset"]),
+                                               (verify_checksum, artifact["checksum_asset"]))
+                     if enabled]
+            for name in names:
                 try:
                     _run_gh(gh or _gh, ["release", "download", artifact["tag"], "--repo", REPOSITORY,
                                         "--pattern", name, "--dir", tmp])
                 except ReleaseError as exc:
                     raise ReleaseTransportError(str(exc)) from exc
-            data = (Path(tmp) / artifact["asset"]).read_bytes()
-            checksum = (Path(tmp) / artifact["checksum_asset"]).read_text()
+            data = (Path(tmp) / artifact["asset"]).read_bytes() if verify_zip else None
+            checksum = (Path(tmp) / artifact["checksum_asset"]).read_text() if verify_checksum else None
     else:
-        data = _download(artifact["url"])
-    if hashlib.sha256(data).hexdigest() != artifact["zip_sha256"]:
-        raise ReleaseError("скачанный ZIP не совпадает с publisher ZIP SHA-256")
-    with tempfile.TemporaryDirectory(prefix="gates-release-download-") as tmp:
-        root = inspect_archive(data, Path(tmp) / "plugin", artifact["version"])
-        if expected_disk_tree(root) != artifact["tree"]:
-            raise ReleaseError("дерево скачанного ZIP не совпадает с publisher commit tree")
-    if not draft:
-        checksum = _download(artifact["url"] + ".sha256").decode("utf-8")
-    if checksum.strip() != f"{artifact['zip_sha256']}  {artifact['asset']}":
-        raise ReleaseError("скачанный .sha256 не совпадает с publisher digest")
+        data = _download(artifact["url"]) if verify_zip else None
+    if verify_zip:
+        if hashlib.sha256(data).hexdigest() != artifact["zip_sha256"]:
+            raise ReleaseError("скачанный ZIP не совпадает с publisher ZIP SHA-256")
+        with tempfile.TemporaryDirectory(prefix="gates-release-download-") as tmp:
+            root = inspect_archive(data, Path(tmp) / "plugin", artifact["version"])
+            if expected_disk_tree(root) != artifact["tree"]:
+                raise ReleaseError("дерево скачанного ZIP не совпадает с publisher commit tree")
+    if verify_checksum:
+        if not draft:
+            checksum = _download(artifact["url"] + ".sha256").decode("utf-8")
+        if checksum.strip() != f"{artifact['zip_sha256']}  {artifact['asset']}":
+            raise ReleaseError("скачанный .sha256 не совпадает с publisher digest")
 
 
 def _require_tag_target(artifact: dict, tag: str, gh) -> None:
@@ -271,8 +277,6 @@ def publish_release(artifact: dict, gh=None) -> None:
             raise ReleaseError(f"Release содержит конфликтующие assets: {sorted(unexpected)}")
         missing = [path for key, path in (("zip", artifact["zip"]), ("checksum", artifact["checksum"]))
                    if identity["asset" if key == "zip" else "checksum_asset"] not in assets]
-        if missing:
-            _run_gh(gh, ["release", "upload", tag, *missing, "--repo", REPOSITORY])
     else:
         _run_gh(gh, ["release", "create", tag, artifact["zip"], artifact["checksum"],
                      "--repo", REPOSITORY, "--target", artifact["sha"], "--title", tag,
@@ -281,6 +285,11 @@ def publish_release(artifact: dict, gh=None) -> None:
     try:
         if not exists:
             _require_tag_target(artifact, tag, gh)
+        elif missing:
+            download_and_verify(artifact, gh=gh, draft=release["isDraft"],
+                                verify_zip=identity["asset"] in assets,
+                                verify_checksum=identity["checksum_asset"] in assets)
+            _run_gh(gh, ["release", "upload", tag, *missing, "--repo", REPOSITORY])
         download_and_verify(artifact, gh=gh, draft=exists and release.get("isDraft") is True)
     except ReleaseTransportError:
         raise

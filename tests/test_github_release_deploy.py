@@ -295,6 +295,46 @@ def test_r8_r9_missing_asset_is_added_but_conflicting_or_clobber_is_not(tmp_path
     assert all("--clobber" not in call for call in gh.calls)
 
 
+def test_r9_existing_assets_are_verified_before_missing_upload(tmp_path, monkeypatch):
+    artifact = _artifact(tmp_path)
+    gh = FakeGh({"tagName": "v9.9.9", "assets": [{"name": "gates-9.9.9.zip"}]})
+    calls = []
+
+    def verify(*args, **kwargs):
+        calls.append((kwargs.get("verify_zip", True), kwargs.get("verify_checksum", True)))
+
+    monkeypatch.setattr(gr, "download_and_verify", verify)
+    gr.publish_release(artifact, gh=gh)
+    assert calls == [(True, False), (True, True)]
+    assert len(gh.uploads) == 1
+
+
+def test_r9_corrupt_existing_asset_blocks_missing_upload(tmp_path, monkeypatch):
+    artifact = _artifact(tmp_path)
+    gh = FakeGh({"tagName": "v9.9.9", "assets": [{"name": "gates-9.9.9.zip"}]})
+    monkeypatch.setattr(gr, "download_and_verify", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(gr.ReleaseError("corrupt existing asset")))
+    with pytest.raises(gr.ReleaseError, match="corrupt existing"):
+        gr.publish_release(artifact, gh=gh)
+    assert gh.uploads == []
+
+
+def test_r45_source_failure_never_runs_managed_smoke(tmp_path, monkeypatch):
+    canonical = gr.release_identity("9.9.9")["url"]
+    ran = []
+    monkeypatch.setattr(dv, "installed", lambda _ch: {
+        "state": "installed", "version": "9.9.9", "source": canonical,
+        "path": str(tmp_path), "enabled": False})
+    monkeypatch.setattr(dv, "_verify_kimi_source", lambda *args:
+                        (_ for _ in ()).throw(dv.ReleaseDigestError("wrong digest")))
+    monkeypatch.setattr(dv, "SMOKES", (lambda _root: ran.append(1),))
+    report = dv.cmd_verify(json.dumps({"channels": {"kimi": {
+        "version": "9.9.9", "source": canonical, "tree": {}, "enabled": False,
+        "checks": ["source", "smoke"]}}}))
+    assert [p["code"] for p in report["problems"]] == ["zip-sha256"]
+    assert ran == []
+
+
 def test_r10_downloaded_zip_must_match_publisher_digest(tmp_path, monkeypatch):
     artifact = _artifact(tmp_path)
     monkeypatch.setattr(gr, "_download", lambda _url: b"substituted")

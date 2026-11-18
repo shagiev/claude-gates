@@ -249,7 +249,7 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R6 | Повтор на полностью идентичном release | Без перезаписи; успешная верификация |
 | R7 | Существующий tag указывает не на `<sha>` | Блок, tag не перемещается |
 | R8 | Asset с тем же именем имеет другой digest | Блок, никакого `--clobber` |
-| R9 | Upload прервался / asset отсутствует | Retry дополняет только после проверки; host не мутируется |
+| R9 | Upload прервался / asset отсутствует | Сначала независимо проверяются ВСЕ уже существующие assets; только затем upload отсутствующих; host не мутируется |
 | R10 | Скачанный ZIP отличается от publisher ZIP SHA-256 | Блок до host mutation |
 | R11 | Managed tree равен скачанному ZIP, но НЕ publisher expected-tree из `<sha>` | Rollback cohort, `installed` запрещён |
 | R12 | Kimi API outage/schema drift/unknown state | Fail-closed, никакого absent/success по умолчанию |
@@ -285,6 +285,7 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R42 | Pre-mutation inventory содержит несколько TUI/API ids | Каждый id требует same-session proof; закрытие не засчитывается |
 | R43 | ZIP превышает declared или фактический 16 MiB entry / 100 MiB total | Оба extractor’а останавливают streamed extraction; artifact rejection |
 | R44 | Downloaded tree отличается от publisher tree либо download падает | `source-tree` = artifact/draft; download/local I/O `source` = transport/prerelease |
+| R45 | Любая version/tree/source проблема уже записана у канала | SMOKES этого канала НЕ запускаются: нельзя исполнять заведомо отклонённую установку |
 
 Покрытие измерений: clean/dirty × release absent/identical/conflicting/partial × network ok/outage ×
 host canary/second × channel Kimi/Claude/Codex × install/tree/smoke failure × active/new session ×
