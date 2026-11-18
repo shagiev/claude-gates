@@ -876,6 +876,11 @@ def cmd_restore(spec):
     return {"ok": True, "problems": []}
 
 
+def _valid_session_id(value) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value, re.ASCII) is not None
+
+
 def cmd_sessions(arg):
     sessions = []
     enumeration = "known"
@@ -892,8 +897,7 @@ def cmd_sessions(arg):
             if not isinstance(records, list) or payload.get("has_more") is not False:
                 raise ka.ApiSchemaError("Kimi sessions response неполный или без items list")
             for record in records:
-                if not isinstance(record, dict) or not isinstance(record.get("id"), str) \
-                        or re.fullmatch(r"[A-Za-z0-9._-]+", record["id"], re.ASCII) is None:
+                if not isinstance(record, dict) or not _valid_session_id(record.get("id")):
                     raise ka.ApiSchemaError("Kimi session без валидного id")
                 sessions.append({"channel": "kimi", "id": record["id"],
                                  "kind": record.get("kind", "unknown")})
@@ -910,6 +914,9 @@ def cmd_activate(arg):
     errors = []
     for session in inventory:
         if session.get("channel") != "kimi" or not session.get("id"):
+            continue
+        if not _valid_session_id(session["id"]):
+            errors.append({"id": session["id"], "error": "invalid session id"})
             continue
         try:
             _kimi_call("POST", f"/api/v1/sessions/{session['id']}:reload")

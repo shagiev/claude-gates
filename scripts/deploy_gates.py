@@ -509,7 +509,9 @@ def session_inventory(hosts) -> dict:
             if not isinstance(session, dict) or not session.get("id"):
                 result["enumeration"] = "unknown"
                 continue
-            result["sessions"].append({"host": host["id"], **session})
+            result["sessions"].append({
+                "host": host["id"], "channel": session.get("channel"),
+                "id": session["id"], "kind": session.get("kind", "unknown")})
     return result
 
 

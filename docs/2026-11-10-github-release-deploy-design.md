@@ -286,6 +286,7 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R43 | ZIP превышает declared или фактический 16 MiB entry / 100 MiB total | Оба extractor’а останавливают streamed extraction; artifact rejection |
 | R44 | Downloaded tree отличается от publisher tree либо download падает | `source-tree` = artifact/draft; download/local I/O `source` = transport/prerelease |
 | R45 | Любая version/tree/source проблема уже записана у канала | SMOKES этого канала НЕ запускаются: нельзя исполнять заведомо отклонённую установку |
+| R46 | Session payload подменяет host либо содержит id `..`/path separator/не-string | Collector сохраняет только channel/id/kind и назначает host сам; activate повторно отклоняет invalid id до API path |
 
 Покрытие измерений: clean/dirty × release absent/identical/conflicting/partial × network ok/outage ×
 host canary/second × channel Kimi/Claude/Codex × install/tree/smoke failure × active/new session ×

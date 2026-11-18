@@ -710,9 +710,27 @@ def test_r33_github_and_kimi_guards_are_fail_closed_without_explicit_mocks():
 
 
 def test_r12_session_id_cannot_inject_an_api_path(monkeypatch):
-    monkeypatch.setattr(dv, "_kimi_call", lambda *args: {"items": [{"id": "../other"}]})
-    report = dv.cmd_sessions("kimi")
-    assert report["enumeration"] == "unknown" and report["sessions"] == []
+    for invalid in ("../other", "..", ".", "a/b"):
+        monkeypatch.setattr(dv, "_kimi_call", lambda *args: {
+            "items": [{"id": invalid}], "has_more": False})
+        report = dv.cmd_sessions("kimi")
+        assert report["enumeration"] == "unknown" and report["sessions"] == []
+
+
+def test_r46_fleet_session_cannot_overwrite_real_host(monkeypatch):
+    monkeypatch.setattr(dg, "agent", lambda *args: {
+        "enumeration": "known", "sessions": [
+            {"host": "vps", "channel": "kimi", "id": "safe", "kind": "api"}]})
+    inventory = dg.session_inventory([{"id": "canary", "channels": ["kimi"]}])
+    assert inventory["sessions"] == [
+        {"host": "canary", "channel": "kimi", "id": "safe", "kind": "api"}]
+
+
+def test_r46_activate_revalidates_safe_session_id(monkeypatch):
+    calls = []
+    monkeypatch.setattr(dv, "_kimi_call", lambda *args: calls.append(args))
+    report = dv.cmd_activate(json.dumps({"sessions": [{"channel": "kimi", "id": ".."}]}))
+    assert calls == [] and report["sessions"] == [] and report["errors"]
 
 
 def test_r40_live_session_items_envelope_is_enumerated(monkeypatch):
