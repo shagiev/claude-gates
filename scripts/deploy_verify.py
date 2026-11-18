@@ -817,6 +817,11 @@ def cmd_restore(spec):
     if snap.get("state") in ("absent", "installed") and not target:
         return {"ok": False, "problems": [_problem(
             "no-target", ch, "в снапшоте нет адреса цели — мутация без явного адреса запрещена")]}
+    if ch == "kimi" and snap.get("state") in ("absent", "installed"):
+        if not isinstance(target, str) or not pathlib.Path(target).is_absolute() \
+                or pathlib.Path(target).resolve() != _kimi_home().resolve():
+            return {"ok": False, "problems": [_problem(
+                "no-target", ch, "snapshot Kimi home не совпадает с process Kimi home")]}
     if snap.get("state") == "absent":
         # Канал установлен ЭТИМ деплоем: вернуть состояние — значит снять его, иначе откат
         # отчитался бы успехом, оставив канал, которого до деплоя не было.

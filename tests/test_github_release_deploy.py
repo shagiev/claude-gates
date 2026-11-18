@@ -533,6 +533,20 @@ def test_r14_kimi_install_uses_canonical_url_then_enables(monkeypatch):
                    for _m, _p, body in calls)
 
 
+@pytest.mark.parametrize("state", ("absent", "installed"))
+def test_r47_restore_kimi_home_must_match_process_home(state, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(dv, "_kimi_home", lambda: tmp_path / "real-home")
+    monkeypatch.setattr(dv, "_kimi_call", lambda *args: calls.append(args))
+    monkeypatch.setattr(dv, "_extract_release", lambda *args:
+                        pytest.fail("download выполнен до проверки Kimi home"))
+    snap = {"state": state, "kimi_home": str(tmp_path / "other-home"),
+            "version": "1.0.0", "source": gr.release_identity("1.0.0")["url"],
+            "enabled": True, "zip_sha256": "d" * 64}
+    out = dv.cmd_restore(json.dumps({"channel": "kimi", "snapshot": snap}))
+    assert not out["ok"] and calls == []
+
+
 def test_r15_claude_directory_marketplace_is_undetermined(monkeypatch, tmp_path):
     home = tmp_path / "home"
     cache = home / ".claude/plugins/cache/lenar-gates/gates/1.0.0/scripts"
@@ -599,6 +613,7 @@ def test_r36_preflight_pins_rollback_zip_digest(monkeypatch):
 
 def test_r22_restore_rechecks_snapshot_digest_before_install(monkeypatch, tmp_path):
     events = []
+    monkeypatch.setattr(dv, "_kimi_home", lambda: tmp_path)
     monkeypatch.setattr(dv, "_extract_release", lambda source, version, dest, digest:
                         events.append(("extract", digest)) or dest)
     monkeypatch.setattr(dv, "_install_kimi_release", lambda source, enabled:
