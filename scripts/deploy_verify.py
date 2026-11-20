@@ -691,7 +691,18 @@ def cmd_update(spec: str):
     version = want.get("version")
     if _release_version(source) != version or source != _canonical_release_url(version):
         raise InstallError("Kimi update source/version не образуют canonical release identity")
+    if not isinstance(want.get("tree"), dict) or not want["tree"] \
+            or not isinstance(want.get("zip_sha256"), str) \
+            or re.fullmatch(r"[0-9a-f]{64}", want["zip_sha256"], re.ASCII) is None:
+        raise InstallError("Kimi update требует exact tree и publisher ZIP digest")
     try:
+        with tempfile.TemporaryDirectory(prefix="gates-kimi-update-") as tmp:
+            root = _extract_release(source, version, pathlib.Path(tmp) / "plugin",
+                                    want["zip_sha256"])
+            problems = check_tree(root, want["tree"])
+        if problems:
+            return {"ok": False, "problems": [_problem("tree", "kimi", why)
+                                               for why in problems]}
         _install_kimi_release(source, enabled=True)
         return {"ok": True, "problems": []}
     except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:

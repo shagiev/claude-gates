@@ -520,17 +520,45 @@ def test_r37_post_smoke_tree_drift_is_caught(install, monkeypatch):
     assert any("post-smoke.py" in problem["text"] for problem in report["problems"])
 
 
-def test_r14_kimi_install_uses_canonical_url_then_enables(monkeypatch):
+def test_r14_kimi_install_uses_canonical_url_then_enables(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(dv, "_kimi_records", lambda: [])
     monkeypatch.setattr(dv, "_kimi_call", lambda method, path, body=None:
                         calls.append((method, path, body)) or {})
+    monkeypatch.setattr(dv, "_extract_release", lambda *args: tmp_path)
+    monkeypatch.setattr(dv, "check_tree", lambda *args: [])
     source = gr.release_identity("1.2.3")["url"]
-    out = dv.cmd_update(json.dumps({"version": "1.2.3", "source": source}))
+    out = dv.cmd_update(json.dumps({"version": "1.2.3", "source": source,
+                                    "tree": {"x": "100644 " + "0" * 40},
+                                    "zip_sha256": "d" * 64}))
     assert out["ok"]
     assert ("POST", "/api/v1/plugins", {"source": source}) in calls
     assert not any(isinstance(body, dict) and Path(str(body.get("source", ""))).is_absolute()
                    for _m, _p, body in calls)
+
+
+def test_r48_update_checks_digest_and_tree_before_api_install(tmp_path, monkeypatch):
+    source = gr.release_identity("1.2.3")["url"]
+    tree = {"scripts/gate.py": "100755 " + "a" * 40}
+    spec = json.dumps({"version": "1.2.3", "source": source, "tree": tree,
+                       "zip_sha256": "d" * 64})
+    events = []
+    monkeypatch.setattr(dv, "_extract_release", lambda *args:
+                        events.append(("extract", args[-1])) or tmp_path)
+    monkeypatch.setattr(dv, "check_tree", lambda *args: [])
+    monkeypatch.setattr(dv, "_kimi_records", lambda: [])
+    monkeypatch.setattr(dv, "_kimi_call", lambda *args:
+                        events.append(("api", args[1])) or {})
+    out = dv.cmd_update(spec)
+    assert out["ok"] and events[0] == ("extract", "d" * 64)
+    assert ("api", "/api/v1/plugins") in events
+
+    events.clear()
+    monkeypatch.setattr(dv, "check_tree", lambda *args: ["wrong tree"])
+    out = dv.cmd_update(spec)
+    assert not out["ok"]
+    assert events == [("extract", "d" * 64)]
+    assert out["problems"][0]["code"] == "tree"
 
 
 @pytest.mark.parametrize("state", ("absent", "installed"))

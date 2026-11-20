@@ -381,13 +381,13 @@ def check_rollback_target(host: str, snap: dict) -> "str | None":
     return None
 
 
-def update(host: str, channels: "list[str]", versions=None) -> "str | None":
+def update(host: str, channels: "list[str]", versions=None, tree=None, zip_sha256=None) -> "str | None":
     for ch in channels:
         if ch == "kimi":
-            if not versions or not versions.get("kimi"):
-                return f"{host}/{ch}: версия release не передана — локальный source запрещён"
+            if not versions or not versions.get("kimi") or not tree or not zip_sha256:
+                return f"{host}/{ch}: release version/tree/digest не переданы — install запрещён"
             out = agent(host, "update", json.dumps({
-                "version": versions["kimi"],
+                "version": versions["kimi"], "tree": tree, "zip_sha256": zip_sha256,
                 "source": gr.release_identity(versions["kimi"])["url"]}))
             if "error" in out:
                 return f"{host}/{ch}: {out['error']}"
@@ -668,7 +668,7 @@ def main(argv=None) -> int:
                 tag = "канарейка" if i == 0 else f"хост {i + 1}/{len(hosts)}"
                 print(f"[deploy] {tag}: {h['id']} ({', '.join(h['channels'])})")
                 cohort.append((h, snap))
-                why = update(h["id"], h["channels"], ver)
+                why = update(h["id"], h["channels"], ver, tree, artifact["zip_sha256"])
                 if why:
                     raise DeployAbort(why)
                 rep = verify(h["id"], h["channels"], ver, sha, tree, artifact["zip_sha256"])

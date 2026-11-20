@@ -51,6 +51,10 @@ SSH stdin и рабочее дерево не являются источник�
 - В использованном Server API OpenAPI есть plugin install/remove/enable/disable и sessions/prompts,
   но нет отдельного гарантированного «reload existing interactive TUI session». Поэтому нельзя
   обещать внешний reload чужой активной сессии.
+- Live OpenAPI 20.11.2026: install принимает только `source`, без digest или atomic `enabled=false`.
+  Поэтому добавлены pre-install publisher digest/exact tree check и post-install verification/rollback;
+  собственный второй fetch Kimi между ними остаётся остатком. Владелец явно принял этот residual risk
+  20.11.2026; устранение требует digest-aware/install-disabled API Kimi.
 - `claude plugin update` сообщает `Restart to apply changes`; Codex также имеет session snapshot.
   Их CLI не предоставляет доказанный нами API перезагрузки уже работающей интерактивной сессии.
 - Claude/Codex marketplace CLI обновляет Git source, но не даёт одного общего проверенного способа
@@ -288,6 +292,7 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R45 | Любая version/tree/source проблема уже записана у канала | SMOKES этого канала НЕ запускаются: нельзя исполнять заведомо отклонённую установку |
 | R46 | Session payload подменяет host либо содержит id `..`/path separator/не-string | Collector сохраняет только channel/id/kind и назначает host сам; activate повторно отклоняет invalid id до API path |
 | R47 | Kimi snapshot `kimi_home` отличается от process home | Restore absent/installed отклоняется до API и download; valid home продолжает digest/install |
+| R48 | Kimi update получил canonical URL | До API install host скачивает ZIP, проверяет publisher SHA-256 и exact commit tree; failure = ноль API install |
 
 Покрытие измерений: clean/dirty × release absent/identical/conflicting/partial × network ok/outage ×
 host canary/second × channel Kimi/Claude/Codex × install/tree/smoke failure × active/new session ×
