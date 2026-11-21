@@ -12,7 +12,8 @@ Kimi только по canonical release URL; Claude Code и Codex остают�
 ZIP получает commit `--mtime`, startup Kimi — non-blocking timeout. Live Kimi 2.4.1 подтвердил
 фактические OpenAPI/plugin/session contracts и same-session reload route. Тесты изолированы от
 настоящих GitHub/Kimi/fleet мутаций; review evidence и baseline тоже изолированы от тестов.
-Полный regression: 1401 passed. Дизайн:
+Pre-install digest/archive/tree отказ сохраняет artifact-код через host update: release уходит в draft,
+а transport-ошибка оставляет prerelease. Полный regression: 1405 passed, 1 skipped. Дизайн:
 `docs/2026-11-10-github-release-deploy-design.md`.
 
 Добавлена явная `make clean-pycache` только для regenerable cache в дереве Gates и его managed/cache

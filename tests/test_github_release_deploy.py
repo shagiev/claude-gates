@@ -611,6 +611,31 @@ def test_r20_transport_outage_after_mutation_keeps_prerelease(harness):
     assert drafts == []
 
 
+@pytest.mark.parametrize(("error", "code"), [
+    (dv.ReleaseDigestError("wrong digest"), "zip-sha256"),
+    (dv.ReleaseArchiveError("unsafe ZIP"), "source-archive"),
+    (dv.InstallError("download failed"), "kimi-install"),
+])
+def test_r49_update_preserves_artifact_vs_transport_codes(error, code, monkeypatch):
+    monkeypatch.setattr(dv, "_extract_release", lambda *args: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(dv, "_kimi_call", lambda *args:
+                        pytest.fail("API install выполнен после отклонения release"))
+    out = dv.cmd_update(json.dumps({
+        "version": "9.9.9", "source": gr.release_identity("9.9.9")["url"],
+        "tree": {"scripts/gate.py": "100755 " + "a" * 40}, "zip_sha256": "d" * 64}))
+    assert not out["ok"]
+    assert [problem["code"] for problem in out["problems"]] == [code]
+
+
+def test_r49_artifact_failure_during_update_raises_artifact_abort(monkeypatch):
+    monkeypatch.setattr(dg, "agent", lambda *args: {"ok": False, "problems": [
+        {"channel": "kimi", "code": "zip-sha256", "text": "wrong digest"}]})
+    with pytest.raises(dg.DeployAbort) as raised:
+        dg.update("canary", ["kimi"], versions={"kimi": "9.9.9"},
+                  tree={"scripts/gate.py": "100755 " + "a" * 40}, zip_sha256="d" * 64)
+    assert raised.value.artifact is True
+
+
 def test_r22_rollback_requires_tree_enabled_and_smoke(monkeypatch):
     specs = []
     monkeypatch.setattr(dg, "agent", lambda h, cmd, arg:

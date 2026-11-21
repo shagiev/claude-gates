@@ -705,6 +705,12 @@ def cmd_update(spec: str):
                                                for why in problems]}
         _install_kimi_release(source, enabled=True)
         return {"ok": True, "problems": []}
+    except ReleaseDigestError as exc:
+        return {"ok": False, "problems": [_problem(
+            "zip-sha256", "kimi", f"Kimi release rejected: {type(exc).__name__}: {exc}")]}
+    except ReleaseArchiveError as exc:
+        return {"ok": False, "problems": [_problem(
+            "source-archive", "kimi", f"Kimi release rejected: {type(exc).__name__}: {exc}")]}
     except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
         return {"ok": False, "problems": [_problem(
             "kimi-install", "kimi", f"Kimi API install failed: {type(exc).__name__}: {exc}")]}

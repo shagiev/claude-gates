@@ -293,6 +293,7 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R46 | Session payload подменяет host либо содержит id `..`/path separator/не-string | Collector сохраняет только channel/id/kind и назначает host сам; activate повторно отклоняет invalid id до API path |
 | R47 | Kimi snapshot `kimi_home` отличается от process home | Restore absent/installed отклоняется до API и download; valid home продолжает digest/install |
 | R48 | Kimi update получил canonical URL | До API install host скачивает ZIP, проверяет publisher SHA-256 и exact commit tree; failure = ноль API install |
+| R49 | Kimi update отклоняет digest/archive/tree до API install | Сохраняются `zip-sha256`/`source-archive`/`tree`; driver возбуждает `DeployAbort(artifact=True)`, rollback + draft. Download/API `kimi-install` остаётся transport/prerelease |
 
 Покрытие измерений: clean/dirty × release absent/identical/conflicting/partial × network ok/outage ×
 host canary/second × channel Kimi/Claude/Codex × install/tree/smoke failure × active/new session ×

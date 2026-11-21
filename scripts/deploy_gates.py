@@ -392,8 +392,12 @@ def update(host: str, channels: "list[str]", versions=None, tree=None, zip_sha25
             if "error" in out:
                 return f"{host}/{ch}: {out['error']}"
             if not out.get("ok"):
-                return f"{host}/{ch}: " + "; ".join(
-                    problem["text"] for problem in out.get("problems", []))
+                problems = out.get("problems", [])
+                message = f"{host}/{ch}: " + "; ".join(
+                    problem["text"] for problem in problems)
+                if any(problem.get("code") in _ARTIFACT_PROBLEM_CODES for problem in problems):
+                    raise DeployAbort(message, artifact=True)
+                return message
             continue
         spec = CHANNELS[ch]
         for args in spec["update"]:
