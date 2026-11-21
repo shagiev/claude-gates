@@ -1033,6 +1033,68 @@ def test_direct_invocation_still_runs_the_pre_deploy_gate(harness):
     assert called == [1]
 
 
+_CLEAN_RM_GUARD = '''#!/usr/bin/python3
+import sys
+sys.dont_write_bytecode = True
+import os
+import pathlib
+import shutil
+
+allowed = pathlib.Path(os.environ["GATES_TEST_CLEAN_ROOT"]).resolve()
+if len(sys.argv) < 4 or sys.argv[1:3] != ["-rf", "--"]:
+    raise SystemExit("неожиданная форма rm")
+targets = [pathlib.Path(arg).resolve() for arg in sys.argv[3:]]
+if any(target.name != "__pycache__" or target == allowed or allowed not in target.parents
+       for target in targets):
+    raise SystemExit("rm за пределами временного корня отклонён")
+for target in targets:
+    shutil.rmtree(target)
+'''
+
+
+def _exercise_clean_pycache(tmp_path, makefile):
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    roots = [work / "plugins/gates",
+             home / ".claude/plugins/cache/lenar-gates/gates",
+             home / ".kimi-code/plugins/managed/gates"]
+    removed = []
+    for root in roots:
+        cache = root / "scripts/nested/__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "cached.pyc").write_bytes(b"cache")
+        removed.append(cache)
+    preserved = [work / "plugins/other/__pycache__",
+                 home / ".claude/plugins/cache/other/__pycache__",
+                 tmp_path / "outside/__pycache__"]
+    for cache in preserved:
+        cache.mkdir(parents=True)
+        (cache / "sentinel").write_text("keep")
+    (roots[0] / "linked").symlink_to(tmp_path / "outside", target_is_directory=True)
+
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    guard = stub_bin / "rm"
+    guard.write_text(_CLEAN_RM_GUARD)
+    guard.chmod(0o755)
+    env = os.environ.copy()
+    env.update({"HOME": str(home), "PATH": f"{stub_bin}:/usr/bin:/bin",
+                "SHELL": "/bin/sh", "GATES_TEST_CLEAN_ROOT": str(tmp_path),
+                "PYTHONDONTWRITEBYTECODE": "1"})
+    result = subprocess.run([shutil.which("make"), "-f", str(makefile), "clean-pycache"],
+                            cwd=work, env=env, capture_output=True, text=True)
+    return result, removed, preserved
+
+
+def test_clean_pycache_is_limited_to_gates_roots(tmp_path):
+    """F10: настоящая команда удаляет три разрешённых корня, но не соседей или цель symlink.
+    Страж `rm` сохраняет тест безвредным и при регрессии области очистки."""
+    result, removed, preserved = _exercise_clean_pycache(tmp_path, ROOT / "Makefile")
+    assert result.returncode == 0, result.stderr
+    assert all(not cache.exists() for cache in removed)
+    assert all((cache / "sentinel").read_text() == "keep" for cache in preserved)
+
+
 # ── интеграция: настоящий деплой на подставной хост ────────────────────────────────────────
 #
 # Мутационное ревью показало, что 32 правки из 63 оставляли модульные тесты зелёными: `agent`,
