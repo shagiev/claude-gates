@@ -1095,6 +1095,38 @@ def test_clean_pycache_is_limited_to_gates_roots(tmp_path):
     assert all((cache / "sentinel").read_text() == "keep" for cache in preserved)
 
 
+@pytest.mark.parametrize("component", ("parent", "root"))
+def test_clean_pycache_rejects_symlinked_root_components_before_delete(tmp_path, component):
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    legitimate = work / "plugins/gates/scripts/__pycache__"
+    legitimate.mkdir(parents=True)
+    external = tmp_path / "outside/gates/scripts/__pycache__"
+    external.mkdir(parents=True)
+    (external / "sentinel").write_text("keep")
+    base = home / ".claude/plugins/cache/lenar-gates"
+    if component == "parent":
+        base.parent.mkdir(parents=True)
+        base.symlink_to(tmp_path / "outside", target_is_directory=True)
+    else:
+        base.mkdir(parents=True)
+        (base / "gates").symlink_to(tmp_path / "outside/gates", target_is_directory=True)
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    guard = stub_bin / "rm"
+    guard.write_text(_CLEAN_RM_GUARD)
+    guard.chmod(0o755)
+    env = os.environ.copy()
+    env.update({"HOME": str(home), "PATH": f"{stub_bin}:/usr/bin:/bin",
+                "SHELL": "/bin/sh", "GATES_TEST_CLEAN_ROOT": str(tmp_path)})
+    result = subprocess.run([shutil.which("make"), "-f", str(ROOT / "Makefile"), "clean-pycache"],
+                            cwd=work, env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert legitimate.is_dir()
+    assert (external / "sentinel").read_text() == "keep"
+
+
 # ── интеграция: настоящий деплой на подставной хост ────────────────────────────────────────
 #
 # Мутационное ревью показало, что 32 правки из 63 оставляли модульные тесты зелёными: `agent`,

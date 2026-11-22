@@ -17,12 +17,13 @@ Pre-install digest/archive/tree отказ сохраняет artifact-код ч
 `pending_channels` для Claude/Codex запрещают complete/stable. `kimi web` stdout непрерывно читается
 после bootstrap, поэтому info-логи не заполняют pipe и не блокируют install/rollback API. Server
 запускается с OS-home как HOME/cwd и минимальным environment; relocated `KIMI_CODE_HOME` отклоняется.
-Полный regression: 1410 passed, 1 skipped. Дизайн:
+Полный regression: 1412 passed, 1 skipped. Дизайн:
 `docs/2026-11-10-github-release-deploy-design.md`.
 
 Добавлена явная `make clean-pycache` только для regenerable cache в дереве Gates и его managed/cache
 установках. Автоматический verifier остаётся read-only; это отдельное позднейшее решение владельца,
-а не возврат auto-delete.
+а не возврат auto-delete. Двухпроходный preflight отклоняет symlink в любом компоненте root до любого
+удаления; внешние и legitimate sentinel сохраняются.
 
 ## 0.11.3 — 2026-11-08
 

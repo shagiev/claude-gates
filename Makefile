@@ -19,7 +19,27 @@ check:                       ## то же, что проверит деплой:
 	@$(MAKE) --no-print-directory test
 
 clean-pycache:               ## явно удалить regenerable cache только в деревьях Gates
-	@for root in "$(CURDIR)/plugins/gates" \
+	@set -eu; \
+	check_root() { \
+		root=$$1; \
+		case "$$root" in /*) ;; *) echo "✗ root не абсолютный: $$root" >&2; exit 1 ;; esac; \
+		[ -d "$$root" ] || return 0; \
+		path=/; old_ifs=$$IFS; IFS=/; set -f; \
+		for part in $$root; do \
+			[ -n "$$part" ] || continue; \
+			path=$${path%/}/$$part; \
+			if [ -L "$$path" ]; then \
+				echo "✗ symlink в root очистки: $$path" >&2; exit 1; \
+			fi; \
+		done; \
+		IFS=$$old_ifs; set +f; \
+	}; \
+	for root in "$(CURDIR)/plugins/gates" \
+		"$$HOME/.claude/plugins/cache/lenar-gates/gates" \
+		"$$HOME/.kimi-code/plugins/managed/gates"; do \
+		check_root "$$root"; \
+	done; \
+	for root in "$(CURDIR)/plugins/gates" \
 		"$$HOME/.claude/plugins/cache/lenar-gates/gates" \
 		"$$HOME/.kimi-code/plugins/managed/gates"; do \
 		if [ -d "$$root" ]; then \
