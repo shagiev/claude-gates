@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import tomllib
 import urllib.request
@@ -652,6 +653,12 @@ def _start_server(root: Path, port=58690):
                     base = f"http://127.0.0.1:{address.group(1)}"
         if not token or base is None:
             raise RuntimeError("kimi web не выдал адрес и bearer token за 30 секунд")
+        def drain_output():
+            while os.read(proc.stdout.fileno(), 65536):
+                pass
+        drain = threading.Thread(target=drain_output, name="kimi-web-output-drain", daemon=True)
+        drain.start()
+        proc._gates_output_drain = drain
         while time.monotonic() < deadline:
             try:
                 with urllib.request.urlopen(base + "/api/v1/healthz", timeout=1):

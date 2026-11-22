@@ -295,6 +295,12 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R48 | Kimi update получил canonical URL | До API install host скачивает ZIP, проверяет publisher SHA-256 и exact commit tree; failure = ноль API install |
 | R49 | Kimi update отклоняет digest/archive/tree до API install | Сохраняются `zip-sha256`/`source-archive`/`tree`; driver возбуждает `DeployAbort(artifact=True)`, rollback + draft. Download/API `kimi-install` остаётся transport/prerelease |
 | R50 | Host объявляет claude,codex,kimi; Kimi enumeration успешен | Kimi ids сохраняются и reload выполняется; `pending_channels` для неподдерживаемых enumeration/proof каналов запрещает complete/stable и даёт exit 4. Игнорировать их нельзя |
+| R51 | `kimi web` пишет info-логи после token/base до health и во время install/remove/rollback | Daemon drain запускается ДО health-poll и читает outer pipe весь lifetime, отбрасывая байты без RAM/JSON stdout; EOF/terminate завершает thread, silent/partial timeout и lifeline-cleanup сохраняются |
+
+R51 отвергает отключение info-логов и forwarding в stdout агента: первое скрывает диагностику и не
+гарантирует отсутствие stdout, второе ломает машиночитаемый JSON. Pipe нельзя оставлять без reader
+после startup: supervisor уже пересылает child logs в outer pipe, поэтому заполнение останавливает и
+supervisor, и `kimi web`, включая rollback API.
 
 Покрытие измерений: clean/dirty × release absent/identical/conflicting/partial × network ok/outage ×
 host canary/second × channel Kimi/Claude/Codex × install/tree/smoke failure × active/new session ×

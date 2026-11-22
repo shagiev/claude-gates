@@ -686,6 +686,60 @@ time.sleep(60)
     proc.wait(timeout=10)
 
 
+def test_r51_server_output_is_drained_for_process_lifetime(tmp_path, monkeypatch):
+    import socket
+    import time
+    marker = tmp_path / "flood-finished"
+    fake = tmp_path / "fake_kimi_flood.py"
+    fake.write_text(fr'''#!/usr/bin/python3
+import http.server, pathlib, sys, threading, time
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *args):
+        pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+print(f"Local: http://127.0.0.1:{{port}}/#token=fake", flush=True)
+print("Token: fake", flush=True)
+def flood():
+    for _ in range(4096):
+        print("x" * 1024, flush=True)
+    pathlib.Path({str(marker)!r}).write_text("done")
+threading.Thread(target=flood, daemon=True).start()
+while True:
+    time.sleep(1)
+''')
+    fake.chmod(0o755)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    monkeypatch.setattr(ka, "_kimi_bin", lambda: str(fake))
+    proc, base, token = ka._start_server(tmp_path, port)
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.read_text() == "done", "4 MiB logs заполнили pipe и остановили kimi web"
+        with ka.urllib.request.urlopen(base + "/api/v1/healthz", timeout=1) as response:
+            assert response.status == 200
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        os.close(proc._gates_lifeline)
+    drain = getattr(proc, "_gates_output_drain", None)
+    if drain is not None:
+        drain.join(timeout=2)
+        assert not drain.is_alive()
+
+
 def test_server_without_startup_output_honours_timeout(tmp_path, monkeypatch):
     class SilentProcess:
         def __init__(self):
