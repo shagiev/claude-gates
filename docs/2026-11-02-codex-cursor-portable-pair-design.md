@@ -33,6 +33,11 @@ Outage выбранного адаптера — fail-closed, автоматич
 production adapter также использует точную пару `(provider, adapter)`.
 Добавленный verified Gemini не может легализовать неверную базовую пару.
 
+Дополнение 22.11.2026 (C16): panel evidence и arbiter обязаны получать обязательные семейства из
+того же `resolve_portable_review_plan("portable")`. Второй hardcoded список семейств запрещён:
+он уже расходился с Codex+Cursor и делал allow недеплоюемым. Неразрешимый/пустой plan — fail-closed;
+Codex+Claude fallback сохраняется.
+
 Cursor получает production text-адаптер, общий с certification runner. Модель
 берётся из единственной certification record, не из `CURSOR_REVIEW_MODEL`.
 Закреплённая модель — `grok-4.7-high`, `attestation=declared`, не `verified`.

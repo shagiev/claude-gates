@@ -448,12 +448,59 @@ def test_t21_baseline_advances_only_with_full_panel_evidence(repo, tmp_path, mon
                    "--sha256", digest]) == 0
     assert not g.GATE_BASELINE.exists(), "хватило ОДНОГО семейства — пара необязательна?"
 
-    full = half + [{"role": "blocking", "family": "anthropic", "status": "ok",
-                    "certification_id": "c2", "actual_models": ["claude-opus-5"]}]
+    full = half + [{"role": "blocking", "family": "xai", "status": "ok",
+                    "certification_id": "c2", "actual_models": ["grok-4.7-high"]}]
     g._record_reviewed(head, {"head_sha": head, "reviewers": full})
     assert g.main(["finalize-deploy", "--artifact", str(art), "--head", head,
                    "--sha256", digest]) == 0
     assert g.GATE_BASELINE.read_text().strip() == head
+
+
+@pytest.mark.parametrize(("plan", "expected"), [
+    (None, "registry broken"),
+    ((), "не содержит blocking"),
+])
+def test_t21_unresolvable_portable_plan_rejects_evidence(repo, tmp_path, monkeypatch, plan, expected):
+    head = "h" * 40
+    monkeypatch.setattr(g, "PANEL_EVIDENCE", tmp_path / "panel-evidence.json")
+    monkeypatch.setattr(g, "resolve_portable_review_plan", lambda profile: (plan, "registry broken"))
+    g._record_reviewed(head, {"head_sha": head, "reviewers": [
+        {"role": "blocking", "family": "openai", "status": "ok",
+         "certification_id": "c1", "actual_models": ["gpt-5.6-sol"]},
+        {"role": "blocking", "family": "xai", "status": "ok",
+         "certification_id": "c2", "actual_models": ["grok-4.7-high"]}]})
+    ok, why = g._panel_evidence_ok(head)
+    assert not ok and expected in why
+
+
+def test_t21_claude_fallback_evidence_matches_resolved_pair(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    head = "h" * 40
+    pair = (SimpleNamespace(family="openai", roles=("blocking",)),
+            SimpleNamespace(family="anthropic", roles=("blocking",)))
+    monkeypatch.setattr(g, "PANEL_EVIDENCE", tmp_path / "panel-evidence.json")
+    monkeypatch.setattr(g, "resolve_portable_review_plan", lambda profile: (pair, ""))
+    g._record_reviewed(head, {"head_sha": head, "reviewers": [
+        {"role": "blocking", "family": "openai", "status": "ok",
+         "certification_id": "c1", "actual_models": ["gpt-5.6-sol"]},
+        {"role": "blocking", "family": "anthropic", "status": "ok",
+         "certification_id": "c2", "actual_models": ["claude-opus-5"]}]})
+    assert g._panel_evidence_ok(head) == (True, "")
+
+
+def test_t21_singleton_blocking_family_is_rejected(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    head = "h" * 40
+    pair = (SimpleNamespace(family="openai", roles=("blocking",)),)
+    monkeypatch.setattr(g, "PANEL_EVIDENCE", tmp_path / "panel-evidence.json")
+    monkeypatch.setattr(g, "resolve_portable_review_plan", lambda profile: (pair, ""))
+    g._record_reviewed(head, {"head_sha": head, "reviewers": [
+        {"role": "blocking", "family": "openai", "status": "ok",
+         "certification_id": "c1", "actual_models": ["gpt-5.6-sol"]},
+        {"role": "blocking", "family": "xai", "status": "ok",
+         "certification_id": "c2", "actual_models": ["grok-4.7-high"]}]})
+    ok, why = g._panel_evidence_ok(head)
+    assert not ok and "ровно два" in why
 
 
 def test_t21_evidence_for_another_commit_is_rejected(repo, tmp_path, monkeypatch):
@@ -696,8 +743,8 @@ def test_interrupted_deploy_keeps_evidence_for_retry(delta_repo, tmp_path, monke
     diff_sha = g.diff_sha256(base, head)
     rows = [{"role": "blocking", "family": "openai", "status": "ok",
              "certification_id": "c1", "actual_models": ["gpt-5.6"]},
-            {"role": "blocking", "family": "anthropic", "status": "ok",
-             "certification_id": "c2", "actual_models": ["claude-opus-5"]}]
+            {"role": "blocking", "family": "xai", "status": "ok",
+             "certification_id": "c2", "actual_models": ["grok-4.7-high"]}]
     g._record_reviewed(head, {"head_sha": head, "baseline_sha": base,
                               "diff_sha256": diff_sha, "reviewers": rows})
     # валидный кэш чистого ревью того же диапазона → check_reviewed_cli пойдёт по кэш-ветке

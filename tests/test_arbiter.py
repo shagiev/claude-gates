@@ -20,6 +20,8 @@ def led(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "resolve_baseline", lambda: "b" * 40)
     monkeypatch.setattr(g, "git_head", lambda: "h" * 40)
     monkeypatch.setattr(g, "_diff_text", lambda base, head: ("дифф", ""))
+    monkeypatch.setattr(g, "_mandatory_panel_families",
+                        lambda: (frozenset({"openai", "anthropic"}), ""))
     return g.load_findings_ledger("b" * 40)
 
 
@@ -461,6 +463,17 @@ def test_arbiter_refused_on_partial_or_malformed_panel(led, monkeypatch):
     _save(led)
     got, why = g.arbiter_certification()
     assert got is None and "искажена" in why
+
+
+def test_arbiter_refused_when_portable_plan_is_unresolved(led, monkeypatch):
+    cert = g.reviewer_certification("claude", "fable", "arbiter", allow_candidate=True)
+    monkeypatch.setattr(g, "reviewer_certification", lambda *a, **k: cert)
+    _panel(led)
+    _save(led)
+    monkeypatch.setattr(g, "_mandatory_panel_families",
+                        lambda: (frozenset(), "registry broken"))
+    got, why = g.arbiter_certification()
+    assert got is None and "registry broken" in why
 
 
 def test_arbitration_does_not_reopen_a_closed_finding(led, monkeypatch):

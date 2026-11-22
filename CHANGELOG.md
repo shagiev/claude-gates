@@ -17,7 +17,9 @@ Pre-install digest/archive/tree отказ сохраняет artifact-код ч
 `pending_channels` для Claude/Codex запрещают complete/stable. `kimi web` stdout непрерывно читается
 после bootstrap, поэтому info-логи не заполняют pipe и не блокируют install/rollback API. Server
 запускается с OS-home как HOME/cwd и минимальным environment; relocated `KIMI_CODE_HOME` отклоняется.
-Полный regression: 1412 passed, 1 skipped. Дизайн:
+Panel evidence и arbiter получают обязательные семейства из актуального portable resolver: Codex+Cursor
+и Codex+Claude fallback используют одну политику без устаревшего hardcoded списка; plan без ровно двух
+distinct blocking-семейств отклоняется. Полный regression: 1417 passed, 1 skipped. Дизайн:
 `docs/2026-11-10-github-release-deploy-design.md`.
 
 Добавлена явная `make clean-pycache` только для regenerable cache в дереве Gates и его managed/cache

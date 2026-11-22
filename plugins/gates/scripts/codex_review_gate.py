@@ -1271,9 +1271,17 @@ LAST_DEPLOYED = (REPO_ROOT / ".claude" / ".last-deployed-sha") if REPO_ROOT else
 LAST_REVIEWED = (REPO_ROOT / ".claude" / ".last-reviewed-sha") if REPO_ROOT else None   # SHA, одобренный check-reviewed
 
 
-#: Семейства обязательной blocking-пары (§3 дизайна панели): Codex/openai + Claude/anthropic.
-#: Baseline ревью двигается, только когда обе семьи реально отработали по этому head.
-MANDATORY_PANEL_FAMILIES = ("openai", "anthropic")
+def _mandatory_panel_families() -> "tuple[frozenset, str]":
+    """Обязательные семейства выбранной certified base pair, без второго hardcoded списка."""
+    plan, why = resolve_portable_review_plan("portable")
+    if plan is None:
+        return frozenset(), why
+    families = frozenset(cert.family for cert in plan if "blocking" in cert.roles)
+    if not families:
+        return frozenset(), "certified portable plan не содержит blocking-ревьюеров"
+    if len(families) != 2:
+        return frozenset(), "certified portable plan обязан содержать ровно два blocking-семейства"
+    return families, ""
 
 #: baseline ревью, принадлежащий ГЕЙТУ, — вне рабочего дерева (см. `_gate_state_dir`).
 GATE_BASELINE = (_gate_state_dir() / "review-baseline") if REPO_ROOT else None
@@ -1334,7 +1342,10 @@ def _panel_evidence_ok(head_sha: str, baseline: "str | None" = None,
                 if isinstance(r, dict) and r.get("role") == "blocking"
                 and r.get("status") == "ok" and r.get("certification_id")
                 and r.get("actual_models")}
-    missing = set(MANDATORY_PANEL_FAMILIES) - families
+    mandatory, why = _mandatory_panel_families()
+    if not mandatory:
+        return (False, f"не определить обязательную certified blocking-пару: {why}")
+    missing = mandatory - families
     if missing:
         return (False, f"в evidence нет успешного blocking-ревьюера семейств: "
                        f"{', '.join(sorted(missing))}")
@@ -2976,7 +2987,10 @@ def arbiter_certification() -> "tuple[ReviewerCertification | None, str]":
                 cert.actual_models):
             return (None, f"арбитр совпадает с членом панели ({cert.provider}/"
                           f"{','.join(cert.actual_models)}) — модель не арбитрирует саму себя")
-    missing = set(MANDATORY_PANEL_FAMILIES) - families_ok
+    mandatory, why = _mandatory_panel_families()
+    if not mandatory:
+        return (None, f"не определить обязательную certified blocking-пару: {why}")
+    missing = mandatory - families_ok
     if missing:
         return (None, "панель отработала не полностью (нет успешных семейств: "
                       f"{', '.join(sorted(missing))}) — арбитрировать нечего")
