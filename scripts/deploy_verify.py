@@ -905,13 +905,14 @@ def _valid_session_id(value) -> bool:
 
 def cmd_sessions(arg):
     sessions = []
+    pending_channels = []
     enumeration = "known"
     for channel in (value for value in arg.split(",") if value):
         if channel not in CHANNELS:
             enumeration = "unknown"
             continue
         if channel != "kimi":
-            enumeration = "unknown"
+            pending_channels.append(channel)
             continue
         try:
             payload = _kimi_call("GET", "/api/v1/sessions")
@@ -927,7 +928,10 @@ def cmd_sessions(arg):
             return {"enumeration": "unknown", "sessions": [], "error": str(exc)}
     if not sessions:
         enumeration = "unknown"
-    return {"enumeration": enumeration, "sessions": sessions}
+    report = {"enumeration": enumeration, "sessions": sessions}
+    if pending_channels:
+        report["pending_channels"] = pending_channels
+    return report
 
 
 def cmd_activate(arg):

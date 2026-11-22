@@ -527,7 +527,9 @@ def activation_status(inventory: dict, observations: dict, expected_version=None
         for proof in observed.get("sessions", []):
             if isinstance(proof, dict) and proof.get("id"):
                 proofs[(host, proof["id"])] = proof
-    pending = []
+    pending = [f"enumeration:{host}/{channel}"
+               for host, report in inventory.get("hosts", {}).items()
+               for channel in report.get("pending_channels", [])]
     for session in inventory["sessions"]:
         proof = proofs.get((session["host"], session["id"]), {})
         version_ok = bool(proof.get("version")) and (

@@ -13,7 +13,9 @@ ZIP получает commit `--mtime`, startup Kimi — non-blocking timeout. Li
 фактические OpenAPI/plugin/session contracts и same-session reload route. Тесты изолированы от
 настоящих GitHub/Kimi/fleet мутаций; review evidence и baseline тоже изолированы от тестов.
 Pre-install digest/archive/tree отказ сохраняет artifact-код через host update: release уходит в draft,
-а transport-ошибка оставляет prerelease. Полный regression: 1405 passed, 1 skipped. Дизайн:
+а transport-ошибка оставляет prerelease. Mixed session inventory сохраняет Kimi reload, но
+`pending_channels` для Claude/Codex запрещают complete/stable. Полный regression: 1407 passed,
+1 skipped. Дизайн:
 `docs/2026-11-10-github-release-deploy-design.md`.
 
 Добавлена явная `make clean-pycache` только для regenerable cache в дереве Gates и его managed/cache

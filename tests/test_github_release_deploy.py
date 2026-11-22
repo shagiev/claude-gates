@@ -809,6 +809,28 @@ def test_r40_live_session_items_envelope_is_enumerated(monkeypatch):
         {"channel": "kimi", "id": "session_live", "kind": "unknown"}]}
 
 
+def test_r50_kimi_inventory_survives_unsupported_channels(monkeypatch):
+    monkeypatch.setattr(dv, "_kimi_call", lambda *args: {
+        "items": [{"id": "kimi-live", "kind": "interactive"}], "has_more": False})
+    report = dv.cmd_sessions("claude,codex,kimi")
+    assert report == {"enumeration": "known", "pending_channels": ["claude", "codex"],
+                      "sessions": [{"channel": "kimi", "id": "kimi-live", "kind": "interactive"}]}
+
+
+def test_r50_unsupported_channels_block_complete_despite_kimi_proof(monkeypatch):
+    inventory = {"enumeration": "known", "hosts": {"h": {
+        "enumeration": "known", "pending_channels": ["claude", "codex"]}}, "sessions": [
+            {"host": "h", "channel": "kimi", "id": "kimi-live"}]}
+    calls = []
+    monkeypatch.setattr(dg, "agent", lambda host, command, arg: calls.append(
+        (host, command, json.loads(arg))) or {"sessions": [
+            {"id": "kimi-live", "version": "0.12.0", "smoke": "passed"}]})
+    report = dg.activation(inventory, [{"id": "h"}], expected_version="0.12.0")
+    assert calls == [("h", "activate", {"sessions": inventory["sessions"]})]
+    assert not report["complete"]
+    assert report["pending"] == ["enumeration:h/claude", "enumeration:h/codex"]
+
+
 def test_r16_codex_local_or_unknown_marketplace_is_rejected(monkeypatch, tmp_path):
     path = tmp_path / "codex" / "gates"
     (path / ".codex-plugin").mkdir(parents=True)
