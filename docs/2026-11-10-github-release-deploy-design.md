@@ -296,6 +296,7 @@ same-session version/behaviour proof; сам факт возврата CLI и п
 | R49 | Kimi update отклоняет digest/archive/tree до API install | Сохраняются `zip-sha256`/`source-archive`/`tree`; driver возбуждает `DeployAbort(artifact=True)`, rollback + draft. Download/API `kimi-install` остаётся transport/prerelease |
 | R50 | Host объявляет claude,codex,kimi; Kimi enumeration успешен | Kimi ids сохраняются и reload выполняется; `pending_channels` для неподдерживаемых enumeration/proof каналов запрещает complete/stable и даёт exit 4. Игнорировать их нельзя |
 | R51 | `kimi web` пишет info-логи после token/base до health и во время install/remove/rollback | Daemon drain запускается ДО health-poll и читает outer pipe весь lifetime, отбрасывая байты без RAM/JSON stdout; EOF/terminate завершает thread, silent/partial timeout и lifeline-cleanup сохраняются |
+| R52 | Caller задаёт `KIMI_CODE_HOME`/другой env либо live plugin envelope не содержит root | Любой установленный `KIMI_CODE_HOME` = отказ до Popen/API. Server получает getpwuid HOME/cwd и минимальный env без KIMI_*/TMPDIR/secrets. Присутствующий API root обязан совпасть; отсутствующий root — live 2.4.1 contract, допустим только после закрытия env ambiguity |
 
 R51 отвергает отключение info-логов и forwarding в stdout агента: первое скрывает диагностику и не
 гарантирует отсутствие stdout, второе ломает машиночитаемый JSON. Pipe нельзя оставлять без reader

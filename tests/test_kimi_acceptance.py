@@ -740,6 +740,42 @@ while True:
         assert not drain.is_alive()
 
 
+def test_r52_relocated_kimi_home_is_rejected_before_spawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "attacker-kimi"))
+    monkeypatch.setattr(ka.subprocess, "Popen", lambda *args, **kwargs:
+                        pytest.fail("server запущен при relocated KIMI_CODE_HOME"))
+    with pytest.raises(RuntimeError, match="KIMI_CODE_HOME"):
+        ka._start_server(tmp_path)
+
+
+def test_r52_server_spawn_uses_os_home_and_sterile_environment(tmp_path, monkeypatch):
+    class SpawnStop(Exception):
+        pass
+
+    home = tmp_path / "os-home"
+    home.mkdir()
+    captured = {}
+    monkeypatch.setattr(ka.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    monkeypatch.setenv("HOME", str(tmp_path / "attacker-home"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "attacker-tmp"))
+    monkeypatch.setenv("KIMI_DATA_DIR", str(tmp_path / "attacker-data"))
+    monkeypatch.setenv("GATES_TEST_SECRET", "not-for-child")
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
+
+    def spawn(*args, **kwargs):
+        captured.update(kwargs)
+        raise SpawnStop
+
+    monkeypatch.setattr(ka.subprocess, "Popen", spawn)
+    with pytest.raises(SpawnStop):
+        ka._start_server(tmp_path / "caller")
+    assert captured["cwd"] == str(home)
+    env = captured["env"]
+    assert env["HOME"] == str(home)
+    assert env["PATH"] == "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    assert not {"KIMI_CODE_HOME", "KIMI_DATA_DIR", "TMPDIR", "GATES_TEST_SECRET"} & env.keys()
+
+
 def test_server_without_startup_output_honours_timeout(tmp_path, monkeypatch):
     class SilentProcess:
         def __init__(self):

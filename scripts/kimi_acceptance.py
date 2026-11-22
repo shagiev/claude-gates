@@ -618,10 +618,17 @@ finally:
 
 
 def _start_server(root: Path, port=58690):
+    if "KIMI_CODE_HOME" in os.environ:
+        raise RuntimeError("KIMI_CODE_HOME установлен: relocated Kimi home запрещён для deploy")
+    server_home = pwd.getpwuid(os.getuid()).pw_dir
+    env = {key: os.environ[key] for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ")
+           if key in os.environ}
+    env.update({"HOME": server_home, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1"})
     lifeline, writer = os.pipe()
     proc = subprocess.Popen(["/usr/bin/python3", "-I", "-B", "-c", _SUPERVISOR, str(lifeline),
                              _kimi_bin(), "web", "--no-open", "--log-level", "info",
-                             "--port", str(port)], cwd=root,
+                             "--port", str(port)], cwd=server_home, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             pass_fds=(lifeline,))
     os.close(lifeline)
