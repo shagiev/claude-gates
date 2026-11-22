@@ -19,7 +19,9 @@ Pre-install digest/archive/tree отказ сохраняет artifact-код ч
 запускается с OS-home как HOME/cwd и минимальным environment; relocated `KIMI_CODE_HOME` отклоняется.
 Panel evidence и arbiter получают обязательные семейства из актуального portable resolver: Codex+Cursor
 и Codex+Claude fallback используют одну политику без устаревшего hardcoded списка; plan без ровно двух
-distinct blocking-семейств отклоняется. Полный regression: 1417 passed, 1 skipped. Дизайн:
+distinct blocking-семейств отклоняется. Artifact parser принимает цифры в `GATES_ARTIFACT_SHA256`,
+поэтому trusted `verify-deployable → build_artifact` доходит до decision/digest проверок.
+Полный regression: 1418 passed, 1 skipped. Дизайн:
 `docs/2026-11-10-github-release-deploy-design.md`.
 
 Добавлена явная `make clean-pycache` только для regenerable cache в дереве Gates и его managed/cache

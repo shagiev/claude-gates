@@ -322,7 +322,7 @@ def build_artifact(root: Path) -> "tuple[Path, str, str]":
     result = _run([".githooks/gates-run", "codex_review_gate.py", "verify-deployable"], root)
     if result.returncode:
         raise RuntimeError(result.stderr[-1000:])
-    values = dict(re.findall(r"^(GATES_[A-Z_]+)=(.+)$", result.stdout, re.MULTILINE))
+    values = dict(re.findall(r"^(GATES_[A-Z0-9_]+)=(.+)$", result.stdout, re.MULTILINE))
     artifact = Path(values["GATES_ARTIFACT"])
     head = values["GATES_ARTIFACT_HEAD"]
     digest = values["GATES_ARTIFACT_SHA256"]

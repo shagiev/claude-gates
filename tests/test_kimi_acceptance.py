@@ -242,6 +242,27 @@ def test_external_managed_change_after_api_restore_is_a_conflict(tmp_path):
     assert journal_path.is_file()
 
 
+def test_build_artifact_parses_sha256_key_with_digits(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.tar"
+    artifact.write_bytes(b"artifact")
+    head = "h" * 40
+    digest = "d" * 64
+    calls = []
+
+    def run(argv, _cwd, **_kwargs):
+        calls.append(argv[2])
+        if argv[2] == "verify-deployable":
+            return subprocess.CompletedProcess(argv, 0, (
+                f"GATES_ARTIFACT={artifact}\n"
+                f"GATES_ARTIFACT_SHA256={digest}\n"
+                f"GATES_ARTIFACT_HEAD={head}\n"), "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(ka, "_run", run)
+    assert ka.build_artifact(ROOT) == (artifact, head, digest)
+    assert calls == ["verify-deployable", "check-decision", "check-artifact"]
+
+
 def test_live_restore_conflict_preserves_external_change_and_journal(tmp_path, monkeypatch):
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     home = tmp_path / "os-home/.kimi-code"
