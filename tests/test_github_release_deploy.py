@@ -20,6 +20,8 @@ from test_deploy import harness, install  # noqa: E402,F401
 
 SHA = "a" * 40
 OLD_SHA = "b" * 40
+_REAL_UPDATE = dg.update
+_REAL_VERIFY = dg.verify
 REAL_SHA = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                           capture_output=True, text=True, check=True).stdout.strip()
 REAL_VERSION = json.loads(subprocess.run(
@@ -550,13 +552,14 @@ def test_r48_update_checks_digest_and_tree_before_api_install(tmp_path, monkeypa
     monkeypatch.setattr(dv, "_kimi_call", lambda *args:
                         events.append(("api", args[1])) or {})
     out = dv.cmd_update(spec)
-    assert out["ok"] and events[0] == ("extract", "d" * 64)
+    assert out["ok"] and out["mutated"] is True
+    assert events[0] == ("extract", "d" * 64)
     assert ("api", "/api/v1/plugins") in events
 
     events.clear()
     monkeypatch.setattr(dv, "check_tree", lambda *args: ["wrong tree"])
     out = dv.cmd_update(spec)
-    assert not out["ok"]
+    assert not out["ok"] and out["mutated"] is False
     assert events == [("extract", "d" * 64)]
     assert out["problems"][0]["code"] == "tree"
 
@@ -624,22 +627,199 @@ def test_r49_update_preserves_artifact_vs_transport_codes(error, code, monkeypat
         "version": "9.9.9", "source": gr.release_identity("9.9.9")["url"],
         "tree": {"scripts/gate.py": "100755 " + "a" * 40}, "zip_sha256": "d" * 64}))
     assert not out["ok"]
+    assert out["mutated"] is False
     assert [problem["code"] for problem in out["problems"]] == [code]
 
 
+def test_kimi_update_reports_possible_mutation_once_install_started(tmp_path, monkeypatch):
+    monkeypatch.setattr(dv, "_extract_release", lambda *args: tmp_path)
+    monkeypatch.setattr(dv, "check_tree", lambda *args: [])
+    monkeypatch.setattr(dv, "_install_kimi_release", lambda *args, **kwargs:
+                        (_ for _ in ()).throw(RuntimeError("remove/install failed")))
+    out = dv.cmd_update(json.dumps({
+        "version": "9.9.9", "source": gr.release_identity("9.9.9")["url"],
+        "tree": {"scripts/gate.py": "100755 " + "a" * 40}, "zip_sha256": "d" * 64}))
+    assert not out["ok"] and out["mutated"] is True
+    assert out["problems"][0]["code"] == "kimi-install"
+
+
 def test_r49_artifact_failure_during_update_raises_artifact_abort(monkeypatch):
-    monkeypatch.setattr(dg, "agent", lambda *args: {"ok": False, "problems": [
+    monkeypatch.setattr(dg, "agent", lambda *args: {"ok": False, "mutated": False, "problems": [
         {"channel": "kimi", "code": "zip-sha256", "text": "wrong digest"}]})
     with pytest.raises(dg.DeployAbort) as raised:
         dg.update("canary", ["kimi"], versions={"kimi": "9.9.9"},
                   tree={"scripts/gate.py": "100755 " + "a" * 40}, zip_sha256="d" * 64)
     assert raised.value.artifact is True
+    assert raised.value.mutated is False
+
+
+@pytest.mark.parametrize("code,artifact", [("zip-sha256", True), ("kimi-install", False)])
+def test_preinstall_kimi_failure_does_not_rollback_unchanged_host(harness, monkeypatch,
+                                                                  code, artifact):
+    real_update = _REAL_UPDATE
+    rolled, drafts = [], []
+    harness.setattr(dg, "read_inventory", lambda: [{"id": "canary", "channels": ["kimi"]}])
+    harness.setattr(dg, "update", real_update)
+    harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
+    harness.setattr(dg.gr, "mark_release_draft", lambda artifact: drafts.append(artifact))
+    monkeypatch.setattr(dg, "agent", lambda *args: {
+        "ok": False, "mutated": False,
+        "problems": [{"channel": "kimi", "code": code, "text": "pre-install rejected"}]})
+
+    assert dg.main([]) == 2
+    assert rolled == []
+    assert len(drafts) == int(artifact)
+
+
+def test_preinstall_failure_on_second_host_rolls_back_only_canary(harness, monkeypatch):
+    real_update = _REAL_UPDATE
+    rolled = []
+    harness.setattr(dg, "read_inventory", lambda: [
+        {"id": "canary", "channels": ["kimi"]}, {"id": "vps", "channels": ["kimi"]}])
+    harness.setattr(dg, "update", real_update)
+    harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
+
+    def response(host, *args):
+        return {"ok": host == "canary", "mutated": host == "canary", "problems": (
+            [] if host == "canary" else [
+                {"channel": "kimi", "code": "zip-sha256", "text": "wrong digest"}])}
+
+    monkeypatch.setattr(dg, "agent", response)
+    assert dg.main([]) == 2
+    assert rolled == ["canary"]
+
+
+@pytest.mark.parametrize("report", [
+    {"ok": False, "mutated": True,
+     "problems": [{"channel": "kimi", "code": "kimi-install", "text": "remove failed"}]},
+    {"ok": False,
+     "problems": [{"channel": "kimi", "code": "kimi-install", "text": "legacy agent"}]},
+])
+def test_possible_or_unknown_kimi_mutation_still_rolls_back(harness, monkeypatch, report):
+    real_update = _REAL_UPDATE
+    rolled = []
+    harness.setattr(dg, "read_inventory", lambda: [{"id": "canary", "channels": ["kimi"]}])
+    harness.setattr(dg, "update", real_update)
+    harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
+    monkeypatch.setattr(dg, "agent", lambda *args: report)
+
+    assert dg.main([]) == 2
+    assert rolled == ["canary"]
+
+
+@pytest.mark.parametrize("report", [
+    None,
+    {"ok": None, "mutated": True, "problems": []},
+    {"ok": False, "mutated": True, "problems": None},
+    {"ok": False, "mutated": True, "problems": []},
+    {"ok": False, "mutated": True, "problems": [{"code": "kimi-install"}]},
+    {"ok": False, "mutated": True, "problems": [{"text": "missing code"}]},
+])
+def test_malformed_agent_response_rolls_back_after_prior_mutation(harness, monkeypatch,
+                                                                  capsys, report):
+    real_update = _REAL_UPDATE
+    rolled = []
+    harness.setattr(dg, "read_inventory", lambda: [
+        {"id": "canary", "channels": ["claude", "kimi"]}])
+    harness.setattr(dg, "update", real_update)
+    harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
+    monkeypatch.setattr(dg, "on_host", lambda *args: subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(dg, "agent", lambda *args: report)
+
+    assert dg.main([]) == 2
+    assert rolled == ["canary"]
+    assert "схема" in capsys.readouterr().err
+
+
+def test_successful_kimi_mutation_survives_a_later_preinstall_failure(monkeypatch):
+    responses = iter([
+        {"ok": True, "mutated": True, "problems": []},
+        {"ok": False, "mutated": False,
+         "problems": [{"channel": "kimi", "code": "tree", "text": "wrong tree"}]},
+    ])
+    monkeypatch.setattr(dg, "agent", lambda *args: next(responses))
+
+    with pytest.raises(dg.DeployAbort) as raised:
+        dg.update("canary", ["kimi", "kimi"], versions={"kimi": "9.9.9"},
+                  tree={"scripts/gate.py": "100755 " + "a" * 40}, zip_sha256="d" * 64)
+    assert raised.value.mutated is True
+
+
+def test_kimi_preinstall_failure_does_not_hide_prior_channel_mutation(harness, monkeypatch):
+    real_update = _REAL_UPDATE
+    rolled = []
+    harness.setattr(dg, "read_inventory", lambda: [
+        {"id": "canary", "channels": ["claude", "kimi"]}])
+    harness.setattr(dg, "update", real_update)
+    harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
+    monkeypatch.setattr(dg, "on_host", lambda *args: subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(dg, "agent", lambda *args: {
+        "ok": False, "mutated": False,
+        "problems": [{"channel": "kimi", "code": "tree", "text": "wrong tree"}]})
+
+    assert dg.main([]) == 2
+    assert rolled == ["canary"]
+
+
+@pytest.mark.parametrize("report", [
+    None,
+    {"ok": None, "problems": [], "channels": {}},
+    {"ok": False, "problems": None, "channels": {}},
+    {"ok": False, "problems": [], "channels": {}},
+    {"ok": False, "problems": [{"channel": "kimi", "code": "tree"}], "channels": {}},
+    {"ok": True, "problems": [], "channels": None},
+])
+def test_malformed_verify_rolls_back_current_and_previous_hosts(harness, monkeypatch,
+                                                                capsys, report):
+    rolled = []
+    harness.setattr(dg, "read_inventory", lambda: [
+        {"id": "canary", "channels": ["kimi"]}, {"id": "vps", "channels": ["kimi"]}])
+    harness.setattr(dg, "verify", _REAL_VERIFY)
+    harness.setattr(dg, "rollback", lambda h, s: rolled.append(h) or [])
+
+    def response(host, *args):
+        if host == "canary":
+            return {"ok": True, "problems": [], "channels": {}}
+        return report
+
+    monkeypatch.setattr(dg, "agent", response)
+    assert dg.main([]) == 2
+    assert rolled == ["canary", "vps"]
+    assert "схема" in capsys.readouterr().err
+
+
+def _kimi_snapshot():
+    return {"channels": {"kimi": {
+        "state": "installed", "version": "1.0.0", "source": gr.release_identity("1.0.0")["url"],
+        "tree": {"x": "100644 " + "0" * 40}, "enabled": True, "zip_sha256": "d" * 64}}}
+
+
+@pytest.mark.parametrize("report", [
+    None,
+    {"ok": True, "problems": None},
+    {"ok": False, "problems": [{"text": "missing code"}]},
+])
+def test_malformed_restore_is_an_explicit_rollback_failure(monkeypatch, report):
+    monkeypatch.setattr(dg, "agent", lambda *args: report)
+    problems = dg.rollback("h", _kimi_snapshot())
+    assert any("схема" in problem for problem in problems)
+
+
+def test_malformed_rollback_verification_is_not_success(monkeypatch):
+    def response(_host, command, _arg):
+        if command == "restore":
+            return {"ok": True, "problems": []}
+        return None
+
+    monkeypatch.setattr(dg, "agent", response)
+    problems = dg.rollback("h", _kimi_snapshot())
+    assert any("схема" in problem for problem in problems)
 
 
 def test_r22_rollback_requires_tree_enabled_and_smoke(monkeypatch):
     specs = []
     monkeypatch.setattr(dg, "agent", lambda h, cmd, arg:
-                        specs.append((cmd, json.loads(arg))) or {"ok": True, "problems": []})
+                        specs.append((cmd, json.loads(arg))) or {"ok": True, "problems": [], "channels": {}})
     snap = {"channels": {"kimi": {
         "state": "installed", "version": "1.0.0", "source": gr.release_identity("1.0.0")["url"],
         "tree": {"x": "100644 " + "0" * 40}, "enabled": False, "zip_sha256": "d" * 64}}}

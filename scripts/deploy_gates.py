@@ -59,9 +59,10 @@ class DeployAbort(Exception):
     хост на старой, а `stable` от прошлого деплоя продолжал сертифицировать флот зелёным —
     ровно тот version skew, ради устранения которого всё делается."""
 
-    def __init__(self, message, *, artifact=False):
+    def __init__(self, message, *, artifact=False, mutated=True):
         super().__init__(message)
         self.artifact = artifact
+        self.mutated = mutated
 
 
 _ARTIFACT_PROBLEM_CODES = frozenset({
@@ -135,13 +136,27 @@ def agent(host: str, subcmd: str, arg: str) -> dict:
         fail("агент не загружен из коммита — вызов до `load_agent`")
     r = on_host(host, ["python3", "-B", "-", subcmd, arg], stdin=_AGENT_SRC)
     try:
-        return json.loads(r.stdout.strip().splitlines()[-1])
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        if not isinstance(out, dict):
+            return {"error": f"{host}/{subcmd}: схема ответа agent не dict"}
+        return out
     except (ValueError, IndexError):
         # ХВОСТ, а не голова: агент едет через `python3 -`, и первые 200 символов — это шапка
         # трейсбека с кадрами `File "<stdin>"`, тогда как тип и текст исключения (единственное
         # полезное) стоят в конце.
         tail = g.redact_secrets(g.strip_ansi((r.stderr or r.stdout or "").strip()))[-400:]
         return {"error": f"агент не ответил (rc={r.returncode}): …{tail}"}
+
+
+def _problem_list_ok(problems, fields) -> bool:
+    return isinstance(problems, list) and all(
+        isinstance(problem, dict)
+        and all(isinstance(problem.get(field), str) and problem[field] for field in fields)
+        for problem in problems)
+
+
+def _schema_error(host: str, subcmd: str) -> str:
+    return f"{host}/{subcmd}: схема ответа agent невалидна — состояние операции неизвестно"
 
 
 def read_inventory() -> "list[dict]":
@@ -170,6 +185,8 @@ def read_inventory() -> "list[dict]":
             # Аллоулист формы, а не default-fallthrough: с неявным `else` опечатка в канале
             # трактовалась бы как codex и была бы МУТИРОВАНА до первой же проверки.
             fail(f"{h['id']}: неизвестные каналы {unknown} (известны: {sorted(CHANNELS)})")
+        if len(set(chans)) != len(chans):
+            fail(f"{h['id']}: дубли каналов в инвентаре запрещены: {chans}")
     ids = [h["id"] for h in hosts]
     if len(set(ids)) != len(ids):
         fail(f"дубли id в инвентаре: {sorted({i for i in ids if ids.count(i) > 1})}")
@@ -382,6 +399,7 @@ def check_rollback_target(host: str, snap: dict) -> "str | None":
 
 
 def update(host: str, channels: "list[str]", versions=None, tree=None, zip_sha256=None) -> "str | None":
+    host_mutated = False
     for ch in channels:
         if ch == "kimi":
             if not versions or not versions.get("kimi") or not tree or not zip_sha256:
@@ -389,18 +407,27 @@ def update(host: str, channels: "list[str]", versions=None, tree=None, zip_sha25
             out = agent(host, "update", json.dumps({
                 "version": versions["kimi"], "tree": tree, "zip_sha256": zip_sha256,
                 "source": gr.release_identity(versions["kimi"])["url"]}))
+            if not isinstance(out, dict):
+                raise DeployAbort(_schema_error(host, ch), mutated=True)
             if "error" in out:
                 return f"{host}/{ch}: {out['error']}"
-            if not out.get("ok"):
-                problems = out.get("problems", [])
-                message = f"{host}/{ch}: " + "; ".join(
-                    problem["text"] for problem in problems)
-                if any(problem.get("code") in _ARTIFACT_PROBLEM_CODES for problem in problems):
-                    raise DeployAbort(message, artifact=True)
-                return message
-            continue
+            problems = out.get("problems")
+            schema_ok = (isinstance(out.get("ok"), bool)
+                         and _problem_list_ok(problems, ("code", "text")))
+            if not schema_ok or (out["ok"] is False and not problems):
+                raise DeployAbort(_schema_error(host, ch), mutated=True)
+            if out["ok"]:
+                host_mutated = True
+                continue
+            message = f"{host}/{ch}: " + "; ".join(
+                problem["text"] for problem in problems)
+            artifact = any(problem.get("code") in _ARTIFACT_PROBLEM_CODES
+                           for problem in problems)
+            mutated = host_mutated or (out.get("mutated") is not False)
+            raise DeployAbort(message, artifact=artifact, mutated=mutated)
         spec = CHANNELS[ch]
         for args in spec["update"]:
+            host_mutated = True
             r = on_host(host, [spec["cli"], *args])
             if r.returncode != 0:
                 return (f"{host}/{ch}: {' '.join(args)} → rc={r.returncode} " +
@@ -423,9 +450,18 @@ def verify(host: str, channels, versions, sha, tree, zip_sha256=None) -> dict:
     меняет исполняемый код."""
     rep = agent(host, "verify", _spec(channels, versions, sha, tree,
                                       ["version", "tree", "smoke"], zip_sha256))
-    if "error" in rep:
+    if isinstance(rep, dict) and "error" in rep:
         return {"ok": False, "problems": [{"code": "agent", "channel": "-",
-                                           "text": rep["error"]}]}
+                                           "text": rep["error"]}], "channels": {}}
+    problems = rep.get("problems") if isinstance(rep, dict) else None
+    schema_ok = (
+        isinstance(rep, dict) and isinstance(rep.get("ok"), bool)
+        and isinstance(rep.get("channels"), dict)
+        and _problem_list_ok(problems, ("channel", "code", "text")))
+    if not schema_ok or (rep["ok"] is False and not problems):
+        return {"ok": False, "problems": [{"code": "agent-schema", "channel": "-",
+                                           "text": _schema_error(host, "verify")}],
+                "channels": {}}
     return rep
 
 
@@ -445,10 +481,16 @@ def rollback(host: str, snap: dict) -> "list[str]":
         # вызывающий печатал «откат проверен», оставив канал, которого до деплоя не было.
         out = agent(host, "restore", json.dumps({"channel": ch, "snapshot": info},
                                                 ensure_ascii=False))
-        if "error" in out:
+        if isinstance(out, dict) and "error" in out:
             problems.append(f"{host}/{ch}: {out['error']}")
-        elif not out.get("ok"):
-            problems.extend(f"{host}/{ch}: {p['text']}" for p in out.get("problems", []))
+            continue
+        restore_problems = out.get("problems") if isinstance(out, dict) else None
+        schema_ok = (isinstance(out, dict) and isinstance(out.get("ok"), bool)
+                     and _problem_list_ok(restore_problems, ("code", "text")))
+        if not schema_ok or (out["ok"] is False and not restore_problems):
+            problems.append(_schema_error(host, f"restore:{ch}"))
+        elif not out["ok"]:
+            problems.extend(f"{host}/{ch}: {p['text']}" for p in restore_problems)
     if problems:
         return problems
     # Откат тоже ДОКАЗЫВАЕТСЯ, и теми же структурными кодами: прежняя версия фильтровала
@@ -465,11 +507,18 @@ def rollback(host: str, snap: dict) -> "list[str]":
 
     def confirm(spec):
         rep = agent(host, "verify", json.dumps(spec, ensure_ascii=False))
-        if "error" in rep:
+        if isinstance(rep, dict) and "error" in rep:
             problems.append(f"{host}: откат не подтверждён — {rep['error']}")
-        elif not rep.get("ok"):
+            return
+        verify_problems = rep.get("problems") if isinstance(rep, dict) else None
+        schema_ok = (isinstance(rep, dict) and isinstance(rep.get("ok"), bool)
+                     and isinstance(rep.get("channels"), dict)
+                     and _problem_list_ok(verify_problems, ("channel", "code", "text")))
+        if not schema_ok or (rep["ok"] is False and not verify_problems):
+            problems.append(_schema_error(host, "rollback verify"))
+        elif not rep["ok"]:
             problems.extend(f"{host}/{p['channel']}/{p['code']}: {p['text']}"
-                            for p in rep.get("problems", []))
+                            for p in verify_problems)
 
     for ch, info in chans.items():
         if ch != "kimi" or (info or {}).get("state") != "installed":
@@ -673,10 +722,16 @@ def main(argv=None) -> int:
             for i, (h, snap) in enumerate(prepared):
                 tag = "канарейка" if i == 0 else f"хост {i + 1}/{len(hosts)}"
                 print(f"[deploy] {tag}: {h['id']} ({', '.join(h['channels'])})")
-                cohort.append((h, snap))
-                why = update(h["id"], h["channels"], ver, tree, artifact["zip_sha256"])
+                try:
+                    why = update(h["id"], h["channels"], ver, tree, artifact["zip_sha256"])
+                except DeployAbort as abort:
+                    if abort.mutated:
+                        cohort.append((h, snap))
+                    raise
                 if why:
+                    cohort.append((h, snap))
                     raise DeployAbort(why)
+                cohort.append((h, snap))
                 rep = verify(h["id"], h["channels"], ver, sha, tree, artifact["zip_sha256"])
                 if not rep["ok"]:
                     raise DeployAbort("; ".join(f"{h['id']}/{p['channel']}/{p['code']}: "
@@ -692,15 +747,14 @@ def main(argv=None) -> int:
                          if drift else ""))
         except DeployAbort as abort:
             print(f"[deploy] ✗ {abort}", file=sys.stderr)
-            if not cohort:
-                print("[deploy] мутаций не было — флот не тронут; release остаётся prerelease",
-                      file=sys.stderr)
-                return 2
             if abort.artifact:
                 try:
                     gr.mark_release_draft(artifact)
                 except gr.ReleaseError as exc:
                     print(f"[deploy] ⛔ release не переведён в draft: {exc}", file=sys.stderr)
+            if not cohort:
+                print("[deploy] мутаций не было — флот не тронут", file=sys.stderr)
+                return 2
             for prev_h, prev_snap in cohort:
                 errs = rollback(prev_h["id"], prev_snap)
                 if errs:

@@ -389,3 +389,45 @@ delivery-файлов и проверка resolver против реальног
 прежнее обещание до полной сертификации real-HOME trust chain. Для текущего fleet отсутствующий
 gate-owned bootstrap на VPS восстанавливается операционно из pinned template с безопасными режимами;
 общая модификация source/real-HOME verification требует отдельного дизайна.
+
+## 11. Rollback только после возможной мутации хоста
+
+Независимый commit review обнаружил, что хост добавляется в rollback cohort до `update`. Поэтому
+pre-install отказ Kimi (download/digest/archive/tree) приводит к API remove/install неизменённого
+работающего плагина; ошибка этого ненужного восстановления может оставить канал отсутствующим.
+
+**Выбранный минимальный вариант — явный mutation evidence, без второго live-state resolver.** Host
+`cmd_update` возвращает `mutated=false` только на путях, где `_install_kimi_release` ещё не вызван.
+Перед входом в него и при любом последующем отказе возвращается `mutated=true`. Driver считает хост
+мутированным при успешном update до verify, при ошибке любого Claude/Codex CLI, transport/agent error,
+а также при отсутствии или невалидном признаке от старого agent. Литеральное `false` от нового agent
+освобождает ТЕКУЩИЙ хост от rollback только если ни один предыдущий канал этого же `update` не мог
+мутировать. Успешный Kimi update также устанавливает host-level признак до следующего канала.
+Driver строго проверяет top-level dict, `ok`, непустой `problems` list и обязательные строки
+`code`/`text`; любая schema drift становится `DeployAbort(mutated=true)`, а не необработанным
+исключением мимо cohort rollback. Предыдущие хосты cohort не сбрасываются.
+
+Сценарии:
+
+- **M1. Только Kimi, отказ до install.** Текущий хост не rollback'ится; artifact release уходит в draft,
+  transport остаётся prerelease, API remove/install не вызывается.
+- **M2. Второй хост отказался до install.** Откатывается только ранее обновлённая канарейка.
+- **M3. Ошибка после входа в Kimi install.** Текущий хост обязательно rollback'ится, включая restore
+  в `absent`, потому что remove/install мог частично выполниться.
+- **M4. Предыдущий канал уже мог мутировать.** Это включает Claude/Codex CLI и успешный Kimi перед
+  повторным Kimi: даже последующий `mutated=false` не исключает хост из rollback.
+- **M5. Старый agent, missing/malformed flag, transport error.** Conservative rollback. Non-dict
+  response, невалидный `ok`, null/non-list/пустой `problems` и problem без `code`/`text` — та же
+  fail-closed ветка с `mutated=true`.
+- **M6. Update успешен, verify падает.** Хост добавлен в cohort до verify и rollback'ится как раньше.
+- **M7. Duplicate channel в inventory.** Запись отклоняется до любой мутации; накопление mutation
+  evidence в `update` остаётся вторым независимым защитным слоем.
+- **M8. Malformed verify после успешной мутации.** `verify` нормализует non-dict, невалидный
+  `ok`/`problems`/`channels` и problem без `channel`/`code`/`text` в отрицательный `agent-schema`
+  report. Main откатывает текущий и предыдущие хосты; исключение не уходит мимо cohort.
+- **M9. Malformed restore или rollback verify.** Rollback добавляет явную schema-ошибку, продолжает
+  остальные доступные действия и никогда не сообщает подтверждённый откат по невалидному ответу.
+
+Альтернатива «сравнить live state со snapshot» отклонена для этого fix: она создаёт второй resolver
+и риск ложного `unchanged` при неполном ответе API. Install-before-remove — отдельный дизайн Kimi API,
+а не необходимое условие устранения ненужного rollback pre-install отказов.

@@ -8,7 +8,12 @@
 Process-wide umask и argv не меняются. Режимы исходной установки и synthetic copy не нормализуются:
 group-writable rollback target по-прежнему отклоняется. Добавлены RED/regression-сценарии для
 symlink/hardlink/FIFO/owner и ошибок scaffold до запуска гейта.
-Полный regression: 1435 passed, 1 skipped; реальный VPS verify под umask `002` зелёный после
+
+Kimi update теперь возвращает явный mutation evidence, а deploy не выполняет API rollback хоста при
+доказанном pre-install отказе. Предыдущие каналы/хосты, transport error и старый agent без признака
+сохраняют conservative rollback; artifact-ошибка переводит release в draft даже при пустой cohort.
+Schema drift в update/verify/rollback становится fail-closed ошибкой, duplicate channels отклоняются.
+Полный regression: 1460 passed, 1 skipped; реальный VPS verify под umask `002` зелёный после
 операционного снятия group-write с существующей Codex-установки. Дизайн:
 `docs/2026-11-10-github-release-deploy-design.md`.
 

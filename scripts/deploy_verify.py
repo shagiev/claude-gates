@@ -724,24 +724,26 @@ def cmd_update(spec: str):
             or not isinstance(want.get("zip_sha256"), str) \
             or re.fullmatch(r"[0-9a-f]{64}", want["zip_sha256"], re.ASCII) is None:
         raise InstallError("Kimi update требует exact tree и publisher ZIP digest")
+    mutated = False
     try:
         with tempfile.TemporaryDirectory(prefix="gates-kimi-update-") as tmp:
             root = _extract_release(source, version, pathlib.Path(tmp) / "plugin",
                                     want["zip_sha256"])
             problems = check_tree(root, want["tree"])
         if problems:
-            return {"ok": False, "problems": [_problem("tree", "kimi", why)
-                                               for why in problems]}
+            return {"ok": False, "mutated": mutated,
+                    "problems": [_problem("tree", "kimi", why) for why in problems]}
+        mutated = True
         _install_kimi_release(source, enabled=True)
-        return {"ok": True, "problems": []}
+        return {"ok": True, "mutated": mutated, "problems": []}
     except ReleaseDigestError as exc:
-        return {"ok": False, "problems": [_problem(
+        return {"ok": False, "mutated": mutated, "problems": [_problem(
             "zip-sha256", "kimi", f"Kimi release rejected: {type(exc).__name__}: {exc}")]}
     except ReleaseArchiveError as exc:
-        return {"ok": False, "problems": [_problem(
+        return {"ok": False, "mutated": mutated, "problems": [_problem(
             "source-archive", "kimi", f"Kimi release rejected: {type(exc).__name__}: {exc}")]}
     except (OSError, ValueError, RuntimeError, ka.ApiSchemaError) as exc:
-        return {"ok": False, "problems": [_problem(
+        return {"ok": False, "mutated": mutated, "problems": [_problem(
             "kimi-install", "kimi", f"Kimi API install failed: {type(exc).__name__}: {exc}")]}
 
 

@@ -92,6 +92,14 @@ def test_unknown_channel_is_rejected_before_any_mutation(monkeypatch, tmp_path):
         dg.read_inventory()
 
 
+def test_duplicate_channel_is_rejected_before_any_mutation(monkeypatch, tmp_path):
+    monkeypatch.setattr(dg, "ROOT", tmp_path)
+    (tmp_path / "deploy-hosts.yaml").write_text(
+        "hosts:\n  - id: h1\n    channels: [kimi, kimi]\n")
+    with pytest.raises(SystemExit):
+        dg.read_inventory()
+
+
 def test_host_without_channels_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(dg, "ROOT", tmp_path)
     (tmp_path / "deploy-hosts.yaml").write_text("hosts:\n  - id: h1\n")
@@ -1031,7 +1039,7 @@ def test_rollback_restores_every_snapshotted_channel(monkeypatch):
             restored.append(spec["channel"])
             return {"ok": True, "problems": []}
         verified.append(sorted(spec["channels"]))
-        return {"ok": True, "problems": []}
+        return {"ok": True, "problems": [], "channels": {}}
 
     monkeypatch.setattr(dg, "agent", fake_agent)
     monkeypatch.setattr(dg, "expected_tree", lambda sha: {})
