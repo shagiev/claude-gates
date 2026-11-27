@@ -1270,7 +1270,7 @@ def _exercise_clean_pycache(tmp_path, makefile):
 
 
 def test_clean_pycache_is_limited_to_gates_roots(tmp_path):
-    """F10: настоящая команда удаляет три разрешённых корня, но не соседей или цель symlink.
+    """Настоящая команда удаляет три разрешённых корня, но не соседей или цель symlink.
     Страж `rm` сохраняет тест безвредным и при регрессии области очистки."""
     result, removed, preserved = _exercise_clean_pycache(tmp_path, ROOT / "Makefile")
     assert result.returncode == 0, result.stderr
