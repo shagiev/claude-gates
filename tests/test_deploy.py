@@ -8,6 +8,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -744,6 +745,180 @@ def test_smoke_proves_the_gate_actually_blocks(install):
     проверку проходит. Гейт обязан ЗАБЛОКИРОВАТЬ код-правку без ревью и ПРОПУСТИТЬ её после
     честной цепочки — и всё это через настоящий шим, которым ходят хуки."""
     assert dv.smoke_gate_blocks(install) is None
+
+
+def test_smoke_supports_group_umask_without_changing_process_umask(install, monkeypatch):
+    real_umask = os.umask
+    previous = real_umask(0o002)
+    try:
+        def forbidden_umask(_mode):
+            raise AssertionError("smoke не должен менять process-wide umask")
+
+        monkeypatch.setattr(dv.os, "umask", forbidden_umask)
+        assert dv.smoke_gate_blocks(install) is None
+    finally:
+        real_umask(previous)
+
+
+@pytest.mark.parametrize("rel,mode", [
+    ("scripts", 0o775),
+    ("scripts/codex_review_gate.py", 0o664),
+])
+def test_smoke_preserves_group_writable_install_modes(install, rel, mode):
+    target = install / rel
+    target.chmod(mode)
+    before = target.stat().st_mode & 0o777
+
+    assert dv.smoke_gate_blocks(install), "group-writable rollback target принят smoke"
+    assert target.stat().st_mode & 0o777 == before == mode
+
+
+def _gate_launch_spy(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(dv.subprocess, "run", fake_run)
+    return calls
+
+
+def test_run_gate_rejects_symlink_home_before_writing(install, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("keep")
+    (tmp_path / "home").symlink_to(outside, target_is_directory=True)
+    calls = _gate_launch_spy(monkeypatch)
+
+    with pytest.raises((OSError, RuntimeError)):
+        dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+
+    assert sentinel.read_text() == "keep"
+    assert list(outside.iterdir()) == [sentinel]
+    assert not calls
+
+
+@pytest.mark.parametrize("target_kind", ["registry", "resolver"])
+def test_run_gate_rejects_symlink_output_files(install, tmp_path, monkeypatch, target_kind):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    if target_kind == "registry":
+        target = home / ".claude/plugins/installed_plugins.json"
+    else:
+        target = home / ".local/lib/claude-gates/kimi_install.py"
+    target.parent.mkdir(parents=True)
+    sentinel = tmp_path / f"{target_kind}-sentinel"
+    sentinel.write_text("keep")
+    target.symlink_to(sentinel)
+    calls = _gate_launch_spy(monkeypatch)
+
+    with pytest.raises((OSError, RuntimeError)):
+        dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+
+    assert sentinel.read_text() == "keep"
+    assert not calls
+
+
+def _foreign_owner(info):
+    fields = list(info)
+    fields[stat.ST_UID] = info.st_uid + 1
+    return os.stat_result(fields)
+
+
+def test_run_gate_rejects_foreign_owned_home(install, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    home.mkdir(mode=0o755)
+    before = home.stat().st_mode & 0o777
+    calls = _gate_launch_spy(monkeypatch)
+    real_lstat = Path.lstat
+    monkeypatch.setattr(Path, "lstat", lambda path: _foreign_owner(real_lstat(path)))
+
+    with pytest.raises(RuntimeError, match="небезопасный каталог"):
+        dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+
+    assert home.stat().st_mode & 0o777 == before
+    assert not calls
+
+
+def test_run_gate_rejects_hardlink_before_truncating_sentinel(install, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = tmp_path / "home/.claude/plugins/installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    sentinel = tmp_path / "hardlink-sentinel"
+    sentinel.write_text("keep")
+    os.link(sentinel, registry)
+    calls = _gate_launch_spy(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="небезопасный файл"):
+        dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+
+    assert sentinel.read_text() == "keep"
+    assert registry.read_text() == "keep"
+    assert not calls
+
+
+def test_run_gate_rejects_foreign_owned_file_before_truncating(install, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = tmp_path / "home/.claude/plugins/installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("keep")
+    calls = _gate_launch_spy(monkeypatch)
+    real_fstat = os.fstat
+    monkeypatch.setattr(dv.os, "fstat", lambda fd: _foreign_owner(real_fstat(fd)))
+
+    with pytest.raises(RuntimeError, match="небезопасный файл"):
+        dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+
+    assert registry.read_text() == "keep"
+    assert not calls
+
+
+def test_run_gate_rejects_fifo_after_descriptor_check(install, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = tmp_path / "home/.claude/plugins/installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    os.mkfifo(registry)
+    reader = os.open(registry, os.O_RDONLY | os.O_NONBLOCK)
+    calls = _gate_launch_spy(monkeypatch)
+    try:
+        with pytest.raises(RuntimeError, match="небезопасный файл"):
+            dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+    finally:
+        os.close(reader)
+
+    assert stat.S_ISFIFO(registry.stat().st_mode)
+    assert not calls
+
+
+@pytest.mark.parametrize("operation", [
+    "mkdir", "lstat", "chmod", "open", "fstat", "fchmod", "ftruncate",
+])
+def test_run_gate_scaffold_errors_abort_before_gate(install, tmp_path, monkeypatch, operation):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    calls = _gate_launch_spy(monkeypatch)
+
+    def fail(*args, **kwargs):
+        raise OSError(f"сбой {operation}")
+
+    if operation in ("mkdir", "lstat"):
+        monkeypatch.setattr(Path, operation, fail)
+    else:
+        monkeypatch.setattr(dv.os, operation, fail)
+
+    with pytest.raises(OSError, match=f"сбой {operation}"):
+        dv._run_gate(install, repo, "ladder_gate.py", "check-precommit")
+    assert not calls
 
 
 def test_smoke_launcher_ignores_path_bash(install, tmp_path, monkeypatch):

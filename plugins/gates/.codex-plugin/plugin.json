@@ -1,6 +1,6 @@
 {
   "name": "gates",
-  "version": "0.12.0+codex.20261110",
+  "version": "0.12.1+codex.20261127",
   "description": "Cross-host review gates preview for Claude Code and Codex.",
   "author": {
     "name": "Ленар"

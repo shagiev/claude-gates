@@ -343,3 +343,49 @@ Live acceptance выполняется только после approve/security 
 
 Версия плагина повышается отдельным релизом после реализации. Первый прогон нового deploy обязан
 сам опубликовать свой ZIP и обновить все три канала из GitHub — это и есть конечная приёмка.
+
+## 10. Smoke HOME при групповом umask
+
+Замер на `smartape-vps-1` 23.11.2026: при umask `002` disposable smoke создаёт домашние каталоги
+`0775`, resolver и Claude registry `0664`. Trusted launcher отклоняет их до запуска лесенки, поэтому
+rollback target ошибочно выглядит нерабочим. Тот же smoke при umask `022` проходит; реальная
+установка Codex и pinned resolver template на хосте при этом присутствуют и совпадают по digest.
+
+**Выбрано владельцем после сравнения альтернатив и остановки цикла:** `_run_gate` создаёт только
+harness-owned каталоги synthetic HOME с `0700` и проверяет `lstat` на тип/владельца до использования.
+Registry и resolver открываются через `os.open` с `O_NOFOLLOW|O_NONBLOCK`, без `O_TRUNC`: сначала
+`fstat` подтверждает regular file, текущего владельца и `st_nlink == 1`, затем `fchmod(0600)`,
+`ftruncate` и запись. Поэтому symlink, hardlink, FIFO и чужой файл отклоняются до изменения sentinel;
+special file не может заблокировать open. Изменение process-wide umask отсутствует полностью, поэтому
+production subcommands и real-HOME потомки Kimi не наследуют новый режим. `copytree/copystat` сохраняет
+режимы rollback target; chmod исходной или скопированной установки не выполняется.
+
+**Отклонённые альтернативы:** main-wide, verify-wide и save/set/restore umask оставляют process-wide
+влияние на реальные потомки; `/bin/sh -c` добавляет ненужную shell-границу; рекурсивный chmod disposable
+HOME маскирует небезопасный rollback target. После раундов alternatives выбран узкий secure-creation
+вариант, не требующий изменения argv или нового worker.
+
+Сценарии приёмки:
+
+- **U1. Групповой umask caller.** Настоящий `smoke_gate_blocks` при исходном umask `002` выполняет обе
+  ветки лесенки. До исправления сценарий краснеет с отказом trusted resolver; `os.umask` не вызывается.
+- **U2. Обычный umask.** Существующий smoke при umask `022` остаётся зелёным без изменения контракта.
+- **U3. Mode parity rollback target.** Group-writable каталог или проверяемый resolver'ом файл внутри
+  `install_root` сохраняет режим в synthetic copy и даёт smoke failure; режимы source не меняются.
+  Нормализация копии в приватные права запрещена.
+- **U4. Fail-closed сохраняется.** Сломанный shim и неблокирующая лесенка по-прежнему дают
+  `smoke_gate_blocks` failure. Исправление прав не должно превращать отказ resolver в успешный smoke.
+- **U5. Production side effects отсутствуют.** Spy подтверждает отсутствие `os.umask`; argv всех
+  subcommands и режимы real-HOME registry/managed/runtime файлов не меняются.
+- **U6. Небезопасный entry в scaffold.** Symlink synthetic HOME, registry или resolver на sentinel вне
+  disposable HOME отклоняется до chmod/записи. Hardlink, FIFO и чужой владелец файла/каталога также
+  отклоняются после descriptor/lstat проверки, но до truncate/write; содержимое и режимы sentinel
+  сохраняются, гейт не запускается.
+- **U7. Ошибка secure creation.** Ошибка `mkdir`, `lstat`, `chmod`, secure open, `fstat`, `fchmod` или
+  `ftruncate` завершает smoke до запуска гейта; исключение не трактуется как успешная проверка.
+
+**Явный остаток, принятый владельцем отдельно от этого fix:** рекурсивный source-side lstat-аудит всех
+delivery-файлов и проверка resolver против реального HOME не добавляются. Synthetic smoke не расширяет
+прежнее обещание до полной сертификации real-HOME trust chain. Для текущего fleet отсутствующий
+gate-owned bootstrap на VPS восстанавливается операционно из pinned template с безопасными режимами;
+общая модификация source/real-HOME verification требует отдельного дизайна.

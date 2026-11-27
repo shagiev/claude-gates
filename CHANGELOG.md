@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.1 — 2026-11-27
+
+Исправлен ложный отказ disposable smoke при caller umask `002`: каталоги synthetic HOME создаются
+последовательно с проверкой типа/владельца и режимом `0700`, Claude registry и Kimi resolver
+открываются через `O_NOFOLLOW|O_NONBLOCK` и проходят regular/owner/nlink-проверку до truncate/write.
+Process-wide umask и argv не меняются. Режимы исходной установки и synthetic copy не нормализуются:
+group-writable rollback target по-прежнему отклоняется. Добавлены RED/regression-сценарии для
+symlink/hardlink/FIFO/owner и ошибок scaffold до запуска гейта.
+Полный regression: 1435 passed, 1 skipped; реальный VPS verify под umask `002` зелёный после
+операционного снятия group-write с существующей Codex-установки. Дизайн:
+`docs/2026-11-10-github-release-deploy-design.md`.
+
 ## 0.12.0 — 2026-11-11
 
 `make deploy` теперь публикует versioned GitHub Release ZIP из закреплённого коммита и обновляет

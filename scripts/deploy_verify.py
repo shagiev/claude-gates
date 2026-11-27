@@ -459,6 +459,34 @@ def _scratch_repo(files: dict):
     return base, repo
 
 
+def _secure_smoke_dirs(home: pathlib.Path, *targets: pathlib.Path):
+    directories = [home]
+    for target in targets:
+        current = home
+        for part in target.relative_to(home).parts:
+            current = current / part
+            if current not in directories:
+                directories.append(current)
+    for directory in directories:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"небезопасный каталог synthetic HOME: {directory}")
+        os.chmod(directory, 0o700)
+
+
+def _secure_smoke_write(path: pathlib.Path, body: str):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise RuntimeError(f"небезопасный файл synthetic HOME: {path}")
+        os.fchmod(f.fileno(), 0o600)
+        os.ftruncate(f.fileno(), 0)
+        f.write(body)
+
+
 def _run_gate(install_root: pathlib.Path, repo: pathlib.Path, script, *args, env=None):
     """Запуск гейта ТАК ЖЕ, как его запускает хук: через шим `gates-run`.
 
@@ -477,16 +505,18 @@ def _run_gate(install_root: pathlib.Path, repo: pathlib.Path, script, *args, env
         raise FileNotFoundError(f"в поставке нет шима {shim} — хукам гейт запускать нечем")
     home = repo.parent / "home"
     installed = home / ".claude/plugins/cache/lenar-gates/gates/smoke"
-    installed.parent.mkdir(parents=True, exist_ok=True)
+    resolver_src = install_root / "templates" / "githooks" / "kimi_install.py"
+    targets = [installed.parent]
+    if resolver_src.is_file():
+        targets.append(home / ".local/lib/claude-gates")
+    _secure_smoke_dirs(home, *targets)
     shutil.copytree(install_root, installed, dirs_exist_ok=True)
     meta = home / ".claude" / "plugins" / "installed_plugins.json"
-    meta.parent.mkdir(parents=True, exist_ok=True)
-    meta.write_text(json.dumps({"plugins": {"gates@lenar-gates": [
+    _secure_smoke_write(meta, json.dumps({"plugins": {"gates@lenar-gates": [
         {"scope": "user", "installPath": str(installed), "version": "smoke"}]}}))
     dst = repo / ".githooks" / "gates-run"
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(shim, dst)
-    resolver_src = install_root / "templates" / "githooks" / "kimi_install.py"
     if resolver_src.is_file():
         body = dst.read_text()
         body, home_count = re.subn(r"GATE_HOME=.*", f'GATE_HOME="{home}"', body, count=1)
@@ -499,8 +529,7 @@ def _run_gate(install_root: pathlib.Path, repo: pathlib.Path, script, *args, env
                 raise RuntimeError("smoke не нашёл digest-pin в gates-run")
             dst.write_text(body)
             resolver = home / ".local/lib/claude-gates/kimi_install.py"
-            resolver.parent.mkdir(parents=True, exist_ok=True)
-            resolver.write_text(resolver_body)
+            _secure_smoke_write(resolver, resolver_body)
     return subprocess.run(["/bin/sh", str(dst), script, *args], cwd=repo,
                           capture_output=True, text=True, env={**e, "HOME": str(home)})
 
